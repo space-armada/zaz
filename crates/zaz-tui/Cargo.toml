@@ -1,0 +1,16 @@
+[package]
+name = "zaz-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Terminal UI for zaz"
+
+[dependencies]
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zaz-daemon.workspace = true

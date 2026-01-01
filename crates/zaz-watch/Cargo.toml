@@ -1,0 +1,13 @@
+[package]
+name = "zaz-watch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "File watching for zaz"
+
+[dependencies]
+globset.workspace = true
+notify.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

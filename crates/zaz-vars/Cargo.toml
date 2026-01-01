@@ -1,0 +1,9 @@
+[package]
+name = "zaz-vars"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Variable expansion for zaz"
+
+[dependencies]
+thiserror.workspace = true

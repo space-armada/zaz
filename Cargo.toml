@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zaz-config",
+    "crates/zaz-daemon",
+    "crates/zaz-process",
+    "crates/zaz-tui",
+    "crates/zaz-vars",
+    "crates/zaz-watch",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ripta/zaz"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Config parsing
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# File watching
+notify = "7"
+globset = "0.4"
+
+# Process management
+nix = { version = "0.29", features = ["signal", "process", "term"] }
+portable-pty = "0.8"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Unix socket / async utilities
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Internal crates
+zaz-config = { path = "crates/zaz-config" }
+zaz-daemon = { path = "crates/zaz-daemon" }
+zaz-process = { path = "crates/zaz-process" }
+zaz-tui = { path = "crates/zaz-tui" }
+zaz-vars = { path = "crates/zaz-vars" }
+zaz-watch = { path = "crates/zaz-watch" }
+
+[package]
+name = "zaz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A modern file-watching task runner and process manager"
+
+[[bin]]
+name = "zaz"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zaz-config.workspace = true
+zaz-daemon.workspace = true
+zaz-process.workspace = true
+zaz-tui.workspace = true
+zaz-vars.workspace = true
+zaz-watch.workspace = true
