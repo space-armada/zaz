@@ -1,0 +1,55 @@
+# rumdl configuration file for Electron Microscope
+# Lenient ruleset with auto-fix enabled for developer-friendly workflow
+
+# Global configuration options
+[global]
+# List of rules to disable (lenient configuration)
+disable = [
+    "MD036",  # Allow emphasis for styled text (not just headings)
+]
+
+# List of file/directory patterns to exclude from linting
+exclude = [
+    # Build artifacts and dependencies
+    "node_modules",
+    ".cache",
+    "bin",
+    "dist",
+    "build",
+
+    # Git and IDE
+    ".git",
+    ".github",
+    ".idea",
+    ".vscode",
+]
+
+# Respect .gitignore files when scanning directories
+respect-gitignore = true
+
+# GitHub Flavored Markdown (supports tables, task lists, etc.)
+flavor = "gfm"
+
+# Rule-specific configurations
+
+[MD003]
+style = "atx"  # Use # for headings (not underline style)
+
+[MD004]
+style = "dash"  # Use - for unordered lists (consistent with project style)
+
+[MD007]
+indent = 2  # Unordered list indentation (common standard)
+
+[MD013]
+line-length = 120
+code-blocks = false  # Ignore line length in code blocks
+reflow = true
+reflow-mode = "default"
+
+[MD041]
+front_matter_title_pattern = '^name\s*[:=]'
+
+[MD044]
+names = ["PostgreSQL", "GitHub", "RPC"]
+code-blocks = false  # Don't check code blocks for proper names
