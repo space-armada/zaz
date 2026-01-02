@@ -62,18 +62,25 @@ impl StyleRenderer for FullStyle {
     }
 
     fn handle_navigation(&self, app: &mut App, key: KeyCode) {
+        let total_items: usize = app
+            .state
+            .groups
+            .values()
+            .map(|g| 1 + g.tasks.len() + g.daemons.len())
+            .sum();
+
         match key {
             KeyCode::Char('j') | KeyCode::Down => {
-                if !app.state.groups.is_empty() {
-                    app.selected_group = (app.selected_group + 1) % app.state.groups.len();
+                if total_items > 0 {
+                    app.selected_item = (app.selected_item + 1) % total_items;
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if !app.state.groups.is_empty() {
-                    app.selected_group = app
-                        .selected_group
+                if total_items > 0 {
+                    app.selected_item = app
+                        .selected_item
                         .checked_sub(1)
-                        .unwrap_or(app.state.groups.len().saturating_sub(1));
+                        .unwrap_or(total_items.saturating_sub(1));
                 }
             }
             KeyCode::Tab => {
@@ -100,49 +107,54 @@ impl FullStyle {
             Style::default()
         };
 
-        let items: Vec<ListItem> = app
-            .state
-            .groups
-            .values()
-            .enumerate()
-            .map(|(i, group)| {
-                let status_icon = match group.status {
-                    zaz_daemon::GroupStatus::Pending => "○",
-                    zaz_daemon::GroupStatus::Running => {
-                        if app.blink_on() {
-                            "●"
-                        } else {
-                            "○"
-                        }
+        let mut items: Vec<ListItem> = Vec::new();
+        let mut flat_idx: usize = 0;
+
+        for group in app.state.groups.values() {
+            let status_icon = match group.status {
+                zaz_daemon::GroupStatus::Pending => "○",
+                zaz_daemon::GroupStatus::Running => {
+                    if app.blink_on() {
+                        "●"
+                    } else {
+                        "○"
                     }
-                    zaz_daemon::GroupStatus::Ready => "✓",
-                    zaz_daemon::GroupStatus::Failed => "✗",
-                };
+                }
+                zaz_daemon::GroupStatus::Ready => "✓",
+                zaz_daemon::GroupStatus::Failed => "✗",
+            };
 
-                let status_color = match group.status {
-                    zaz_daemon::GroupStatus::Pending => Color::White,
-                    zaz_daemon::GroupStatus::Running => Color::Yellow,
-                    zaz_daemon::GroupStatus::Ready => Color::Green,
-                    zaz_daemon::GroupStatus::Failed => Color::Red,
-                };
+            let status_color = match group.status {
+                zaz_daemon::GroupStatus::Pending => Color::White,
+                zaz_daemon::GroupStatus::Running => Color::Yellow,
+                zaz_daemon::GroupStatus::Ready => Color::Green,
+                zaz_daemon::GroupStatus::Failed => Color::Red,
+            };
 
-                let style = if i == app.selected_group {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
+            let is_selected = flat_idx == app.selected_item;
+            flat_idx += 1;
 
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", status_icon),
-                        Style::default().fg(status_color),
-                    ),
-                    Span::styled(&group.name, style),
-                ]))
-            })
-            .collect();
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
+                Span::styled(&group.name, style),
+            ])));
+
+            // Add tasks and daemons (update flat_idx for each)
+            for _task in &group.tasks {
+                flat_idx += 1;
+            }
+            for _daemon in &group.daemons {
+                flat_idx += 1;
+            }
+        }
 
         let list = List::new(items)
             .block(

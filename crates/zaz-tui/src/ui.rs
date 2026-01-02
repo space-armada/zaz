@@ -40,9 +40,14 @@ fn draw_full_style(frame: &mut Frame, app: &App) {
         3
     };
 
+    // Calculate the width needed for the groups pane based on content
+    let groups_width = calculate_groups_width(app);
+    // Add 4 for borders and padding, cap at 50% of screen
+    let left_width = (groups_width + 4).min(area.width / 2).max(20);
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Length(left_width), Constraint::Min(0)])
         .split(area);
 
     let left_chunks = Layout::default()
@@ -53,6 +58,35 @@ fn draw_full_style(frame: &mut Frame, app: &App) {
     draw_groups(frame, app, left_chunks[0]);
     draw_status_bar(frame, app, left_chunks[1]);
     draw_logs(frame, app, chunks[1]);
+}
+
+/// Calculate the width needed for the groups pane content.
+fn calculate_groups_width(app: &App) -> u16 {
+    let mut max_width: usize = 0;
+
+    for group in app.state.groups.values() {
+        // Group line: " ● group_name (status)"
+        let group_width = 4 + group.name.len() + 10; // icon + name + " (running)"
+        max_width = max_width.max(group_width);
+
+        // Task/daemon lines: "   ├─ [✓] name (suffix)"
+        for task in &group.tasks {
+            let suffix_len = task
+                .duration_ms
+                .map(|d| if d >= 1000 { 8 } else { 7 })
+                .unwrap_or(0);
+            let task_width = 10 + task.name.len() + suffix_len; // "   ├─ [✓] " + name + suffix
+            max_width = max_width.max(task_width);
+        }
+
+        for daemon in &group.daemons {
+            let suffix_len = daemon.pid.map(|p| format!(" (pid {})", p).len()).unwrap_or(0);
+            let daemon_width = 10 + daemon.name.len() + suffix_len;
+            max_width = max_width.max(daemon_width);
+        }
+    }
+
+    max_width as u16
 }
 
 fn draw_minimal_style(frame: &mut Frame, app: &App) {
@@ -83,54 +117,193 @@ fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
         Style::default()
     };
 
-    let items: Vec<ListItem> = app
-        .state
-        .groups
-        .values()
-        .enumerate()
-        .map(|(i, group)| {
-            let status_icon = match group.status {
-                zaz_daemon::GroupStatus::Pending => "○",
-                zaz_daemon::GroupStatus::Running => {
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut flat_idx: usize = 0;
+
+    for group in app.state.groups.values() {
+        // Group header
+        let status_icon = match group.status {
+            zaz_daemon::GroupStatus::Pending => "○",
+            zaz_daemon::GroupStatus::Running => {
+                if app.blink_on() {
+                    "●"
+                } else {
+                    "○"
+                }
+            }
+            zaz_daemon::GroupStatus::Ready => "✓",
+            zaz_daemon::GroupStatus::Failed => "✗",
+        };
+
+        let status_color = match group.status {
+            zaz_daemon::GroupStatus::Pending => Color::White,
+            zaz_daemon::GroupStatus::Running => Color::Yellow,
+            zaz_daemon::GroupStatus::Ready => Color::Green,
+            zaz_daemon::GroupStatus::Failed => Color::Red,
+        };
+
+        let is_selected = flat_idx == app.selected_item;
+        flat_idx += 1;
+
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        // Format group status text
+        let group_status_text = match group.status {
+            zaz_daemon::GroupStatus::Pending => "pending",
+            zaz_daemon::GroupStatus::Running => "running",
+            zaz_daemon::GroupStatus::Ready => "ready",
+            zaz_daemon::GroupStatus::Failed => "failed",
+        };
+
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
+            Span::styled(&group.name, style),
+            Span::styled(
+                format!(" ({})", group_status_text),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])));
+
+        // Collect all children (tasks + daemons) for tree rendering
+        let total_children = group.tasks.len() + group.daemons.len();
+        let mut child_idx = 0;
+
+        // Tasks under the group
+        for task in &group.tasks {
+            child_idx += 1;
+            let is_last = child_idx == total_children;
+            let tree_branch = if is_last { "└─" } else { "├─" };
+
+            let is_selected = flat_idx == app.selected_item;
+            flat_idx += 1;
+
+            let task_icon = match task.status {
+                zaz_daemon::ProcessStatus::Pending => "○",
+                zaz_daemon::ProcessStatus::Running => {
                     if app.blink_on() {
                         "●"
                     } else {
                         "○"
                     }
                 }
-                zaz_daemon::GroupStatus::Ready => "✓",
-                zaz_daemon::GroupStatus::Failed => "✗",
+                zaz_daemon::ProcessStatus::Success => "✓",
+                zaz_daemon::ProcessStatus::Failed => "✗",
+                zaz_daemon::ProcessStatus::Backoff => "⟳",
             };
 
-            let status_color = match group.status {
-                zaz_daemon::GroupStatus::Pending => Color::White,
-                zaz_daemon::GroupStatus::Running => Color::Yellow,
-                zaz_daemon::GroupStatus::Ready => Color::Green,
-                zaz_daemon::GroupStatus::Failed => Color::Red,
+            let task_color = match task.status {
+                zaz_daemon::ProcessStatus::Pending => Color::DarkGray,
+                zaz_daemon::ProcessStatus::Running => Color::Yellow,
+                zaz_daemon::ProcessStatus::Success => Color::Green,
+                zaz_daemon::ProcessStatus::Failed => Color::Red,
+                zaz_daemon::ProcessStatus::Backoff => Color::Yellow,
             };
 
-            let style = if i == app.selected_group {
+            // Format duration or status suffix
+            let suffix = match task.status {
+                zaz_daemon::ProcessStatus::Success | zaz_daemon::ProcessStatus::Failed => {
+                    task.duration_ms
+                        .map(|d| {
+                            if d >= 1000 {
+                                format!(" ({:.1}s)", d as f64 / 1000.0)
+                            } else {
+                                format!(" ({}ms)", d)
+                            }
+                        })
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+
+            let name_style = if is_selected {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(Color::White)
             };
 
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", status_icon),
-                    Style::default().fg(status_color),
-                ),
-                Span::styled(&group.name, style),
-            ]))
-        })
-        .collect();
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!("   {} ", tree_branch), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("[{}] ", task_icon), Style::default().fg(task_color)),
+                Span::styled(&task.name, name_style),
+                Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+            ])));
+        }
+
+        // Daemons under the group
+        for daemon in &group.daemons {
+            child_idx += 1;
+            let is_last = child_idx == total_children;
+            let tree_branch = if is_last { "└─" } else { "├─" };
+
+            let is_selected = flat_idx == app.selected_item;
+            flat_idx += 1;
+
+            let daemon_icon = match daemon.status {
+                zaz_daemon::ProcessStatus::Pending => "○",
+                zaz_daemon::ProcessStatus::Running => {
+                    if app.blink_on() {
+                        "●"
+                    } else {
+                        "○"
+                    }
+                }
+                zaz_daemon::ProcessStatus::Success => "✓",
+                zaz_daemon::ProcessStatus::Failed => "✗",
+                zaz_daemon::ProcessStatus::Backoff => "⟳",
+            };
+
+            let daemon_color = match daemon.status {
+                zaz_daemon::ProcessStatus::Pending => Color::DarkGray,
+                zaz_daemon::ProcessStatus::Running => Color::Yellow,
+                zaz_daemon::ProcessStatus::Success => Color::Green,
+                zaz_daemon::ProcessStatus::Failed => Color::Red,
+                zaz_daemon::ProcessStatus::Backoff => Color::Yellow,
+            };
+
+            // Format pid suffix for running daemons
+            let suffix = match daemon.status {
+                zaz_daemon::ProcessStatus::Running => daemon
+                    .pid
+                    .map(|p| format!(" (pid {})", p))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+
+            let name_style = if is_selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(format!("   {} ", tree_branch), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("[{}] ", daemon_icon), Style::default().fg(daemon_color)),
+                Span::styled(&daemon.name, name_style),
+                Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+            ])));
+        }
+    }
+
+    let title = if app.focus == Focus::Groups {
+        " Groups* "
+    } else {
+        " Groups "
+    };
 
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Groups ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(border_style),
         )
@@ -188,6 +361,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         ])]
     } else if use_multi_line {
         // Multi-line: detailed status
+        let daemon_indicator = if app.started_daemon {
+            " (daemon)"
+        } else {
+            ""
+        };
         vec![
             Line::from(vec![
                 Span::raw(" "),
@@ -197,6 +375,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     &app.config_name,
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(daemon_indicator, Style::default().fg(Color::Cyan)),
                 Span::raw(" │ Follow "),
                 Span::styled(
                     follow_icon,
@@ -314,15 +493,17 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
+    let focus_indicator = if app.focus == Focus::Logs { "*" } else { "" };
     let title = if total_lines > 0 {
         format!(
-            " Logs ({}-{}/{}) ",
+            " Logs{} ({}-{}/{}) ",
+            focus_indicator,
             scroll_offset + 1,
             (scroll_offset + items.len()).min(total_lines),
             total_lines
         )
     } else {
-        " Logs (empty) ".to_string()
+        format!(" Logs{} (empty) ", focus_indicator)
     };
 
     let list = List::new(items).block(

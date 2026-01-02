@@ -76,8 +76,8 @@ pub struct App {
     // === UI State ===
     /// Currently focused element.
     pub focus: Focus,
-    /// Selected group index (full style).
-    pub selected_group: usize,
+    /// Selected item index in flat list (groups + tasks + daemons).
+    pub selected_item: usize,
     /// Selected pane index (minimal style).
     pub selected_pane: usize,
     /// Current page for pagination (minimal style, >6 tasks).
@@ -122,7 +122,7 @@ impl App {
             daemon: None,
             logs: LogBuffer::new(),
             focus: Focus::Groups,
-            selected_group: 0,
+            selected_item: 0,
             selected_pane: 0,
             current_page: 0,
             log_scroll: 0,
@@ -246,10 +246,10 @@ impl App {
         // Handle quit regardless of mode
         if events::is_quit(&event) {
             if self.started_daemon {
-                self.input_mode = InputMode::QuitPrompt;
-            } else {
-                self.should_quit = true;
+                // If we started the daemon, shut it down when quitting
+                self.send_command(ClientCommand::Shutdown);
             }
+            self.should_quit = true;
             return;
         }
 
@@ -258,7 +258,10 @@ impl App {
             InputMode::Normal => self.handle_normal_mode(event),
             InputMode::Filter => self.handle_filter_mode(event),
             InputMode::Search => self.handle_search_mode(event),
-            InputMode::QuitPrompt => self.handle_quit_prompt(event),
+            InputMode::QuitPrompt => {
+                // Legacy: no longer used, but kept for enum completeness
+                self.input_mode = InputMode::Normal;
+            }
         }
     }
 
@@ -409,33 +412,47 @@ impl App {
         }
     }
 
-    fn handle_quit_prompt(&mut self, event: Event) {
-        use crossterm::event::KeyCode;
+    /// Count total items in the groups pane (groups + tasks + daemons).
+    fn groups_item_count(&self) -> usize {
+        self.state
+            .groups
+            .values()
+            .map(|g| 1 + g.tasks.len() + g.daemons.len())
+            .sum()
+    }
 
-        if let Event::Key(key) = event {
-            match key.code {
-                KeyCode::Char('d') => {
-                    // Detach: leave daemon running
-                    self.should_quit = true;
-                }
-                KeyCode::Char('q') | KeyCode::Char('y') => {
-                    // Quit: shutdown daemon
-                    self.send_command(ClientCommand::Shutdown);
-                    self.should_quit = true;
-                }
-                KeyCode::Esc => {
-                    self.input_mode = InputMode::Normal;
-                }
-                _ => {}
+    /// Get the group name for the currently selected item.
+    fn selected_group_name(&self) -> Option<String> {
+        let mut idx = 0;
+        for group in self.state.groups.values() {
+            let group_items = 1 + group.tasks.len() + group.daemons.len();
+            if self.selected_item >= idx && self.selected_item < idx + group_items {
+                return Some(group.name.clone());
             }
+            idx += group_items;
         }
+        None
     }
 
     fn navigate_down(&mut self) {
         match self.style {
             TuiStyle::Full => {
-                if !self.state.groups.is_empty() {
-                    self.selected_group = (self.selected_group + 1) % self.state.groups.len();
+                match self.focus {
+                    Focus::Groups => {
+                        let total = self.groups_item_count();
+                        if total > 0 {
+                            self.selected_item = (self.selected_item + 1) % total;
+                        }
+                    }
+                    Focus::Logs => {
+                        // Scroll logs down
+                        self.logs.disable_follow();
+                        let total = self.logs.all_logs_combined().len();
+                        if self.log_scroll < total.saturating_sub(1) {
+                            self.log_scroll += 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
             TuiStyle::Minimal => {
@@ -452,11 +469,24 @@ impl App {
     fn navigate_up(&mut self) {
         match self.style {
             TuiStyle::Full => {
-                if !self.state.groups.is_empty() {
-                    self.selected_group = self
-                        .selected_group
-                        .checked_sub(1)
-                        .unwrap_or(self.state.groups.len().saturating_sub(1));
+                match self.focus {
+                    Focus::Groups => {
+                        let total = self.groups_item_count();
+                        if total > 0 {
+                            self.selected_item = self
+                                .selected_item
+                                .checked_sub(1)
+                                .unwrap_or(total.saturating_sub(1));
+                        }
+                    }
+                    Focus::Logs => {
+                        // Scroll logs up
+                        self.logs.disable_follow();
+                        if self.log_scroll > 0 {
+                            self.log_scroll -= 1;
+                        }
+                    }
+                    _ => {}
                 }
             }
             TuiStyle::Minimal => {
@@ -473,16 +503,20 @@ impl App {
     }
 
     fn navigate_left(&mut self) {
-        // In minimal style, move to previous pane; in full style, could collapse tree
-        if self.style == TuiStyle::Minimal {
-            self.navigate_up();
+        // In minimal style, move to previous pane
+        // In full style, same as up (for now)
+        match self.style {
+            TuiStyle::Minimal => self.navigate_up(),
+            TuiStyle::Full => self.navigate_up(),
         }
     }
 
     fn navigate_right(&mut self) {
-        // In minimal style, move to next pane; in full style, could expand tree
-        if self.style == TuiStyle::Minimal {
-            self.navigate_down();
+        // In minimal style, move to next pane
+        // In full style, same as down (for now)
+        match self.style {
+            TuiStyle::Minimal => self.navigate_down(),
+            TuiStyle::Full => self.navigate_down(),
         }
     }
 
@@ -503,9 +537,8 @@ impl App {
     }
 
     fn restart_selected(&mut self) {
-        // Get the selected group name
-        let group_names: Vec<String> = self.state.groups.keys().cloned().collect();
-        if let Some(name) = group_names.get(self.selected_group) {
+        // Get the group name containing the selected item
+        if let Some(name) = self.selected_group_name() {
             self.send_command(ClientCommand::RestartGroup(name.clone()));
             self.set_status(format!("Restarting {}", name));
         }

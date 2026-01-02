@@ -52,6 +52,10 @@ enum Commands {
         /// Detach from terminal
         #[arg(short, long)]
         detach: bool,
+
+        /// Suppress process output logging
+        #[arg(short, long)]
+        quiet: bool,
     },
 
     /// Show status of running daemon
@@ -126,9 +130,9 @@ async fn main() -> Result<()> {
             let config_path = find_config(&cli.config)?;
             run_tasks(&config_path).await
         }
-        Some(Commands::Daemon { detach }) => {
+        Some(Commands::Daemon { detach, quiet }) => {
             let config_path = find_config(&cli.config)?;
-            run_daemon(&config_path, &socket_path, detach).await
+            run_daemon(&config_path, &socket_path, detach, quiet).await
         }
         Some(Commands::Status) => show_status(&socket_path).await,
         Some(Commands::Restart { group }) => restart(&socket_path, group).await,
@@ -172,7 +176,7 @@ async fn run_tasks(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_daemon(config_path: &Path, socket_path: &Path, detach: bool) -> Result<()> {
+async fn run_daemon(config_path: &Path, socket_path: &Path, detach: bool, quiet: bool) -> Result<()> {
     if detach {
         // TODO: implement daemonization
         anyhow::bail!("detached daemon mode not yet implemented");
@@ -208,7 +212,7 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, detach: bool) -> Res
 
     tracing::info!(config = %config_path.display(), "starting daemon");
 
-    let mut engine = Engine::new(config_path)?;
+    let mut engine = Engine::with_options(config_path, !quiet)?;
     let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
 
     // Start API server

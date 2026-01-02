@@ -57,6 +57,9 @@ pub struct Engine {
 
     /// Sender for PTY reader tasks to submit logs.
     log_tx: mpsc::Sender<LogLine>,
+
+    /// Whether to print process output to stdout (verbose mode).
+    verbose_output: bool,
 }
 
 /// A managed watch group with its processes.
@@ -77,12 +80,23 @@ struct ManagedGroup {
 impl Engine {
     /// Create a new engine from a configuration file.
     pub fn new(config_path: &Path) -> Result<Self, DaemonError> {
+        Self::with_options(config_path, true)
+    }
+
+    /// Create a new engine with options.
+    ///
+    /// `verbose_output` controls whether process output is printed to stdout.
+    pub fn with_options(config_path: &Path, verbose_output: bool) -> Result<Self, DaemonError> {
         let config = zaz_config::load(config_path).map_err(DaemonError::Config)?;
-        Self::from_config(config, config_path.to_path_buf())
+        Self::from_config(config, config_path.to_path_buf(), verbose_output)
     }
 
     /// Create a new engine from a loaded configuration.
-    pub fn from_config(config: Config, config_path: PathBuf) -> Result<Self, DaemonError> {
+    pub fn from_config(
+        config: Config,
+        config_path: PathBuf,
+        verbose_output: bool,
+    ) -> Result<Self, DaemonError> {
         // Determine the config directory for variable expansion
         let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
@@ -189,6 +203,7 @@ impl Engine {
             logs_tx,
             log_rx,
             log_tx,
+            verbose_output,
         })
     }
 
@@ -214,12 +229,10 @@ impl Engine {
 
     /// Add a log line to storage and broadcast.
     pub fn push_log(&mut self, log: LogLine) {
-        eprintln!(
-            "[DEBUG push_log] process={} source={:?} content={}",
-            log.process,
-            log.source,
-            log.content.chars().take(60).collect::<String>()
-        );
+        // Print process output to stdout in verbose mode
+        if self.verbose_output && log.source == crate::api::LogSource::Process {
+            println!("[{}] {}", log.process, log.content);
+        }
 
         // Store in per-process buffer
         let buffer = self
@@ -241,12 +254,6 @@ impl Engine {
     ///
     /// If `name` is "*", returns logs from all processes.
     pub fn get_logs(&self, name: &str, limit: Option<usize>) -> Vec<LogLine> {
-        let total_in_buffers: usize = self.log_buffers.values().map(|b| b.len()).sum();
-        eprintln!(
-            "[DEBUG get_logs] name={} limit={:?} total_in_buffers={}",
-            name, limit, total_in_buffers
-        );
-
         if name == "*" {
             // Return all logs, sorted by timestamp
             let mut all: Vec<LogLine> = self
@@ -255,7 +262,7 @@ impl Engine {
                 .flat_map(|buf| buf.iter().cloned())
                 .collect();
             all.sort_by_key(|l| l.timestamp);
-            let result = if let Some(n) = limit {
+            if let Some(n) = limit {
                 all.into_iter()
                     .rev()
                     .take(n)
@@ -265,9 +272,7 @@ impl Engine {
                     .collect()
             } else {
                 all
-            };
-            eprintln!("[DEBUG get_logs] returning {} logs", result.len());
-            result
+            }
         } else {
             self.log_buffers
                 .get(name)

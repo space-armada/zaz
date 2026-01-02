@@ -143,36 +143,25 @@ impl Executor {
         let (stderr_tx, mut stderr_rx) = mpsc::channel(100);
 
         // Spawn tasks to read stdout/stderr
-        let cmd_for_debug = command.to_string();
         if let Some(stdout) = stdout {
             let tx = stdout_tx;
-            let cmd = cmd_for_debug.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
-                let mut count = 0;
                 while let Ok(Some(line)) = lines.next_line().await {
-                    count += 1;
-                    eprintln!("[DEBUG stdout #{} cmd={}] {}", count, cmd, line);
                     let _ = tx.send(line).await;
                 }
-                eprintln!("[DEBUG stdout DONE cmd={}] total {} lines", cmd, count);
             });
         }
 
         if let Some(stderr) = stderr {
             let tx = stderr_tx;
-            let cmd = cmd_for_debug;
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
-                let mut count = 0;
                 while let Ok(Some(line)) = lines.next_line().await {
-                    count += 1;
-                    eprintln!("[DEBUG stderr #{} cmd={}] {}", count, cmd, line);
                     let _ = tx.send(line).await;
                 }
-                eprintln!("[DEBUG stderr DONE cmd={}] total {} lines", cmd, count);
             });
         }
 
@@ -184,24 +173,17 @@ impl Executor {
         let mut stderr_lines = Vec::new();
 
         // Process output as it arrives
-        let mut recv_stdout_count = 0;
-        let mut recv_stderr_count = 0;
         loop {
             tokio::select! {
                 Some(line) = stdout_rx.recv() => {
-                    recv_stdout_count += 1;
-                    eprintln!("[DEBUG recv stdout #{}] {}", recv_stdout_count, line);
                     on_output(OutputLine::Stdout(line.clone()));
                     stdout_lines.push(line);
                 }
                 Some(line) = stderr_rx.recv() => {
-                    recv_stderr_count += 1;
-                    eprintln!("[DEBUG recv stderr #{}] {}", recv_stderr_count, line);
                     on_output(OutputLine::Stderr(line.clone()));
                     stderr_lines.push(line);
                 }
                 status = child.wait() => {
-                    eprintln!("[DEBUG child.wait() returned, draining...]");
                     let status = status.map_err(ProcessError::Spawn)?;
 
                     // Drain remaining output
@@ -209,18 +191,13 @@ impl Executor {
                     stderr_rx.close();
 
                     while let Some(line) = stdout_rx.recv().await {
-                        recv_stdout_count += 1;
-                        eprintln!("[DEBUG drain stdout #{}] {}", recv_stdout_count, line);
                         on_output(OutputLine::Stdout(line.clone()));
                         stdout_lines.push(line);
                     }
                     while let Some(line) = stderr_rx.recv().await {
-                        recv_stderr_count += 1;
-                        eprintln!("[DEBUG drain stderr #{}] {}", recv_stderr_count, line);
                         on_output(OutputLine::Stderr(line.clone()));
                         stderr_lines.push(line);
                     }
-                    eprintln!("[DEBUG drained: {} stdout, {} stderr]", recv_stdout_count, recv_stderr_count);
 
                     let exit_code = status.code();
 
