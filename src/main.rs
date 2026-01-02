@@ -2,15 +2,16 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "zaz")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Configuration file path
-    #[arg(short, long, default_value = "zaz.toml")]
-    config: PathBuf,
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
     /// Enable debug logging
     #[arg(short, long)]
@@ -22,8 +23,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run prep commands once and exit
-    Prep,
+    /// Run task commands once and exit
+    Task,
 
     /// Start the daemon in the background
     Daemon {
@@ -59,40 +60,89 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    // Find config file
+    let config_path = find_config(&cli.config)?;
+
     match cli.command {
-        Some(Commands::Prep) => run_prep(&cli.config).await,
-        Some(Commands::Daemon { detach }) => run_daemon(&cli.config, detach).await,
+        Some(Commands::Task) => run_tasks(&config_path).await,
+        Some(Commands::Daemon { detach }) => run_daemon(&config_path, detach).await,
         Some(Commands::Status) => show_status().await,
         Some(Commands::Restart { group }) => restart(group).await,
         Some(Commands::Stop) => stop_daemon().await,
         Some(Commands::Ignores) => show_ignores(),
-        None => run_tui(&cli.config).await,
+        None => run_tui(&config_path).await,
     }
 }
 
-async fn run_prep(config_path: &PathBuf) -> Result<()> {
-    tracing::info!(config = %config_path.display(), "running prep commands");
+/// Find the configuration file.
+fn find_config(explicit: &Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        if path.exists() {
+            return Ok(path.clone());
+        }
+        anyhow::bail!("config file not found: {}", path.display());
+    }
 
-    let config = zaz_config::load(config_path)?;
-    tracing::debug!(groups = config.groups.len(), "loaded configuration");
+    // Try to discover config file
+    match zaz_config::discover() {
+        Ok((path, _)) => Ok(path),
+        Err(e) => anyhow::bail!("no config file found: {}", e),
+    }
+}
 
-    // TODO: implement prep runner
-    println!("Prep mode not yet implemented");
+async fn run_tasks(config_path: &Path) -> Result<()> {
+    tracing::info!(config = %config_path.display(), "running task commands");
+
+    let mut engine = zaz_daemon::Engine::new(config_path)?;
+    engine.startup().await?;
+
+    // Shutdown daemons since we're in task-only mode
+    engine.shutdown().await?;
+
+    tracing::info!("all tasks completed");
     Ok(())
 }
 
-async fn run_daemon(config_path: &PathBuf, detach: bool) -> Result<()> {
-    tracing::info!(
-        config = %config_path.display(),
-        detach = detach,
-        "starting daemon"
-    );
+async fn run_daemon(config_path: &Path, detach: bool) -> Result<()> {
+    if detach {
+        // TODO: implement daemonization
+        anyhow::bail!("detached daemon mode not yet implemented");
+    }
 
-    let config = zaz_config::load(config_path)?;
-    tracing::debug!(groups = config.groups.len(), "loaded configuration");
+    tracing::info!(config = %config_path.display(), "starting daemon");
 
-    // TODO: implement daemon
-    println!("Daemon mode not yet implemented");
+    let mut engine = zaz_daemon::Engine::new(config_path)?;
+
+    // Run initial startup
+    engine.startup().await?;
+
+    tracing::info!("watching for file changes...");
+
+    // Main event loop with graceful shutdown
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal");
+                break;
+            }
+            result = async {
+                // Poll for file changes
+                engine.poll().await?;
+
+                // Check daemon health
+                engine.check_daemons().await?;
+
+                // Small sleep to avoid busy loop
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                Ok::<_, anyhow::Error>(())
+            } => {
+                result?;
+            }
+        }
+    }
+
+    engine.shutdown().await?;
     Ok(())
 }
 
@@ -125,13 +175,10 @@ fn show_ignores() -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(config_path: &PathBuf) -> Result<()> {
+async fn run_tui(config_path: &Path) -> Result<()> {
     tracing::info!(config = %config_path.display(), "starting TUI");
 
-    let _config = zaz_config::load(config_path)?;
-
-    let mut app = zaz_tui::App::new();
-    app.run()?;
-
-    Ok(())
+    // For now, run in daemon mode until TUI is fully implemented
+    // TODO: integrate TUI with engine
+    run_daemon(config_path, false).await
 }
