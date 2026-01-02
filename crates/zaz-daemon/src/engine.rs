@@ -919,20 +919,39 @@ impl Engine {
                 "task execution completed"
             );
 
-            // Update task state
+            // Remove from running set first (needed for group status check)
+            self.running_tasks.remove(&completion.task_id);
+
+            // Update task state and recalculate group status
             if let Some(group) = self.groups.get_mut(&completion.group_name) {
                 if completion.task_index < group.state.tasks.len() {
                     group.state.tasks[completion.task_index].status = completion.status;
                     group.state.tasks[completion.task_index].duration_ms = completion.duration_ms;
                     group.state.tasks[completion.task_index].exit_code = completion.exit_code;
                 }
-                // Update group status based on all tasks
-                // For now, just mark as Ready if any task is done (simplified)
-                // A more complete implementation would track all task states
-            }
 
-            // Remove from running set
-            self.running_tasks.remove(&completion.task_id);
+                // Check if any tasks from this group are still running
+                let group_prefix = format!("{}:", completion.group_name);
+                let has_running_tasks = self
+                    .running_tasks
+                    .iter()
+                    .any(|id| id.starts_with(&group_prefix));
+
+                if !has_running_tasks {
+                    // No tasks running - update group status based on task results
+                    let any_failed = group
+                        .state
+                        .tasks
+                        .iter()
+                        .any(|t| t.status == ProcessStatus::Failed);
+
+                    group.state.status = if any_failed {
+                        GroupStatus::Failed
+                    } else {
+                        GroupStatus::Ready
+                    };
+                }
+            }
 
             // Check if this task is pending re-run
             if self.pending_tasks.remove(&completion.task_id) {
