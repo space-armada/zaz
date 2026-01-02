@@ -70,6 +70,80 @@ zaz stop            # Stop the daemon
 zaz ignores         # Show default ignore patterns
 ```
 
+## TUI Options
+
+```bash
+zaz --full          # Full style: split panes with group tree + logs
+zaz --minimal       # Minimal style: one pane per task
+zaz --no-autostart  # Don't auto-start daemon when TUI starts
+```
+
+Press `F1`/`F2` to switch between Full and Minimal styles at runtime.
+
+## User Configuration
+
+User preferences are stored separately from project configuration at
+`~/.config/zaz/config.toml` (following XDG Base Directory specification):
+
+```toml
+# Don't auto-start daemon when running TUI
+no_autostart = false
+
+# Disable blinking/animation effects
+disable_animations = false
+
+# Default TUI style: "full" or "minimal"
+tui_style = "full"
+```
+
+These settings are optional - zaz works fine without a user config file.
+CLI flags take precedence over user config values.
+
+## Keyboard Shortcuts
+
+### Navigation
+
+| Key | Action |
+|-----|--------|
+| `j`/`k`, `↓`/`↑` | Move down/up |
+| `h`/`l`, `←`/`→` | Move left/right |
+| `Tab` | Switch focus/pane |
+| `g`/`G` | Go to top/bottom of logs |
+| `PgUp`/`PgDn` | Scroll logs by page |
+
+### Actions
+
+| Key | Action |
+|-----|--------|
+| `r` | Restart selected group |
+| `R` | Restart all groups |
+| `c` | Clear logs |
+| `F` | Toggle follow mode |
+
+### Search & Filter
+
+| Key | Action |
+|-----|--------|
+| `/` | Start search |
+| `f` | Start filter |
+| `n`/`N` | Next/previous match |
+| `Esc` | Clear search/filter |
+
+### Style
+
+| Key | Action |
+|-----|--------|
+| `F1` | Switch to Full style |
+| `F2` | Switch to Minimal style |
+| `[`/`]` | Previous/next page (Minimal, >6 tasks) |
+
+### General
+
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `?` | Toggle help overlay |
+
 ## License
 
 MIT
