@@ -12,6 +12,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/ripta/zaz"
 
@@ -69,6 +70,7 @@ zaz-watch = { path = "crates/zaz-watch" }
 name = "zaz"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "A modern file-watching task runner and process manager"
 
