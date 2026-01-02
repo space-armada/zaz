@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
 use zaz_daemon::{
     default_socket_path, ApiRequest, ApiResponse, Client, Engine, EngineCommand, Server,
 };
@@ -24,6 +25,18 @@ struct Cli {
     /// Socket path for daemon communication
     #[arg(short, long)]
     socket: Option<PathBuf>,
+
+    /// Use full TUI style (split panes with group tree)
+    #[arg(long, conflicts_with = "minimal")]
+    full: bool,
+
+    /// Use minimal TUI style (one pane per task)
+    #[arg(long, conflicts_with = "full")]
+    minimal: bool,
+
+    /// Don't auto-start daemon when running TUI
+    #[arg(long)]
+    no_autostart: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -57,6 +70,34 @@ enum Commands {
     Ignores,
 }
 
+/// Effective TUI options after merging CLI flags with user config.
+#[derive(Debug, Clone)]
+pub struct TuiOptions {
+    pub style: TuiStylePreference,
+    pub no_autostart: bool,
+    pub disable_animations: bool,
+}
+
+impl TuiOptions {
+    /// Create TUI options by merging CLI flags with user config.
+    /// CLI flags take precedence over user config.
+    fn from_cli_and_user_config(cli: &Cli, user_config: &UserConfig) -> Self {
+        let style = if cli.full {
+            TuiStylePreference::Full
+        } else if cli.minimal {
+            TuiStylePreference::Minimal
+        } else {
+            user_config.tui_style.unwrap_or(TuiStylePreference::Full)
+        };
+
+        Self {
+            style,
+            no_autostart: cli.no_autostart || user_config.no_autostart,
+            disable_animations: user_config.disable_animations,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -69,7 +110,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Determine socket path
-    let socket_path = cli.socket.unwrap_or_else(default_socket_path);
+    let socket_path = cli.socket.clone().unwrap_or_else(default_socket_path);
 
     match cli.command {
         Some(Commands::Task) => {
@@ -86,7 +127,9 @@ async fn main() -> Result<()> {
         Some(Commands::Ignores) => show_ignores(),
         None => {
             let config_path = find_config(&cli.config)?;
-            run_tui(&config_path, &socket_path).await
+            let user_config = load_user_config();
+            let tui_options = TuiOptions::from_cli_and_user_config(&cli, &user_config);
+            run_tui(&config_path, &socket_path, &tui_options).await
         }
     }
 }
@@ -336,12 +379,150 @@ fn show_ignores() -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(config_path: &Path, socket_path: &Path) -> Result<()> {
-    tracing::info!(config = %config_path.display(), "starting TUI");
+async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -> Result<()> {
+    tracing::info!(
+        config = %config_path.display(),
+        style = ?options.style,
+        "starting TUI"
+    );
 
-    // For now, run in daemon mode until TUI is fully implemented
-    // TODO: integrate TUI with engine
-    run_daemon(config_path, socket_path, false).await
+    // Check if daemon is running
+    let check_timeout = Duration::from_secs(1);
+    let daemon_running = match tokio::time::timeout(check_timeout, Client::connect(socket_path)).await {
+        Ok(Ok(mut client)) => {
+            // Try to communicate
+            match tokio::time::timeout(check_timeout, client.request(&ApiRequest::Status)).await {
+                Ok(Ok(_)) => {
+                    tracing::debug!("daemon is running");
+                    true
+                }
+                _ => {
+                    tracing::debug!("daemon socket exists but not responsive");
+                    false
+                }
+            }
+        }
+        _ => {
+            tracing::debug!("no daemon running");
+            false
+        }
+    };
+
+    // Start daemon if needed
+    let started_daemon = if !daemon_running && !options.no_autostart {
+        tracing::info!("starting daemon in background");
+
+        // Spawn daemon as a background process
+        let config_path_str = config_path.to_string_lossy().to_string();
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let daemon_handle = tokio::spawn(async move {
+            let config_path = std::path::Path::new(&config_path_str);
+            let socket_path = std::path::Path::new(&socket_path_str);
+
+            let mut engine = match Engine::new(config_path) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to create engine");
+                    return;
+                }
+            };
+
+            let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
+
+            // Start API server
+            let server = match Server::bind(socket_path, command_tx).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to start server");
+                    return;
+                }
+            };
+
+            let server_handle = tokio::spawn(async move {
+                if let Err(e) = server.run().await {
+                    tracing::error!(error = %e, "server error");
+                }
+            });
+
+            // Run startup
+            if let Err(e) = engine.startup().await {
+                tracing::error!(error = %e, "startup failed");
+            }
+
+            // Main loop
+            loop {
+                tokio::select! {
+                    Some(cmd) = command_rx.recv() => {
+                        let is_shutdown = matches!(cmd.request, ApiRequest::Shutdown);
+                        let response = engine.handle_request(cmd.request).await;
+                        let _ = cmd.response_tx.send(response);
+
+                        if is_shutdown {
+                            break;
+                        }
+                    }
+
+                    _ = async {
+                        if let Err(e) = engine.poll().await {
+                            tracing::error!(error = %e, "poll error");
+                        }
+                        if let Err(e) = engine.check_daemons().await {
+                            tracing::error!(error = %e, "daemon check error");
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    } => {}
+                }
+            }
+
+            server_handle.abort();
+            let _ = engine.shutdown().await;
+        });
+
+        // Wait for daemon to be ready
+        let mut attempts = 0;
+        while attempts < 20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(mut client) = Client::connect(socket_path).await {
+                if client.request(&ApiRequest::Status).await.is_ok() {
+                    break;
+                }
+            }
+            attempts += 1;
+        }
+
+        if attempts >= 20 {
+            tracing::warn!("daemon may not be ready after 2s");
+        }
+
+        // Store handle to prevent immediate drop
+        std::mem::forget(daemon_handle);
+        true
+    } else {
+        false
+    };
+
+    // Create TUI app
+    use zaz_tui::{App, TuiStyle};
+    let style = TuiStyle::from(options.style);
+    let user_config = zaz_config::UserConfig {
+        no_autostart: options.no_autostart,
+        disable_animations: options.disable_animations,
+        tui_style: Some(options.style),
+    };
+
+    let mut app = App::new(style, user_config);
+    app.started_daemon = started_daemon;
+
+    // Connect to daemon
+    if let Err(e) = app.connect(socket_path).await {
+        tracing::warn!(error = %e, "failed to connect to daemon");
+    }
+
+    // Run TUI
+    app.run()?;
+
+    Ok(())
 }
 
 fn now_ms() -> u64 {
