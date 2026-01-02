@@ -110,7 +110,11 @@ async fn main() -> Result<()> {
 
     // Initialize logging - suppress for TUI mode to avoid corrupting display
     if !is_tui_mode {
-        let filter = if cli.debug { "debug" } else { "info" };
+        let filter = if cli.debug {
+            "debug,globset=info"
+        } else {
+            "info"
+        };
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
