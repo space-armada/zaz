@@ -38,3 +38,6 @@ watch:
 
 deps:
 	rustup component add clippy rustfmt
+
+run-debug:
+	./target/debug/zaz
