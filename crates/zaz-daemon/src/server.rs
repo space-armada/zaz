@@ -7,13 +7,27 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 /// Default socket path.
+///
+/// Uses `$XDG_RUNTIME_DIR/zaz.sock` if available (preferred).
+/// Falls back to `~/.local/state/zaz/zaz.sock` for user-specific access.
+/// As a last resort, uses `/tmp/zaz-<username>.sock`.
 pub fn default_socket_path() -> PathBuf {
-    // Use XDG_RUNTIME_DIR if available, otherwise /tmp
+    // Prefer XDG_RUNTIME_DIR (e.g., /run/user/1000/) - already user-private
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime_dir).join("zaz.sock")
-    } else {
-        PathBuf::from("/tmp").join(format!("zaz-{}.sock", std::process::id()))
+        return PathBuf::from(runtime_dir).join("zaz.sock");
     }
+
+    // Fall back to user's state directory (user-private via home directory permissions)
+    if let Ok(home) = std::env::var("HOME") {
+        let state_dir = PathBuf::from(home).join(".local/state/zaz");
+        // Create directory if it doesn't exist (with user-only permissions)
+        let _ = std::fs::create_dir_all(&state_dir);
+        return state_dir.join("zaz.sock");
+    }
+
+    // Last resort: /tmp with username to avoid conflicts (less secure)
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    PathBuf::from(format!("/tmp/zaz-{}.sock", user))
 }
 
 /// Unix socket server for the daemon API.

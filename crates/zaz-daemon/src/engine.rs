@@ -402,7 +402,7 @@ impl Engine {
             }
         }
 
-        // Wait for daemons to exit
+        tracing::info!("waiting for daemons to exit");
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         Ok(())
