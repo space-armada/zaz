@@ -176,6 +176,25 @@ impl ManagedChild {
             }
         }
     }
+
+    /// Get a cloneable reader for PTY output.
+    ///
+    /// Returns None for non-PTY processes. The reader can be used in a
+    /// background thread to stream output lines.
+    pub fn try_clone_reader(&self) -> Option<Box<dyn Read + Send>> {
+        match self {
+            ManagedChild::Regular(_) => None,
+            ManagedChild::Pty { master, .. } => {
+                let master = master.lock().ok()?;
+                master.try_clone_reader().ok()
+            }
+        }
+    }
+
+    /// Check if this is a PTY-managed process.
+    pub fn is_pty(&self) -> bool {
+        matches!(self, ManagedChild::Pty { .. })
+    }
 }
 
 #[cfg(test)]

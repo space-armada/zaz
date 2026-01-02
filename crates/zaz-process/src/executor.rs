@@ -94,6 +94,21 @@ impl Executor {
     ///
     /// Note: This always runs without PTY since we need to capture stdout/stderr separately.
     pub async fn run(&self, command: &str) -> Result<CommandOutput, ProcessError> {
+        self.run_with_callback(command, |_| {}).await
+    }
+
+    /// Run a command to completion, streaming output to a callback.
+    ///
+    /// The callback is called for each line of stdout/stderr as it arrives.
+    /// Lines are also collected and returned in the final output.
+    pub async fn run_with_callback<F>(
+        &self,
+        command: &str,
+        on_output: F,
+    ) -> Result<CommandOutput, ProcessError>
+    where
+        F: Fn(OutputLine) + Send + 'static,
+    {
         // For run-to-completion commands, we use regular spawn to capture output
         let child = self.spawn_regular(command)?;
 
@@ -130,38 +145,66 @@ impl Executor {
             });
         }
 
-        // Collect output
+        // Wrap callback in Arc for sharing
+        let on_output = std::sync::Arc::new(on_output);
+
+        // Collect output while streaming to callback
         let mut stdout_lines = Vec::new();
         let mut stderr_lines = Vec::new();
 
-        // Wait for process to complete
-        let status = child.wait().await.map_err(ProcessError::Spawn)?;
+        // Process output as it arrives
+        loop {
+            tokio::select! {
+                Some(line) = stdout_rx.recv() => {
+                    on_output(OutputLine::Stdout(line.clone()));
+                    stdout_lines.push(line);
+                }
+                Some(line) = stderr_rx.recv() => {
+                    on_output(OutputLine::Stderr(line.clone()));
+                    stderr_lines.push(line);
+                }
+                status = child.wait() => {
+                    let status = status.map_err(ProcessError::Spawn)?;
 
-        // Drain remaining output
-        stdout_rx.close();
-        stderr_rx.close();
+                    // Drain remaining output
+                    stdout_rx.close();
+                    stderr_rx.close();
 
-        while let Some(line) = stdout_rx.recv().await {
-            stdout_lines.push(line);
-        }
-        while let Some(line) = stderr_rx.recv().await {
-            stderr_lines.push(line);
-        }
+                    while let Some(line) = stdout_rx.recv().await {
+                        on_output(OutputLine::Stdout(line.clone()));
+                        stdout_lines.push(line);
+                    }
+                    while let Some(line) = stderr_rx.recv().await {
+                        on_output(OutputLine::Stderr(line.clone()));
+                        stderr_lines.push(line);
+                    }
 
-        let exit_code = status.code();
+                    let exit_code = status.code();
 
-        if !status.success() {
-            if let Some(code) = exit_code {
-                return Err(ProcessError::ExitStatus(code));
+                    if !status.success() {
+                        if let Some(code) = exit_code {
+                            return Err(ProcessError::ExitStatus(code));
+                        }
+                    }
+
+                    return Ok(CommandOutput {
+                        stdout: stdout_lines,
+                        stderr: stderr_lines,
+                        exit_code,
+                    });
+                }
             }
         }
-
-        Ok(CommandOutput {
-            stdout: stdout_lines,
-            stderr: stderr_lines,
-            exit_code,
-        })
     }
+}
+
+/// A line of output from a running command.
+#[derive(Debug, Clone)]
+pub enum OutputLine {
+    /// Standard output line.
+    Stdout(String),
+    /// Standard error line.
+    Stderr(String),
 }
 
 impl Default for Executor {

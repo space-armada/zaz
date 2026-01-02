@@ -1573,6 +1573,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "zaz-config",
  "zaz-process",
  "zaz-vars",

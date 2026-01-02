@@ -2,19 +2,23 @@
 //!
 //! The engine ties together configuration, file watching, and process management.
 
+use crate::api::LogLine;
 use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
 };
 use crate::{ApiResponse, DaemonError};
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group};
 use zaz_process::{Daemon, Executor, TaskRunner};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
+
+/// Maximum number of log lines to store per process.
+const MAX_LOG_LINES: usize = 10_000;
 
 /// The core orchestration engine.
 pub struct Engine {
@@ -41,6 +45,18 @@ pub struct Engine {
 
     /// Broadcast channel for status updates (for streaming subscribers).
     status_tx: broadcast::Sender<ApiResponse>,
+
+    /// Per-process log ring buffers.
+    log_buffers: HashMap<String, VecDeque<LogLine>>,
+
+    /// Broadcast channel for log streaming.
+    logs_tx: broadcast::Sender<LogLine>,
+
+    /// Channel for receiving logs from PTY reader tasks.
+    log_rx: mpsc::Receiver<LogLine>,
+
+    /// Sender for PTY reader tasks to submit logs.
+    log_tx: mpsc::Sender<LogLine>,
 }
 
 /// A managed watch group with its processes.
@@ -156,6 +172,12 @@ impl Engine {
         // Create broadcast channel for status updates (capacity 16)
         let (status_tx, _) = broadcast::channel(16);
 
+        // Create broadcast channel for log streaming (larger capacity for high-volume output)
+        let (logs_tx, _) = broadcast::channel(1024);
+
+        // Create mpsc channel for PTY reader tasks to submit logs
+        let (log_tx, log_rx) = mpsc::channel(1024);
+
         Ok(Self {
             config,
             config_path,
@@ -165,6 +187,10 @@ impl Engine {
             state,
             execution_order,
             status_tx,
+            log_buffers: HashMap::new(),
+            logs_tx,
+            log_rx,
+            log_tx,
         })
     }
 
@@ -176,6 +202,135 @@ impl Engine {
     /// Subscribe to status updates.
     pub fn subscribe(&self) -> broadcast::Receiver<ApiResponse> {
         self.status_tx.subscribe()
+    }
+
+    /// Subscribe to log stream.
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<LogLine> {
+        self.logs_tx.subscribe()
+    }
+
+    /// Get a sender for submitting logs (for the tracing layer).
+    pub fn log_sender(&self) -> mpsc::Sender<LogLine> {
+        self.log_tx.clone()
+    }
+
+    /// Add a log line to storage and broadcast.
+    pub fn push_log(&mut self, log: LogLine) {
+        // Store in per-process buffer
+        let buffer = self
+            .log_buffers
+            .entry(log.process.clone())
+            .or_insert_with(VecDeque::new);
+        buffer.push_back(log.clone());
+
+        // Trim to max size
+        while buffer.len() > MAX_LOG_LINES {
+            buffer.pop_front();
+        }
+
+        // Broadcast to subscribers (ignore errors if no subscribers)
+        let _ = self.logs_tx.send(log);
+    }
+
+    /// Get stored logs for a process.
+    ///
+    /// If `name` is "*", returns logs from all processes.
+    pub fn get_logs(&self, name: &str, limit: Option<usize>) -> Vec<LogLine> {
+        if name == "*" {
+            // Return all logs, sorted by timestamp
+            let mut all: Vec<LogLine> = self
+                .log_buffers
+                .values()
+                .flat_map(|buf| buf.iter().cloned())
+                .collect();
+            all.sort_by_key(|l| l.timestamp);
+            if let Some(n) = limit {
+                all.into_iter()
+                    .rev()
+                    .take(n)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            } else {
+                all
+            }
+        } else {
+            self.log_buffers
+                .get(name)
+                .map(|buf| {
+                    let iter = buf.iter().cloned();
+                    match limit {
+                        Some(n) => iter
+                            .rev()
+                            .take(n)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect(),
+                        None => iter.collect(),
+                    }
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    /// Spawn a background task to read PTY output and push to logs.
+    fn spawn_pty_reader(
+        &self,
+        process: String,
+        group: Option<String>,
+        reader: Box<dyn std::io::Read + Send>,
+    ) {
+        use std::io::BufRead;
+
+        let log_tx = self.log_tx.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut buf_reader = std::io::BufReader::new(reader);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match buf_reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        // Trim trailing newline
+                        let content = line.trim_end().to_string();
+                        if !content.is_empty() {
+                            let mut log_line = LogLine::process(&process, content);
+                            if let Some(ref g) = group {
+                                log_line = log_line.with_group(g.clone());
+                            }
+                            // Send to engine for storage and broadcast
+                            if log_tx.blocking_send(log_line).is_err() {
+                                // Channel closed, engine is shutting down
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            process = %process,
+                            error = %e,
+                            "PTY read error"
+                        );
+                        break;
+                    }
+                }
+            }
+
+            tracing::debug!(process = %process, "PTY reader finished");
+        });
+    }
+
+    /// Process incoming logs from PTY readers.
+    ///
+    /// This should be called regularly from the main loop to drain the log channel.
+    pub fn process_incoming_logs(&mut self) {
+        while let Ok(log) = self.log_rx.try_recv() {
+            self.push_log(log);
+        }
     }
 
     /// Run the initial startup sequence.
@@ -247,9 +402,40 @@ impl Engine {
             self.update_state();
 
             let start = std::time::Instant::now();
+
+            // Push daemon log for task start
+            self.push_log(
+                LogLine::daemon(task.name(), format!("running: {}", command))
+                    .with_group(group_name.to_string()),
+            );
+
             match task_runner.run(&command).await {
                 Ok(output) => {
                     let duration = start.elapsed();
+
+                    // Push task output as process logs
+                    for line in &output.stdout {
+                        self.push_log(
+                            LogLine::process(task.name(), line.clone())
+                                .with_group(group_name.to_string()),
+                        );
+                    }
+                    for line in &output.stderr {
+                        self.push_log(
+                            LogLine::process(task.name(), line.clone())
+                                .with_group(group_name.to_string()),
+                        );
+                    }
+
+                    // Push daemon log for task completion
+                    self.push_log(
+                        LogLine::daemon(
+                            task.name(),
+                            format!("completed in {}ms", duration.as_millis()),
+                        )
+                        .with_group(group_name.to_string()),
+                    );
+
                     tracing::info!(
                         task = %task.name(),
                         duration_ms = duration.as_millis(),
@@ -263,6 +449,12 @@ impl Engine {
                     }
                 }
                 Err(e) => {
+                    // Push daemon log for task failure
+                    self.push_log(
+                        LogLine::daemon(task.name(), format!("failed: {}", e))
+                            .with_group(group_name.to_string()),
+                    );
+
                     tracing::error!(task = %task.name(), error = %e, "task failed");
                     if let Some(group) = self.groups.get_mut(group_name) {
                         group.state.tasks[idx].status = ProcessStatus::Failed;
@@ -278,6 +470,29 @@ impl Engine {
         }
 
         // Start or restart daemons
+        // Collect daemon names first to avoid borrow conflicts
+        let daemon_names: Vec<String> = self
+            .groups
+            .get(group_name)
+            .map(|g| g.daemons.iter().map(|d| d.name().to_string()).collect())
+            .unwrap_or_default();
+
+        for daemon_name in &daemon_names {
+            if is_change_triggered {
+                self.push_log(
+                    LogLine::daemon(daemon_name, "restarting").with_group(group_name.to_string()),
+                );
+            } else {
+                self.push_log(
+                    LogLine::daemon(daemon_name, "starting").with_group(group_name.to_string()),
+                );
+            }
+        }
+
+        // Collect PTY readers for newly started daemons
+        let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
+            Vec::new();
+
         if let Some(group) = self.groups.get_mut(group_name) {
             for (idx, daemon) in group.daemons.iter_mut().enumerate() {
                 if is_change_triggered {
@@ -288,6 +503,15 @@ impl Engine {
                     // Start daemon for the first time
                     tracing::info!(daemon = %daemon.name(), "starting daemon");
                     daemon.start().map_err(DaemonError::Process)?;
+
+                    // Get PTY reader for streaming output
+                    if let Some(reader) = daemon.try_clone_reader() {
+                        pty_readers.push((
+                            daemon.name().to_string(),
+                            Some(group_name.to_string()),
+                            reader,
+                        ));
+                    }
                 }
 
                 group.state.daemons[idx].status = ProcessStatus::Running;
@@ -295,6 +519,11 @@ impl Engine {
             }
 
             group.state.status = GroupStatus::Ready;
+        }
+
+        // Spawn PTY reader tasks (outside the mutable borrow)
+        for (process, group, reader) in pty_readers {
+            self.spawn_pty_reader(process, group, reader);
         }
 
         self.update_state();
@@ -362,7 +591,11 @@ impl Engine {
 
     /// Check daemon processes and handle restarts.
     pub async fn check_daemons(&mut self) -> Result<(), DaemonError> {
-        for group in self.groups.values_mut() {
+        // Collect PTY readers for restarted daemons
+        let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
+            Vec::new();
+
+        for (group_name, group) in self.groups.iter_mut() {
             for (idx, daemon) in group.daemons.iter_mut().enumerate() {
                 let exited = daemon.check().await.map_err(DaemonError::Process)?;
 
@@ -382,10 +615,24 @@ impl Engine {
                     tokio::time::sleep(delay).await;
                     daemon.start().map_err(DaemonError::Process)?;
 
+                    // Get PTY reader for streaming output
+                    if let Some(reader) = daemon.try_clone_reader() {
+                        pty_readers.push((
+                            daemon.name().to_string(),
+                            Some(group_name.clone()),
+                            reader,
+                        ));
+                    }
+
                     group.state.daemons[idx].status = ProcessStatus::Running;
                     group.state.daemons[idx].pid = daemon.pid();
                 }
             }
+        }
+
+        // Spawn PTY reader tasks (outside the mutable borrow)
+        for (process, group, reader) in pty_readers {
+            self.spawn_pty_reader(process, group, reader);
         }
 
         self.update_state();
@@ -481,19 +728,14 @@ impl Engine {
                     state: self.state.clone(),
                 }
             }
-            ApiRequest::GetLogs { name, lines: _ } => {
-                // TODO: implement log storage
-                ApiResponse::Logs {
-                    name,
-                    lines: vec![],
-                }
+            ApiRequest::GetLogs { name, lines } => {
+                let logs = self.get_logs(&name, lines);
+                ApiResponse::Logs { name, lines: logs }
             }
             ApiRequest::SubscribeLogs { name } => {
-                // TODO: implement log streaming
-                ApiResponse::Logs {
-                    name,
-                    lines: vec![],
-                }
+                // Return current logs; caller should use subscribe_logs() for streaming
+                let logs = self.get_logs(&name, Some(100));
+                ApiResponse::Logs { name, lines: logs }
             }
             ApiRequest::RestartGroup { name } => match self.restart_group(&name).await {
                 Ok(()) => ApiResponse::ok_with_message(format!("restarted group '{}'", name)),

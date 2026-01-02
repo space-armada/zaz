@@ -11,7 +11,7 @@ mod task;
 
 pub use daemon::{Daemon, DaemonState};
 pub use error::ProcessError;
-pub use executor::{CommandOutput, Executor};
+pub use executor::{CommandOutput, Executor, OutputLine};
 pub use pty::ManagedChild;
 pub use signal::SignalHandler;
 pub use task::TaskRunner;

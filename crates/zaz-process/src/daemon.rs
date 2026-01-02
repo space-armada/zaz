@@ -182,4 +182,18 @@ impl Daemon {
     pub fn restart_delay(&self) -> Duration {
         self.restart_delay
     }
+
+    /// Get a reader for PTY output, if available.
+    ///
+    /// Returns None if:
+    /// - The daemon is not running
+    /// - The daemon is not using a PTY
+    pub fn try_clone_reader(&self) -> Option<Box<dyn std::io::Read + Send>> {
+        self.child.as_ref().and_then(|c| c.try_clone_reader())
+    }
+
+    /// Check if this daemon uses a PTY.
+    pub fn is_pty(&self) -> bool {
+        self.child.as_ref().map(|c| c.is_pty()).unwrap_or(false)
+    }
 }

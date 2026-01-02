@@ -4,6 +4,69 @@ use crate::state::DaemonState;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+/// Source of a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogSource {
+    /// Output from a process (stdout/stderr).
+    Process,
+    /// Internal daemon log (zaz messages).
+    Daemon,
+}
+
+/// A single log line with metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogLine {
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp: u64,
+    /// Process/task name this log is associated with.
+    pub process: String,
+    /// Group name (optional, for context).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// The log content.
+    pub content: String,
+    /// Source of the log (process output vs daemon internal).
+    pub source: LogSource,
+}
+
+impl LogLine {
+    /// Create a new process log line.
+    pub fn process(process: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            timestamp: now_ms(),
+            process: process.into(),
+            group: None,
+            content: content.into(),
+            source: LogSource::Process,
+        }
+    }
+
+    /// Create a new daemon log line.
+    pub fn daemon(process: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            timestamp: now_ms(),
+            process: process.into(),
+            group: None,
+            content: content.into(),
+            source: LogSource::Daemon,
+        }
+    }
+
+    /// Set the group for this log line.
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// API request from client to daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -70,10 +133,10 @@ pub enum ApiResponse {
     StatusUpdate { state: DaemonState },
 
     /// Log lines (one-shot).
-    Logs { name: String, lines: Vec<String> },
+    Logs { name: String, lines: Vec<LogLine> },
 
     /// Log line (streaming).
-    LogLine { name: String, line: String },
+    Log(LogLine),
 
     /// Error response.
     Error { message: String },
