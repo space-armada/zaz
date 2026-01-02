@@ -392,18 +392,54 @@ impl Engine {
     }
 
     /// Shutdown all processes gracefully.
+    ///
+    /// Sends SIGTERM to all daemons, waits up to grace_period for them to exit,
+    /// then sends SIGKILL to any that are still running.
     pub async fn shutdown(&mut self) -> Result<(), DaemonError> {
+        const GRACE_PERIOD: Duration = Duration::from_secs(10);
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
         tracing::info!("shutting down");
         self.state.status = DaemonStatus::Stopping;
 
+        // Send SIGTERM to all daemons
         for group in self.groups.values_mut() {
             for daemon in &mut group.daemons {
                 daemon.stop().map_err(DaemonError::Process)?;
             }
         }
 
-        tracing::info!("waiting for daemons to exit");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Wait for daemons to exit, up to grace period
+        let deadline = std::time::Instant::now() + GRACE_PERIOD;
+        loop {
+            let mut any_running = false;
+            for group in self.groups.values_mut() {
+                for daemon in &mut group.daemons {
+                    if daemon.is_running() {
+                        any_running = true;
+                    }
+                }
+            }
+
+            if !any_running {
+                tracing::info!("all daemons exited");
+                break;
+            }
+
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("grace period expired, force killing remaining daemons");
+                for group in self.groups.values_mut() {
+                    for daemon in &mut group.daemons {
+                        if daemon.is_running() {
+                            daemon.kill().map_err(DaemonError::Process)?;
+                        }
+                    }
+                }
+                break;
+            }
+
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
 
         Ok(())
     }
