@@ -8,8 +8,8 @@ mod error;
 mod server;
 mod state;
 
-pub use api::{ApiRequest, ApiResponse};
+pub use api::{ApiRequest, ApiResponse, EngineCommand};
 pub use engine::Engine;
 pub use error::DaemonError;
-pub use server::Server;
+pub use server::{default_socket_path, Client, Server};
 pub use state::{DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus};

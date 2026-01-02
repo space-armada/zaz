@@ -5,10 +5,11 @@
 use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
 };
-use crate::DaemonError;
+use crate::{ApiResponse, DaemonError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::sync::broadcast;
 use zaz_config::{Config, Group};
 use zaz_process::{Daemon, Executor, TaskRunner};
 use zaz_vars::Context;
@@ -36,6 +37,9 @@ pub struct Engine {
 
     /// Topologically sorted group names for dependency ordering.
     execution_order: Vec<String>,
+
+    /// Broadcast channel for status updates (for streaming subscribers).
+    status_tx: broadcast::Sender<ApiResponse>,
 }
 
 /// A managed watch group with its processes.
@@ -148,6 +152,9 @@ impl Engine {
             last_change: None,
         };
 
+        // Create broadcast channel for status updates (capacity 16)
+        let (status_tx, _) = broadcast::channel(16);
+
         Ok(Self {
             config,
             config_path,
@@ -156,12 +163,18 @@ impl Engine {
             groups,
             state,
             execution_order,
+            status_tx,
         })
     }
 
     /// Get current daemon state.
     pub fn state(&self) -> &DaemonState {
         &self.state
+    }
+
+    /// Subscribe to status updates.
+    pub fn subscribe(&self) -> broadcast::Receiver<ApiResponse> {
+        self.status_tx.subscribe()
     }
 
     /// Run the initial startup sequence.
@@ -410,6 +423,60 @@ impl Engine {
         Ok(())
     }
 
+    /// Handle an API request and return a response.
+    ///
+    /// For Subscribe/SubscribeLogs requests, returns Ok to acknowledge,
+    /// then the caller should use `subscribe()` to get the broadcast receiver.
+    pub async fn handle_request(&mut self, request: crate::ApiRequest) -> crate::ApiResponse {
+        use crate::{ApiRequest, ApiResponse};
+
+        match request {
+            ApiRequest::Status | ApiRequest::ListGroups => {
+                self.update_state();
+                ApiResponse::Status {
+                    state: self.state.clone(),
+                }
+            }
+            ApiRequest::Subscribe => {
+                // Caller should use engine.subscribe() to get broadcast receiver
+                self.update_state();
+                ApiResponse::Status {
+                    state: self.state.clone(),
+                }
+            }
+            ApiRequest::GetLogs { name, lines: _ } => {
+                // TODO: implement log storage
+                ApiResponse::Logs {
+                    name,
+                    lines: vec![],
+                }
+            }
+            ApiRequest::SubscribeLogs { name } => {
+                // TODO: implement log streaming
+                ApiResponse::Logs {
+                    name,
+                    lines: vec![],
+                }
+            }
+            ApiRequest::RestartGroup { name } => match self.restart_group(&name).await {
+                Ok(()) => ApiResponse::ok_with_message(format!("restarted group '{}'", name)),
+                Err(e) => ApiResponse::error(format!("failed to restart group '{}': {}", name, e)),
+            },
+            ApiRequest::RestartAll => match self.restart_all().await {
+                Ok(()) => ApiResponse::ok_with_message("restarted all groups"),
+                Err(e) => ApiResponse::error(format!("failed to restart: {}", e)),
+            },
+            ApiRequest::ReloadConfig => {
+                // TODO: implement config hot-reload
+                ApiResponse::error("config reload not yet implemented")
+            }
+            ApiRequest::Shutdown => {
+                // Signal handled by caller
+                ApiResponse::ok_with_message("shutting down")
+            }
+        }
+    }
+
     /// Create a combined pattern set from all groups.
     fn combined_patterns(&self) -> Result<PatternSet, DaemonError> {
         let mut includes = Vec::new();
@@ -423,13 +490,18 @@ impl Engine {
         PatternSet::new(&includes, &ignores).map_err(DaemonError::Watch)
     }
 
-    /// Update the internal state from group states.
+    /// Update the internal state from group states and broadcast to subscribers.
     fn update_state(&mut self) {
         self.state.groups = self
             .groups
             .iter()
             .map(|(k, v)| (k.clone(), v.state.clone()))
             .collect();
+
+        // Broadcast status update to subscribers (ignore send errors - no subscribers)
+        let _ = self.status_tx.send(ApiResponse::StatusUpdate {
+            state: self.state.clone(),
+        });
     }
 }
 
