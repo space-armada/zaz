@@ -1,0 +1,39 @@
+# zaz configuration for developing zaz itself
+
+[settings]
+debounce_ms = 200
+
+[variables]
+cargo_flags = "--workspace"
+
+# Rust source files
+[[group]]
+name = "rust"
+patterns = ["**/*.rs", "Cargo.toml", "Cargo.lock"]
+ignore = ["target/**"]
+
+  [[group.task]]
+  name = "fmt-check"
+  command = "cargo fmt --check"
+
+  [[group.task]]
+  name = "clippy"
+  command = "cargo clippy --all-targets --all-features -- -D warnings"
+
+  [[group.task]]
+  name = "build"
+  command = "cargo build"
+
+  [[group.task]]
+  name = "test"
+  command = "cargo test ${cargo_flags}"
+
+# Markdown files
+[[group]]
+name = "markdown"
+patterns = ["**/*.md"]
+ignore = ["target/**"]
+
+  [[group.task]]
+  name = "lint-md"
+  command = "bin/rumdl check ."
