@@ -104,7 +104,7 @@ impl Daemon {
         Ok(())
     }
 
-    /// Stop the daemon.
+    /// Stop the daemon gracefully (SIGTERM).
     pub fn stop(&mut self) -> Result<(), ProcessError> {
         self.state = DaemonState::Stopping;
 
@@ -116,6 +116,28 @@ impl Daemon {
         }
 
         Ok(())
+    }
+
+    /// Force kill the daemon (SIGKILL).
+    pub fn kill(&mut self) -> Result<(), ProcessError> {
+        if let Some(child) = &self.child {
+            if let Some(pid) = child.id() {
+                tracing::warn!(name = %self.config.name(), pid = pid, "force killing daemon");
+                SignalHandler::send_to_group(pid as i32, Signal::SIGKILL)?;
+            }
+        }
+        self.child = None;
+        self.state = DaemonState::Stopped;
+        Ok(())
+    }
+
+    /// Check if the daemon is still running.
+    pub fn is_running(&mut self) -> bool {
+        let Some(child) = &mut self.child else {
+            return false;
+        };
+        // try_wait returns Ok(Some(_)) if exited, Ok(None) if still running
+        matches!(child.try_wait(), Ok(None))
     }
 
     /// Check if the daemon has exited and handle restart logic.
