@@ -136,10 +136,7 @@ impl LogBuffer {
 
     /// Add a log line for a process.
     pub fn push(&mut self, log: LogLine) {
-        let buffer = self
-            .logs
-            .entry(log.process)
-            .or_insert_with(VecDeque::new);
+        let buffer = self.logs.entry(log.process).or_insert_with(VecDeque::new);
         buffer.push_back(StoredLog {
             content: log.content,
             source: log.source,
@@ -374,7 +371,11 @@ mod tests {
     fn test_push_logs() {
         let mut buffer = LogBuffer::new();
         buffer.push_line("server", "Started on :8080".to_string(), LogSource::Process);
-        buffer.push_line("server", "Connection accepted".to_string(), LogSource::Process);
+        buffer.push_line(
+            "server",
+            "Connection accepted".to_string(),
+            LogSource::Process,
+        );
         buffer.push_line("worker", "Processing job 1".to_string(), LogSource::Process);
 
         assert!(!buffer.is_empty());

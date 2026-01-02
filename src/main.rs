@@ -102,15 +102,20 @@ impl TuiOptions {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    let filter = if cli.debug { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
-
     // Determine socket path
     let socket_path = cli.socket.clone().unwrap_or_else(default_socket_path);
+
+    // Determine if we're running in TUI mode (default command with no subcommand)
+    let is_tui_mode = cli.command.is_none();
+
+    // Initialize logging - suppress for TUI mode to avoid corrupting display
+    if !is_tui_mode {
+        let filter = if cli.debug { "debug" } else { "info" };
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .init();
+    }
 
     match cli.command {
         Some(Commands::Task) => {

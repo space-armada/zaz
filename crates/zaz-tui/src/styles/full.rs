@@ -229,7 +229,9 @@ impl FullStyle {
                 let line_style = if is_match {
                     Style::default().bg(Color::Yellow).fg(Color::Black)
                 } else if is_daemon_log {
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM)
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::DIM)
                 } else {
                     Style::default()
                 };
