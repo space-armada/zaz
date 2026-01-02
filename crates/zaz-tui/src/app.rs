@@ -93,8 +93,10 @@ pub struct App {
     pub selected_pane: usize,
     /// Current page for pagination (minimal style, >6 tasks).
     pub current_page: usize,
-    /// Log scroll offset.
+    /// Log scroll offset (first visible line).
     pub log_scroll: usize,
+    /// Visible height of log pane (updated during render).
+    pub log_visible_height: usize,
     /// Whether to show full timestamps (vs compact time-only).
     pub show_full_timestamp: bool,
 
@@ -183,6 +185,7 @@ impl App {
             selected_pane: 0,
             current_page: 0,
             log_scroll: 0,
+            log_visible_height: 20, // Default, updated during render
             show_full_timestamp: false,
             input_mode: InputMode::Normal,
             filter_input: String::new(),
@@ -523,6 +526,23 @@ impl App {
         None
     }
 
+    /// Get the maximum valid scroll offset for logs.
+    fn max_log_scroll(&self) -> usize {
+        let total = self.logs.all_logs_combined().len();
+        total.saturating_sub(self.log_visible_height)
+    }
+
+    /// Sync log_scroll to the actual position when leaving follow mode.
+    fn sync_log_scroll(&mut self) {
+        if self.logs.is_following() {
+            // When following, the view is at the bottom
+            self.log_scroll = self.max_log_scroll();
+        } else {
+            // Clamp to valid range
+            self.log_scroll = self.log_scroll.min(self.max_log_scroll());
+        }
+    }
+
     fn navigate_down(&mut self) {
         match self.style {
             TuiStyle::Full => {
@@ -534,10 +554,11 @@ impl App {
                         }
                     }
                     Focus::Logs => {
-                        // Scroll logs down
+                        // Sync scroll position before disabling follow mode
+                        self.sync_log_scroll();
                         self.logs.disable_follow();
-                        let total = self.logs.all_logs_combined().len();
-                        if self.log_scroll < total.saturating_sub(1) {
+                        let max_scroll = self.max_log_scroll();
+                        if self.log_scroll < max_scroll {
                             self.log_scroll += 1;
                         }
                     }
@@ -569,7 +590,8 @@ impl App {
                         }
                     }
                     Focus::Logs => {
-                        // Scroll logs up
+                        // Sync scroll position before disabling follow mode
+                        self.sync_log_scroll();
                         self.logs.disable_follow();
                         if self.log_scroll > 0 {
                             self.log_scroll -= 1;
@@ -667,18 +689,22 @@ impl App {
     }
 
     fn scroll_to_bottom(&mut self) {
-        // This will be calculated based on actual log count during render
-        self.log_scroll = usize::MAX;
+        self.log_scroll = self.max_log_scroll();
         self.logs.enable_follow();
     }
 
     fn page_up(&mut self) {
+        self.sync_log_scroll();
         self.log_scroll = self.log_scroll.saturating_sub(20);
         self.logs.disable_follow();
     }
 
     fn page_down(&mut self) {
-        self.log_scroll = self.log_scroll.saturating_add(20);
+        self.sync_log_scroll();
+        self.log_scroll = self
+            .log_scroll
+            .saturating_add(20)
+            .min(self.max_log_scroll());
     }
 
     fn prev_page(&mut self) {

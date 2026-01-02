@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 /// Draw the main UI.
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.style {
         TuiStyle::Full => draw_full_style(frame, app),
         TuiStyle::Minimal => draw_minimal_style(frame, app),
@@ -30,7 +30,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_full_style(frame: &mut Frame, app: &App) {
+fn draw_full_style(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // Status bar height: 5 lines for multi-line layout, 3 for compact
@@ -95,7 +95,7 @@ fn calculate_groups_width(app: &App) -> u16 {
     max_width as u16
 }
 
-fn draw_minimal_style(frame: &mut Frame, app: &App) {
+fn draw_minimal_style(frame: &mut Frame, app: &mut App) {
     // Placeholder: will be fully implemented in Phase 7.8
     // For now, just show a simple layout
     let area = frame.area();
@@ -440,7 +440,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
     use crate::logs::timestamp_to_day;
 
     let border_style = if app.focus == Focus::Logs {
@@ -455,6 +455,9 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
     // Calculate visible range
     let visible_height = area.height.saturating_sub(2) as usize; // Account for borders
     let total_lines = combined.len();
+
+    // Update app's visible height for scroll calculations
+    app.log_visible_height = visible_height;
 
     // Handle scroll position
     let scroll_offset = if app.logs.is_following() {
