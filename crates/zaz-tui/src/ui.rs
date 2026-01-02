@@ -483,7 +483,7 @@ fn draw_logs(frame: &mut Frame, app: &mut App, area: Rect) {
             let is_daemon_log = log.source == crate::daemon::LogSource::Daemon;
 
             let line_style = if is_match {
-                Style::default().bg(Color::Yellow).fg(Color::Black)
+                Style::default().add_modifier(Modifier::REVERSED)
             } else if is_daemon_log {
                 Style::default()
                     .fg(Color::Magenta)
