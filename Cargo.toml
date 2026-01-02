@@ -43,6 +43,9 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 
+# Regex
+regex = "1"
+
 # Testing
 tempfile = "3"
 
