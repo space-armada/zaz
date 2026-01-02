@@ -84,6 +84,8 @@ pub struct App {
     pub current_page: usize,
     /// Log scroll offset.
     pub log_scroll: usize,
+    /// Whether to show full timestamps (vs compact time-only).
+    pub show_full_timestamp: bool,
 
     // === Input Modes ===
     /// Current input mode.
@@ -124,6 +126,7 @@ impl App {
             selected_pane: 0,
             current_page: 0,
             log_scroll: 0,
+            show_full_timestamp: false,
             input_mode: InputMode::Normal,
             filter_input: String::new(),
             search_input: String::new(),
@@ -191,6 +194,11 @@ impl App {
             TuiStyle::Full => Focus::Groups,
             TuiStyle::Minimal => Focus::Pane(0),
         };
+    }
+
+    /// Toggle timestamp display mode (compact vs full).
+    pub fn toggle_timestamp(&mut self) {
+        self.show_full_timestamp = !self.show_full_timestamp;
     }
 
     /// Poll for updates from the daemon.
@@ -321,6 +329,17 @@ impl App {
                         "Follow mode ON"
                     } else {
                         "Follow mode OFF"
+                    };
+                    self.set_status(status);
+                }
+
+                // Timestamp display toggle
+                KeyCode::Char('t') => {
+                    self.toggle_timestamp();
+                    let status = if self.show_full_timestamp {
+                        "Full timestamps"
+                    } else {
+                        "Compact timestamps"
                     };
                     self.set_status(status);
                 }

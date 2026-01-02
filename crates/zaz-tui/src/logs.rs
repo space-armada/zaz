@@ -10,10 +10,160 @@ use crate::daemon::{LogLine, LogSource};
 /// A stored log entry with source info.
 #[derive(Debug, Clone)]
 pub struct StoredLog {
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp: u64,
     /// The log content.
     pub content: String,
     /// Source of the log.
     pub source: LogSource,
+}
+
+impl StoredLog {
+    /// Format the timestamp for display.
+    ///
+    /// - `reference_day`: The day number of the first log (for calculating +N days)
+    /// - `full`: If true, show full date-time; if false, show compact time with day offset
+    pub fn format_timestamp(&self, reference_day: u64, full: bool) -> String {
+        format_timestamp_ms(self.timestamp, reference_day, full)
+    }
+}
+
+/// Format a timestamp in milliseconds for display.
+///
+/// - `timestamp_ms`: Unix timestamp in milliseconds
+/// - `reference_day`: The day number of the first log (for calculating +N days)
+/// - `full`: If true, show full date-time; if false, show compact time with day offset
+pub fn format_timestamp_ms(timestamp_ms: u64, reference_day: u64, full: bool) -> String {
+    let secs = timestamp_ms / 1000;
+
+    // Convert to local time
+    let local_secs = secs as i64 + local_offset_secs();
+
+    // Calculate time components (handle negative values from timezone)
+    let adjusted_secs = if local_secs < 0 { 0 } else { local_secs };
+    let time_of_day = adjusted_secs % 86400;
+    let hours = (time_of_day / 3600) % 24;
+    let minutes = (time_of_day / 60) % 60;
+    let seconds = time_of_day % 60;
+
+    if full {
+        // Full format: YYYY-MM-DD HH:MM:SS
+        let days_since_epoch = adjusted_secs / 86400;
+        let (year, month, day) = days_to_ymd(days_since_epoch);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            year, month, day, hours, minutes, seconds
+        )
+    } else {
+        // Compact format: HH:MM:SS or HH:MM:SS +N
+        let current_day = (adjusted_secs / 86400) as u64;
+        let day_offset = current_day.saturating_sub(reference_day);
+
+        if day_offset == 0 {
+            format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+        } else {
+            format!("{:02}:{:02}:{:02} +{}", hours, minutes, seconds, day_offset)
+        }
+    }
+}
+
+/// Get the day number for a timestamp (for reference calculations).
+pub fn timestamp_to_day(timestamp_ms: u64) -> u64 {
+    let secs = timestamp_ms / 1000;
+    let local_secs = secs as i64 + local_offset_secs();
+    let adjusted_secs = if local_secs < 0 { 0 } else { local_secs };
+    (adjusted_secs / 86400) as u64
+}
+
+/// Get local timezone offset in seconds.
+///
+/// Uses the system's current local time to calculate offset from UTC.
+fn local_offset_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Get current time in both UTC and local
+    let now = SystemTime::now();
+    let utc_secs = now.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
+    // Use the tm_gmtoff from localtime if available (Unix)
+    // For simplicity, we'll calculate based on current time behavior
+    #[cfg(unix)]
+    {
+        use std::mem::MaybeUninit;
+
+        unsafe {
+            let time_t = utc_secs as i64;
+            let mut tm = MaybeUninit::<libc_tm>::uninit();
+
+            extern "C" {
+                fn localtime_r(timep: *const i64, result: *mut libc_tm) -> *mut libc_tm;
+            }
+
+            if !localtime_r(&time_t, tm.as_mut_ptr()).is_null() {
+                let tm = tm.assume_init();
+                return tm.tm_gmtoff as i64;
+            }
+        }
+    }
+
+    0 // Default to UTC
+}
+
+/// Minimal tm struct for Unix localtime_r
+#[cfg(unix)]
+#[repr(C)]
+struct libc_tm {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
+    tm_gmtoff: i64,
+    tm_zone: *const i8,
+}
+
+/// Convert days since epoch to year/month/day.
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    // Simple algorithm - doesn't handle all edge cases perfectly
+    let mut remaining = days;
+    let mut year = 1970i32;
+
+    // Count years
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        year += 1;
+    }
+
+    // Count months
+    let month_days = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1u32;
+    for &days_in_month in &month_days {
+        if remaining < days_in_month {
+            break;
+        }
+        remaining -= days_in_month;
+        month += 1;
+    }
+
+    let day = remaining as u32 + 1;
+    (year, month, day)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 /// Default maximum lines per process.
@@ -138,6 +288,7 @@ impl LogBuffer {
     pub fn push(&mut self, log: LogLine) {
         let buffer = self.logs.entry(log.process).or_insert_with(VecDeque::new);
         buffer.push_back(StoredLog {
+            timestamp: log.timestamp,
             content: log.content,
             source: log.source,
         });
@@ -148,13 +299,23 @@ impl LogBuffer {
         }
     }
 
-    /// Add a log line with process, content, and source directly.
-    pub fn push_line(&mut self, process: &str, content: String, source: LogSource) {
+    /// Add a log line with process, content, timestamp, and source directly.
+    pub fn push_line(
+        &mut self,
+        process: &str,
+        content: String,
+        timestamp: u64,
+        source: LogSource,
+    ) {
         let buffer = self
             .logs
             .entry(process.to_string())
             .or_insert_with(VecDeque::new);
-        buffer.push_back(StoredLog { content, source });
+        buffer.push_back(StoredLog {
+            timestamp,
+            content,
+            source,
+        });
 
         // Enforce max lines
         while buffer.len() > self.max_lines {
@@ -370,13 +531,14 @@ mod tests {
     #[test]
     fn test_push_logs() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Started on :8080".to_string(), LogSource::Process);
+        buffer.push_line("server", "Started on :8080".to_string(), 1000, LogSource::Process);
         buffer.push_line(
             "server",
             "Connection accepted".to_string(),
+            2000,
             LogSource::Process,
         );
-        buffer.push_line("worker", "Processing job 1".to_string(), LogSource::Process);
+        buffer.push_line("worker", "Processing job 1".to_string(), 3000, LogSource::Process);
 
         assert!(!buffer.is_empty());
         assert_eq!(buffer.len_for("server"), 2);
@@ -389,7 +551,7 @@ mod tests {
         let mut buffer = LogBuffer::with_max_lines(3);
 
         for i in 0..5 {
-            buffer.push_line("test", format!("Line {}", i), LogSource::Process);
+            buffer.push_line("test", format!("Line {}", i), i as u64 * 1000, LogSource::Process);
         }
 
         assert_eq!(buffer.len_for("test"), 3);
@@ -402,10 +564,10 @@ mod tests {
     #[test]
     fn test_filter() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "INFO: Started".to_string(), LogSource::Process);
-        buffer.push_line("server", "DEBUG: Details".to_string(), LogSource::Process);
-        buffer.push_line("server", "ERROR: Failed".to_string(), LogSource::Process);
-        buffer.push_line("server", "INFO: Running".to_string(), LogSource::Process);
+        buffer.push_line("server", "INFO: Started".to_string(), 1000, LogSource::Process);
+        buffer.push_line("server", "DEBUG: Details".to_string(), 2000, LogSource::Process);
+        buffer.push_line("server", "ERROR: Failed".to_string(), 3000, LogSource::Process);
+        buffer.push_line("server", "INFO: Running".to_string(), 4000, LogSource::Process);
 
         // No filter
         let logs = buffer.filtered_logs("server");
@@ -437,10 +599,10 @@ mod tests {
     #[test]
     fn test_search() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Line 1".to_string(), LogSource::Process);
-        buffer.push_line("server", "match here".to_string(), LogSource::Process);
-        buffer.push_line("server", "Line 3".to_string(), LogSource::Process);
-        buffer.push_line("server", "Another match".to_string(), LogSource::Process);
+        buffer.push_line("server", "Line 1".to_string(), 1000, LogSource::Process);
+        buffer.push_line("server", "match here".to_string(), 2000, LogSource::Process);
+        buffer.push_line("server", "Line 3".to_string(), 3000, LogSource::Process);
+        buffer.push_line("server", "Another match".to_string(), 4000, LogSource::Process);
 
         buffer.start_search("match").unwrap();
         assert!(buffer.has_search());
@@ -457,7 +619,7 @@ mod tests {
     #[test]
     fn test_search_case_insensitive() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Match here".to_string(), LogSource::Process);
+        buffer.push_line("server", "Match here".to_string(), 1000, LogSource::Process);
 
         // Case-insensitive search with regex
         buffer.start_search("(?i)match").unwrap();
@@ -502,8 +664,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Line 1".to_string(), LogSource::Process);
-        buffer.push_line("worker", "Line 2".to_string(), LogSource::Process);
+        buffer.push_line("server", "Line 1".to_string(), 1000, LogSource::Process);
+        buffer.push_line("worker", "Line 2".to_string(), 2000, LogSource::Process);
 
         buffer.clear_process("server");
         assert_eq!(buffer.len_for("server"), 0);
@@ -516,9 +678,9 @@ mod tests {
     #[test]
     fn test_all_logs_combined() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Server line 1".to_string(), LogSource::Process);
-        buffer.push_line("worker", "Worker line 1".to_string(), LogSource::Process);
-        buffer.push_line("server", "Server line 2".to_string(), LogSource::Process);
+        buffer.push_line("server", "Server line 1".to_string(), 1000, LogSource::Process);
+        buffer.push_line("worker", "Worker line 1".to_string(), 2000, LogSource::Process);
+        buffer.push_line("server", "Server line 2".to_string(), 3000, LogSource::Process);
 
         let combined = buffer.all_logs_combined();
         assert_eq!(combined.len(), 3);

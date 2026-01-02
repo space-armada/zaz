@@ -197,6 +197,8 @@ impl FullStyle {
     }
 
     fn draw_logs(&self, frame: &mut Frame, app: &App, area: Rect) {
+        use crate::logs::timestamp_to_day;
+
         let border_style = if app.focus == Focus::Logs {
             Style::default().fg(Color::Cyan)
         } else {
@@ -217,6 +219,12 @@ impl FullStyle {
             app.log_scroll
                 .min(total_lines.saturating_sub(visible_height))
         };
+
+        // Get reference day from first log (for day offset calculation)
+        let reference_day = combined
+            .first()
+            .map(|(_, _, log)| timestamp_to_day(log.timestamp))
+            .unwrap_or(0);
 
         let items: Vec<ListItem> = combined
             .iter()
@@ -243,7 +251,14 @@ impl FullStyle {
                     log.content.clone()
                 };
 
+                // Format timestamp
+                let timestamp = log.format_timestamp(reference_day, app.show_full_timestamp);
+
                 ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     Span::styled(
                         format!("[{}] ", process),
                         Style::default().fg(Color::DarkGray),

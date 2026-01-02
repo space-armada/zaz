@@ -336,10 +336,18 @@ impl MinimalStyle {
         };
 
         // Get logs for this process
+        use crate::logs::timestamp_to_day;
+
         let logs = app.logs.filtered_logs(&process.name);
         let visible_height = area.height.saturating_sub(2) as usize;
         let total_lines = logs.len();
         let scroll_offset = total_lines.saturating_sub(visible_height);
+
+        // Get reference day from first log (for day offset calculation)
+        let reference_day = logs
+            .first()
+            .map(|(_, log)| timestamp_to_day(log.timestamp))
+            .unwrap_or(0);
 
         let items: Vec<ListItem> = logs
             .iter()
@@ -366,7 +374,16 @@ impl MinimalStyle {
                     log.content.clone()
                 };
 
-                ListItem::new(Span::styled(content, line_style))
+                // Format timestamp
+                let timestamp = log.format_timestamp(reference_day, app.show_full_timestamp);
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{} ", timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(content, line_style),
+                ]))
             })
             .collect();
 
