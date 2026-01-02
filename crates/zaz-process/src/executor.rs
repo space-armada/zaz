@@ -21,6 +21,7 @@ pub struct CommandOutput {
 }
 
 /// Executes shell commands.
+#[derive(Clone)]
 pub struct Executor {
     shell: String,
     working_dir: Option<String>,

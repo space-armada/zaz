@@ -1,6 +1,6 @@
 //! Task command runner.
 
-use crate::{Executor, ProcessError};
+use crate::{CommandOutput, Executor, ProcessError};
 use zaz_config::TaskCommand;
 
 /// Runs task commands sequentially.
@@ -12,6 +12,11 @@ impl TaskRunner {
     /// Create a new task runner.
     pub fn new(executor: Executor) -> Self {
         Self { executor }
+    }
+
+    /// Run a raw command string and return the output.
+    pub async fn run(&self, command: &str) -> Result<CommandOutput, ProcessError> {
+        self.executor.run(command).await
     }
 
     /// Run a single task command.
