@@ -258,13 +258,22 @@ async fn background_task(
                         lines: Some(500),
                     }).await {
                         Ok(ApiResponse::Logs { lines, .. }) => {
+                            // Find max timestamp first, then send all new logs
+                            // This avoids dropping logs with the same timestamp
+                            let mut max_ts = last_log_timestamp;
+                            for line in &lines {
+                                if line.timestamp > max_ts {
+                                    max_ts = line.timestamp;
+                                }
+                            }
+                            // Send all logs newer than what we've previously seen
                             for line in lines {
-                                // Only send logs newer than what we've seen
                                 if line.timestamp > last_log_timestamp {
-                                    last_log_timestamp = line.timestamp;
                                     let _ = logs_tx.send(line.into()).await;
                                 }
                             }
+                            // Update after processing all
+                            last_log_timestamp = max_ts;
                         }
                         Ok(_) => {}
                         Err(_) => {

@@ -1,9 +1,11 @@
 //! Task command runner.
 
-use crate::{CommandOutput, Executor, ProcessError};
+use crate::{CommandOutput, Executor, OutputLine, ProcessError};
+use tokio::sync::mpsc;
 use zaz_config::TaskCommand;
 
 /// Runs task commands sequentially.
+#[derive(Clone)]
 pub struct TaskRunner {
     executor: Executor,
 }
@@ -17,6 +19,15 @@ impl TaskRunner {
     /// Run a raw command string and return the output.
     pub async fn run(&self, command: &str) -> Result<CommandOutput, ProcessError> {
         self.executor.run(command).await
+    }
+
+    /// Run a command, streaming output through an unbounded channel as it arrives.
+    pub async fn run_streaming(
+        &self,
+        command: &str,
+        output_tx: mpsc::UnboundedSender<OutputLine>,
+    ) -> Result<CommandOutput, ProcessError> {
+        self.executor.run_streaming(command, output_tx).await
     }
 
     /// Run a single task command.

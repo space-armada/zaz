@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group};
-use zaz_process::{Daemon, Executor, TaskRunner};
+use zaz_process::{Daemon, Executor, OutputLine, TaskRunner};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
 
@@ -94,8 +94,6 @@ impl Engine {
         };
 
         let mut watcher = Watcher::new(watcher_config).map_err(DaemonError::Watch)?;
-
-        // Watch the config directory
         watcher.watch(&config_dir).map_err(DaemonError::Watch)?;
 
         // Build pattern sets and managed groups
@@ -216,6 +214,13 @@ impl Engine {
 
     /// Add a log line to storage and broadcast.
     pub fn push_log(&mut self, log: LogLine) {
+        eprintln!(
+            "[DEBUG push_log] process={} source={:?} content={}",
+            log.process,
+            log.source,
+            log.content.chars().take(60).collect::<String>()
+        );
+
         // Store in per-process buffer
         let buffer = self
             .log_buffers
@@ -236,6 +241,12 @@ impl Engine {
     ///
     /// If `name` is "*", returns logs from all processes.
     pub fn get_logs(&self, name: &str, limit: Option<usize>) -> Vec<LogLine> {
+        let total_in_buffers: usize = self.log_buffers.values().map(|b| b.len()).sum();
+        eprintln!(
+            "[DEBUG get_logs] name={} limit={:?} total_in_buffers={}",
+            name, limit, total_in_buffers
+        );
+
         if name == "*" {
             // Return all logs, sorted by timestamp
             let mut all: Vec<LogLine> = self
@@ -244,7 +255,7 @@ impl Engine {
                 .flat_map(|buf| buf.iter().cloned())
                 .collect();
             all.sort_by_key(|l| l.timestamp);
-            if let Some(n) = limit {
+            let result = if let Some(n) = limit {
                 all.into_iter()
                     .rev()
                     .take(n)
@@ -254,7 +265,9 @@ impl Engine {
                     .collect()
             } else {
                 all
-            }
+            };
+            eprintln!("[DEBUG get_logs] returning {} logs", result.len());
+            result
         } else {
             self.log_buffers
                 .get(name)
@@ -407,35 +420,56 @@ impl Engine {
                     .with_group(group_name.to_string()),
             );
 
-            match task_runner.run(&command).await {
+            // Create unbounded channel for streaming output (bounded can drop lines)
+            let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
+
+            // Clone values needed for the spawned task
+            let task_runner_clone = task_runner.clone();
+            let command_clone = command.clone();
+
+            // Spawn task execution in background
+            let task_handle = tokio::spawn(async move {
+                task_runner_clone
+                    .run_streaming(&command_clone, output_tx)
+                    .await
+            });
+
+            // Receive and push output lines as they arrive
+            let task_name = task.name().to_string();
+            let group_name_owned = group_name.to_string();
+            while let Some(line) = output_rx.recv().await {
+                let content = match line {
+                    OutputLine::Stdout(s) => s,
+                    OutputLine::Stderr(s) => s,
+                };
+                self.push_log(
+                    LogLine::process(&task_name, content).with_group(group_name_owned.clone()),
+                );
+            }
+
+            // Wait for task to complete - handle JoinError from spawn
+            let inner_result = task_handle.await.map_err(|e| DaemonError::TaskFailed {
+                task: task_name.clone(),
+                error: format!("task panicked: {}", e),
+            })?;
+
+            match inner_result {
                 Ok(output) => {
                     let duration = start.elapsed();
-                    for line in &output.stdout {
-                        self.push_log(
-                            LogLine::process(task.name(), line.clone())
-                                .with_group(group_name.to_string()),
-                        );
-                    }
-                    for line in &output.stderr {
-                        self.push_log(
-                            LogLine::process(task.name(), line.clone())
-                                .with_group(group_name.to_string()),
-                        );
-                    }
 
                     let is_success = output.exit_code.map(|c| c == 0).unwrap_or(true);
                     if is_success {
                         // Push daemon log for task completion
                         self.push_log(
                             LogLine::daemon(
-                                task.name(),
+                                &task_name,
                                 format!("completed in {}ms", duration.as_millis()),
                             )
-                            .with_group(group_name.to_string()),
+                            .with_group(group_name_owned.clone()),
                         );
 
                         tracing::info!(
-                            task = %task.name(),
+                            task = %task_name,
                             duration_ms = duration.as_millis(),
                             exit_code = output.exit_code,
                             "task completed"
@@ -450,14 +484,14 @@ impl Engine {
                         // Push daemon log for task failure
                         self.push_log(
                             LogLine::daemon(
-                                task.name(),
+                                &task_name,
                                 format!("failed: process exited with status {}", exit_code),
                             )
-                            .with_group(group_name.to_string()),
+                            .with_group(group_name_owned.clone()),
                         );
 
                         tracing::error!(
-                            task = %task.name(),
+                            task = %task_name,
                             exit_code = exit_code,
                             "task failed"
                         );
@@ -468,7 +502,7 @@ impl Engine {
                         }
                         self.update_state();
                         return Err(DaemonError::TaskFailed {
-                            task: task.name().to_string(),
+                            task: task_name,
                             error: format!("process exited with status {}", exit_code),
                         });
                     }
@@ -476,18 +510,18 @@ impl Engine {
                 Err(e) => {
                     // Push daemon log for spawn/system failure (no output captured)
                     self.push_log(
-                        LogLine::daemon(task.name(), format!("failed: {}", e))
-                            .with_group(group_name.to_string()),
+                        LogLine::daemon(&task_name, format!("failed: {}", e))
+                            .with_group(group_name_owned),
                     );
 
-                    tracing::error!(task = %task.name(), error = %e, "task failed");
+                    tracing::error!(task = %task_name, error = %e, "task failed");
                     if let Some(group) = self.groups.get_mut(group_name) {
                         group.state.tasks[idx].status = ProcessStatus::Failed;
                         group.state.status = GroupStatus::Failed;
                     }
                     self.update_state();
                     return Err(DaemonError::TaskFailed {
-                        task: task.name().to_string(),
+                        task: task_name,
                         error: e.to_string(),
                     });
                 }
@@ -528,7 +562,7 @@ impl Engine {
                     // Start daemon for the first time
                     tracing::info!(daemon = %daemon.name(), "starting daemon");
                     daemon.start().map_err(DaemonError::Process)?;
-
+                    
                     // Get PTY reader for streaming output
                     if let Some(reader) = daemon.try_clone_reader() {
                         pty_readers.push((
