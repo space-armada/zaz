@@ -101,6 +101,14 @@ pub enum ApiRequest {
         name: String,
     },
 
+    /// Restart a specific process (task or daemon) within a group.
+    RestartProcess {
+        /// Group name.
+        group: String,
+        /// Process name (task or daemon).
+        process: String,
+    },
+
     /// Restart all groups.
     RestartAll,
 

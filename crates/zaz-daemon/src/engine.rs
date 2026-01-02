@@ -771,6 +771,156 @@ impl Engine {
         Ok(())
     }
 
+    /// Restart a specific process (task or daemon) within a group.
+    pub async fn restart_process(
+        &mut self,
+        group_name: &str,
+        process_name: &str,
+    ) -> Result<(), DaemonError> {
+        // Check if group exists
+        if !self.groups.contains_key(group_name) {
+            return Err(DaemonError::GroupNotFound(group_name.to_string()));
+        }
+
+        // Build variable context
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        let context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_files(vec![])
+            .with_root(config_dir.to_path_buf());
+
+        // Check if it's a task
+        let group = self.groups.get(group_name).unwrap();
+        if let Some((task_idx, task_config)) = group
+            .config
+            .tasks
+            .iter()
+            .enumerate()
+            .find(|(_, t)| t.name() == process_name)
+        {
+            let task_config = task_config.clone();
+            let executor = group.executor.clone();
+
+            tracing::info!(group = group_name, task = process_name, "restarting task");
+
+            // Update state
+            if let Some(group) = self.groups.get_mut(group_name) {
+                group.state.tasks[task_idx].status = ProcessStatus::Running;
+                group.state.tasks[task_idx].duration_ms = None;
+            }
+            self.update_state();
+
+            // Run the task
+            let start = std::time::Instant::now();
+            let expander = zaz_vars::Expander::new(&context);
+            let command = expander
+                .expand(&task_config.command)
+                .map_err(|e| DaemonError::VarExpansion(e.to_string()))?;
+
+            self.push_log(
+                LogLine::daemon(process_name, format!("running: {}", command))
+                    .with_group(group_name.to_string()),
+            );
+
+            // Stream output using the same pattern as run_group
+            let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
+            let task_runner = TaskRunner::new(executor);
+
+            let task_handle = tokio::spawn({
+                let command = command.clone();
+                async move { task_runner.run_streaming(&command, output_tx).await }
+            });
+
+            // Receive and push output lines as they arrive
+            let task_name = process_name.to_string();
+            let group_name_owned = group_name.to_string();
+            while let Some(line) = output_rx.recv().await {
+                let content = match line {
+                    OutputLine::Stdout(s) => s,
+                    OutputLine::Stderr(s) => s,
+                };
+                self.push_log(
+                    LogLine::process(&task_name, content).with_group(group_name_owned.clone()),
+                );
+            }
+
+            // Wait for task to complete
+            let inner_result = task_handle.await.map_err(|e| DaemonError::TaskFailed {
+                task: task_name.clone(),
+                error: format!("task panicked: {}", e),
+            })?;
+
+            let duration = start.elapsed();
+
+            match inner_result {
+                Ok(output) => {
+                    let success = output.exit_code == Some(0);
+                    if let Some(group) = self.groups.get_mut(group_name) {
+                        group.state.tasks[task_idx].status = if success {
+                            ProcessStatus::Success
+                        } else {
+                            ProcessStatus::Failed
+                        };
+                        group.state.tasks[task_idx].duration_ms = Some(duration.as_millis() as u64);
+                    }
+                    self.push_log(
+                        LogLine::daemon(
+                            process_name,
+                            format!(
+                                "completed in {:.1}s (exit code: {:?})",
+                                duration.as_secs_f64(),
+                                output.exit_code
+                            ),
+                        )
+                        .with_group(group_name.to_string()),
+                    );
+                }
+                Err(e) => {
+                    if let Some(group) = self.groups.get_mut(group_name) {
+                        group.state.tasks[task_idx].status = ProcessStatus::Failed;
+                        group.state.tasks[task_idx].duration_ms = Some(duration.as_millis() as u64);
+                    }
+                    self.push_log(
+                        LogLine::daemon(process_name, format!("failed: {}", e))
+                            .with_group(group_name.to_string()),
+                    );
+                }
+            }
+
+            self.update_state();
+            return Ok(());
+        }
+
+        // Check if it's a daemon
+        let group = self.groups.get(group_name).unwrap();
+        if let Some((daemon_idx, _)) = group
+            .daemons
+            .iter()
+            .enumerate()
+            .find(|(_, d)| d.name() == process_name)
+        {
+            tracing::info!(group = group_name, daemon = process_name, "restarting daemon");
+
+            self.push_log(
+                LogLine::daemon(process_name, "restarting").with_group(group_name.to_string()),
+            );
+
+            if let Some(group) = self.groups.get_mut(group_name) {
+                group.daemons[daemon_idx]
+                    .signal_restart()
+                    .map_err(DaemonError::Process)?;
+            }
+
+            self.update_state();
+            return Ok(());
+        }
+
+        Err(DaemonError::TaskFailed {
+            task: process_name.to_string(),
+            error: format!("process '{}' not found in group '{}'", process_name, group_name),
+        })
+    }
+
     /// Handle an API request and return a response.
     ///
     /// For Subscribe/SubscribeLogs requests, returns Ok to acknowledge,
@@ -805,6 +955,17 @@ impl Engine {
                 Ok(()) => ApiResponse::ok_with_message(format!("restarted group '{}'", name)),
                 Err(e) => ApiResponse::error(format!("failed to restart group '{}': {}", name, e)),
             },
+            ApiRequest::RestartProcess { group, process } => {
+                match self.restart_process(&group, &process).await {
+                    Ok(()) => {
+                        ApiResponse::ok_with_message(format!("restarted '{}'", process))
+                    }
+                    Err(e) => ApiResponse::error(format!(
+                        "failed to restart '{}' in group '{}': {}",
+                        process, group, e
+                    )),
+                }
+            }
             ApiRequest::RestartAll => match self.restart_all().await {
                 Ok(()) => ApiResponse::ok_with_message("restarted all groups"),
                 Err(e) => ApiResponse::error(format!("failed to restart: {}", e)),
