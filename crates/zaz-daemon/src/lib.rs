@@ -6,6 +6,7 @@ mod api;
 mod engine;
 mod error;
 mod log_layer;
+mod log_store;
 mod server;
 mod state;
 

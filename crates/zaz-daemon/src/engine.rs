@@ -8,7 +8,7 @@ use crate::state::{
 };
 use crate::{ApiResponse, DaemonError};
 use indexmap::IndexMap;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -16,9 +16,6 @@ use zaz_config::{Config, Group};
 use zaz_process::{Daemon, Executor, OutputLine, TaskRunner};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
-
-/// Maximum number of log lines to store per process.
-const MAX_LOG_LINES: usize = 10_000;
 
 /// Completion signal from a spawned task execution.
 #[derive(Debug)]
@@ -196,20 +193,8 @@ pub struct Engine {
     /// Broadcast channel for status updates (for streaming subscribers).
     status_tx: broadcast::Sender<ApiResponse>,
 
-    /// Per-process log ring buffers.
-    log_buffers: HashMap<String, VecDeque<LogLine>>,
-
-    /// Broadcast channel for log streaming.
-    logs_tx: broadcast::Sender<LogLine>,
-
-    /// Channel for receiving logs from PTY reader tasks.
-    log_rx: mpsc::Receiver<LogLine>,
-
-    /// Sender for PTY reader tasks to submit logs.
-    log_tx: mpsc::Sender<LogLine>,
-
-    /// Whether to print process output to stdout (verbose mode).
-    verbose_output: bool,
+    /// Log storage with channel-based ingestion from spawned tasks.
+    log_store: crate::log_store::LogStore,
 
     /// Currently running tasks (by "group:task" id). All tasks can run in parallel.
     running_tasks: std::collections::HashSet<String>,
@@ -347,13 +332,16 @@ impl Engine {
         // Create broadcast channel for status updates (capacity 16)
         let (status_tx, _) = broadcast::channel(16);
 
-        // Create broadcast channel for log streaming (larger capacity for high-volume output)
-        let (logs_tx, _) = broadcast::channel(1024);
+        // Create log store with verbose callback if enabled
+        let log_store = if verbose_output {
+            crate::log_store::LogStore::new().with_verbose_callback(|log| {
+                println!("[{}] {}", log.process, log.content);
+            })
+        } else {
+            crate::log_store::LogStore::new()
+        };
 
-        // Create mpsc channel for PTY reader tasks to submit logs
-        let (log_tx, log_rx) = mpsc::channel(1024);
-
-        // Create mpsc channel for group completion signals
+        // Create mpsc channel for task completion signals
         let (task_completion_tx, task_completion_rx) = mpsc::channel(64);
 
         Ok(Self {
@@ -365,11 +353,7 @@ impl Engine {
             state,
             execution_order,
             status_tx,
-            log_buffers: HashMap::new(),
-            logs_tx,
-            log_rx,
-            log_tx,
-            verbose_output,
+            log_store,
             running_tasks: std::collections::HashSet::new(),
             pending_tasks: std::collections::HashSet::new(),
             task_completion_rx,
@@ -389,75 +373,24 @@ impl Engine {
 
     /// Subscribe to log stream.
     pub fn subscribe_logs(&self) -> broadcast::Receiver<LogLine> {
-        self.logs_tx.subscribe()
+        self.log_store.subscribe()
     }
 
-    /// Get a sender for submitting logs (for the tracing layer).
+    /// Get a sender for submitting logs (for spawned tasks).
     pub fn log_sender(&self) -> mpsc::Sender<LogLine> {
-        self.log_tx.clone()
+        self.log_store.sender()
     }
 
     /// Add a log line to storage and broadcast.
     pub fn push_log(&mut self, log: LogLine) {
-        // Print process output to stdout in verbose mode
-        if self.verbose_output && log.source == crate::api::LogSource::Process {
-            println!("[{}] {}", log.process, log.content);
-        }
-
-        // Store in per-process buffer
-        let buffer = self.log_buffers.entry(log.process.clone()).or_default();
-        buffer.push_back(log.clone());
-
-        // Trim to max size
-        while buffer.len() > MAX_LOG_LINES {
-            buffer.pop_front();
-        }
-
-        // Broadcast to subscribers (ignore errors if no subscribers)
-        let _ = self.logs_tx.send(log);
+        self.log_store.push(log);
     }
 
     /// Get stored logs for a process.
     ///
-    /// If `name` is "*", returns logs from all processes.
+    /// If `name` is "*", returns logs from all processes sorted by timestamp.
     pub fn get_logs(&self, name: &str, limit: Option<usize>) -> Vec<LogLine> {
-        if name == "*" {
-            // Return all logs, sorted by timestamp
-            let mut all: Vec<LogLine> = self
-                .log_buffers
-                .values()
-                .flat_map(|buf| buf.iter().cloned())
-                .collect();
-            all.sort_by_key(|l| l.timestamp);
-            if let Some(n) = limit {
-                all.into_iter()
-                    .rev()
-                    .take(n)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect()
-            } else {
-                all
-            }
-        } else {
-            self.log_buffers
-                .get(name)
-                .map(|buf| {
-                    let iter = buf.iter().cloned();
-                    match limit {
-                        Some(n) => iter
-                            .rev()
-                            .take(n)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect(),
-                        None => iter.collect(),
-                    }
-                })
-                .unwrap_or_default()
-        }
+        self.log_store.get(name, limit)
     }
 
     /// Spawn a background task to read PTY output and push to logs.
@@ -469,7 +402,7 @@ impl Engine {
     ) {
         use std::io::BufRead;
 
-        let log_tx = self.log_tx.clone();
+        let log_tx = self.log_store.sender();
 
         tokio::task::spawn_blocking(move || {
             let mut buf_reader = std::io::BufReader::new(reader);
@@ -509,13 +442,12 @@ impl Engine {
         });
     }
 
-    /// Process incoming logs from PTY readers.
+    /// Process incoming logs from spawned tasks.
     ///
-    /// This should be called regularly from the main loop to drain the log channel.
+    /// This MUST be called before handling API requests to ensure fresh logs
+    /// are visible. Also call periodically in the main loop.
     pub fn process_incoming_logs(&mut self) {
-        while let Ok(log) = self.log_rx.try_recv() {
-            self.push_log(log);
-        }
+        self.log_store.drain();
     }
 
     /// Run the initial startup sequence.
@@ -897,7 +829,7 @@ impl Engine {
             executor,
         };
 
-        let log_tx = self.log_tx.clone();
+        let log_tx = self.log_store.sender();
         let completion_tx = self.task_completion_tx.clone();
 
         tracing::info!(task = %task_name, group = %group_name, "spawning task execution");
