@@ -402,8 +402,6 @@ impl Engine {
             self.update_state();
 
             let start = std::time::Instant::now();
-
-            // Push daemon log for task start
             self.push_log(
                 LogLine::daemon(task.name(), format!("running: {}", command))
                     .with_group(group_name.to_string()),
@@ -412,8 +410,6 @@ impl Engine {
             match task_runner.run(&command).await {
                 Ok(output) => {
                     let duration = start.elapsed();
-
-                    // Push task output as process logs
                     for line in &output.stdout {
                         self.push_log(
                             LogLine::process(task.name(), line.clone())
@@ -427,29 +423,58 @@ impl Engine {
                         );
                     }
 
-                    // Push daemon log for task completion
-                    self.push_log(
-                        LogLine::daemon(
-                            task.name(),
-                            format!("completed in {}ms", duration.as_millis()),
-                        )
-                        .with_group(group_name.to_string()),
-                    );
+                    let is_success = output.exit_code.map(|c| c == 0).unwrap_or(true);
+                    if is_success {
+                        // Push daemon log for task completion
+                        self.push_log(
+                            LogLine::daemon(
+                                task.name(),
+                                format!("completed in {}ms", duration.as_millis()),
+                            )
+                            .with_group(group_name.to_string()),
+                        );
 
-                    tracing::info!(
-                        task = %task.name(),
-                        duration_ms = duration.as_millis(),
-                        exit_code = output.exit_code,
-                        "task completed"
-                    );
-                    if let Some(group) = self.groups.get_mut(group_name) {
-                        group.state.tasks[idx].status = ProcessStatus::Success;
-                        group.state.tasks[idx].duration_ms = Some(duration.as_millis() as u64);
-                        group.state.tasks[idx].exit_code = output.exit_code;
+                        tracing::info!(
+                            task = %task.name(),
+                            duration_ms = duration.as_millis(),
+                            exit_code = output.exit_code,
+                            "task completed"
+                        );
+                        if let Some(group) = self.groups.get_mut(group_name) {
+                            group.state.tasks[idx].status = ProcessStatus::Success;
+                            group.state.tasks[idx].duration_ms = Some(duration.as_millis() as u64);
+                            group.state.tasks[idx].exit_code = output.exit_code;
+                        }
+                    } else {
+                        let exit_code = output.exit_code.unwrap_or(-1);
+                        // Push daemon log for task failure
+                        self.push_log(
+                            LogLine::daemon(
+                                task.name(),
+                                format!("failed: process exited with status {}", exit_code),
+                            )
+                            .with_group(group_name.to_string()),
+                        );
+
+                        tracing::error!(
+                            task = %task.name(),
+                            exit_code = exit_code,
+                            "task failed"
+                        );
+                        if let Some(group) = self.groups.get_mut(group_name) {
+                            group.state.tasks[idx].status = ProcessStatus::Failed;
+                            group.state.tasks[idx].exit_code = output.exit_code;
+                            group.state.status = GroupStatus::Failed;
+                        }
+                        self.update_state();
+                        return Err(DaemonError::TaskFailed {
+                            task: task.name().to_string(),
+                            error: format!("process exited with status {}", exit_code),
+                        });
                     }
                 }
                 Err(e) => {
-                    // Push daemon log for task failure
+                    // Push daemon log for spawn/system failure (no output captured)
                     self.push_log(
                         LogLine::daemon(task.name(), format!("failed: {}", e))
                             .with_group(group_name.to_string()),

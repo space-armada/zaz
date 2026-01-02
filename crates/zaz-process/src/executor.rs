@@ -181,12 +181,8 @@ impl Executor {
 
                     let exit_code = status.code();
 
-                    if !status.success() {
-                        if let Some(code) = exit_code {
-                            return Err(ProcessError::ExitStatus(code));
-                        }
-                    }
-
+                    // Always return output, even on non-zero exit.
+                    // Caller can check exit_code to determine success/failure.
                     return Ok(CommandOutput {
                         stdout: stdout_lines,
                         stderr: stderr_lines,
