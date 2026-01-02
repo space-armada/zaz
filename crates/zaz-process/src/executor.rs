@@ -145,6 +145,7 @@ impl Executor {
         let (stderr_tx, mut stderr_rx) = mpsc::channel(100);
 
         // Spawn tasks to read stdout/stderr
+        // Important: if not spawning a reader, drop the sender so recv() returns None
         if let Some(stdout) = stdout {
             let tx = stdout_tx;
             tokio::spawn(async move {
@@ -154,6 +155,8 @@ impl Executor {
                     let _ = tx.send(line).await;
                 }
             });
+        } else {
+            drop(stdout_tx);
         }
 
         if let Some(stderr) = stderr {
@@ -165,6 +168,8 @@ impl Executor {
                     let _ = tx.send(line).await;
                 }
             });
+        } else {
+            drop(stderr_tx);
         }
 
         // Wrap callback in Arc for sharing
@@ -177,6 +182,8 @@ impl Executor {
         // Process output as it arrives
         loop {
             tokio::select! {
+                biased;  // Prefer earlier branches to ensure we drain output before checking wait
+
                 Some(line) = stdout_rx.recv() => {
                     on_output(OutputLine::Stdout(line.clone()));
                     stdout_lines.push(line);
@@ -201,14 +208,12 @@ impl Executor {
                         stderr_lines.push(line);
                     }
 
-                    let exit_code = status.code();
-
                     // Always return output, even on non-zero exit.
                     // Caller can check exit_code to determine success/failure.
                     return Ok(CommandOutput {
                         stdout: stdout_lines,
                         stderr: stderr_lines,
-                        exit_code,
+                        exit_code: status.code(),
                     });
                 }
             }

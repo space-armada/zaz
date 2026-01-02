@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group};
-use zaz_process::{Daemon, Executor, OutputLine, TaskRunner};
+use zaz_process::{Daemon, Executor, TaskRunner};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
 
@@ -422,38 +422,29 @@ impl Engine {
                     .with_group(group_name.to_string()),
             );
 
-            // Create unbounded channel for streaming output (bounded can drop lines)
-            let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
-
-            // Clone values needed for the spawned task
-            let task_runner_clone = task_runner.clone();
-            let command_clone = command.clone();
-
-            // Spawn task execution in background
-            let task_handle = tokio::spawn(async move {
-                task_runner_clone
-                    .run_streaming(&command_clone, output_tx)
-                    .await
-            });
-
-            // Receive and push output lines as they arrive
             let task_name = task.name().to_string();
             let group_name_owned = group_name.to_string();
-            while let Some(line) = output_rx.recv().await {
-                let content = match line {
-                    OutputLine::Stdout(s) => s,
-                    OutputLine::Stderr(s) => s,
-                };
-                self.push_log(
-                    LogLine::process(&task_name, content).with_group(group_name_owned.clone()),
-                );
-            }
 
-            // Wait for task to complete - handle JoinError from spawn
-            let inner_result = task_handle.await.map_err(|e| DaemonError::TaskFailed {
-                task: task_name.clone(),
-                error: format!("task panicked: {}", e),
-            })?;
+            // Run task and collect all output (simpler than channel-based streaming)
+            tracing::debug!(task = %task_name, "running task");
+            let inner_result = task_runner.run(&command).await;
+            tracing::debug!(task = %task_name, result = ?inner_result.as_ref().map(|r| r.exit_code), "task finished");
+
+            // Push all collected output as logs
+            if let Ok(ref output) = inner_result {
+                for line in &output.stdout {
+                    self.push_log(
+                        LogLine::process(&task_name, line.clone())
+                            .with_group(group_name_owned.clone()),
+                    );
+                }
+                for line in &output.stderr {
+                    self.push_log(
+                        LogLine::process(&task_name, line.clone())
+                            .with_group(group_name_owned.clone()),
+                    );
+                }
+            }
 
             match inner_result {
                 Ok(output) => {
@@ -819,33 +810,27 @@ impl Engine {
                     .with_group(group_name.to_string()),
             );
 
-            // Stream output using the same pattern as run_group
-            let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
+            // Run task and collect output
             let task_runner = TaskRunner::new(executor);
+            let inner_result = task_runner.run(&command).await;
 
-            let task_handle = tokio::spawn({
-                let command = command.clone();
-                async move { task_runner.run_streaming(&command, output_tx).await }
-            });
-
-            // Receive and push output lines as they arrive
+            // Push all collected output as logs
             let task_name = process_name.to_string();
             let group_name_owned = group_name.to_string();
-            while let Some(line) = output_rx.recv().await {
-                let content = match line {
-                    OutputLine::Stdout(s) => s,
-                    OutputLine::Stderr(s) => s,
-                };
-                self.push_log(
-                    LogLine::process(&task_name, content).with_group(group_name_owned.clone()),
-                );
+            if let Ok(ref output) = inner_result {
+                for line in &output.stdout {
+                    self.push_log(
+                        LogLine::process(&task_name, line.clone())
+                            .with_group(group_name_owned.clone()),
+                    );
+                }
+                for line in &output.stderr {
+                    self.push_log(
+                        LogLine::process(&task_name, line.clone())
+                            .with_group(group_name_owned.clone()),
+                    );
+                }
             }
-
-            // Wait for task to complete
-            let inner_result = task_handle.await.map_err(|e| DaemonError::TaskFailed {
-                task: task_name.clone(),
-                error: format!("task panicked: {}", e),
-            })?;
 
             let duration = start.elapsed();
 
