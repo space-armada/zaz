@@ -33,7 +33,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn draw_full_style(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // Use taller status bar (5 lines) on larger screens for multi-line layout
+    // Status bar height: 5 lines for multi-line layout, 3 for compact
+    // Avoid resizing when transient message comes in to avoid resizes
     let status_bar_height = if area.height >= 20 && area.width >= 60 {
         5
     } else {
@@ -368,14 +369,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     // Use multi-line layout for larger screens (height >= 5 gives us 2 content lines)
     let use_multi_line = area.height >= 5 && area.width >= 60;
 
-    let lines = if let Some(ref msg) = app.status_message {
-        vec![Line::from(vec![
-            Span::raw(" "),
-            connection_status,
-            Span::raw(" "),
-            Span::raw(msg.clone()),
-        ])]
-    } else if use_multi_line {
+    let mut lines = if use_multi_line {
         // Multi-line: detailed status
         let daemon_indicator = if app.started_daemon { " (daemon)" } else { "" };
         vec![
@@ -425,6 +419,20 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(" help"),
         ])]
     };
+
+    // Add transient message line if present and not expired
+    if let Some(msg) = app.active_transient_message() {
+        let style = if msg.is_error {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("→ ", style),
+            Span::styled(&msg.text, style),
+        ]));
+    }
 
     let paragraph =
         Paragraph::new(lines).block(Block::default().title(" Status ").borders(Borders::ALL));

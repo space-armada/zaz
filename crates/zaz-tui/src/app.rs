@@ -117,10 +117,56 @@ pub struct App {
     pub started_daemon: bool,
     /// Whether the app should quit.
     pub should_quit: bool,
-    /// Status message to display.
-    pub status_message: Option<String>,
+    /// Transient status message with expiration.
+    pub transient_message: Option<TransientMessage>,
     /// Whether to show help overlay.
     pub show_help: bool,
+}
+
+/// A transient status message that auto-expires.
+#[derive(Debug, Clone)]
+pub struct TransientMessage {
+    /// The message text.
+    pub text: String,
+    /// When the message was created (for expiration).
+    pub created_at: std::time::Instant,
+    /// Whether this is an error message (longer display time).
+    pub is_error: bool,
+}
+
+impl TransientMessage {
+    /// Duration before success messages expire.
+    const SUCCESS_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
+    /// Duration before error messages expire.
+    const ERROR_DURATION: std::time::Duration = std::time::Duration::from_secs(8);
+
+    /// Create a new success message.
+    pub fn success(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            created_at: std::time::Instant::now(),
+            is_error: false,
+        }
+    }
+
+    /// Create a new error message.
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            created_at: std::time::Instant::now(),
+            is_error: true,
+        }
+    }
+
+    /// Check if the message has expired.
+    pub fn is_expired(&self) -> bool {
+        let duration = if self.is_error {
+            Self::ERROR_DURATION
+        } else {
+            Self::SUCCESS_DURATION
+        };
+        self.created_at.elapsed() > duration
+    }
 }
 
 impl App {
@@ -145,7 +191,7 @@ impl App {
             user_config,
             started_daemon: false,
             should_quit: false,
-            status_message: None,
+            transient_message: None,
             show_help: false,
         }
     }
@@ -184,14 +230,24 @@ impl App {
         }
     }
 
-    /// Set a temporary status message.
+    /// Set a transient status message (auto-expires after a few seconds).
     pub fn set_status(&mut self, message: impl Into<String>) {
-        self.status_message = Some(message.into());
+        self.transient_message = Some(TransientMessage::success(message));
     }
 
-    /// Clear the status message.
+    /// Set a transient error message (auto-expires after longer delay).
+    pub fn set_error(&mut self, message: impl Into<String>) {
+        self.transient_message = Some(TransientMessage::error(message));
+    }
+
+    /// Get the active transient message (if not expired).
+    pub fn active_transient_message(&self) -> Option<&TransientMessage> {
+        self.transient_message.as_ref().filter(|m| !m.is_expired())
+    }
+
+    /// Clear the transient message.
     pub fn clear_status(&mut self) {
-        self.status_message = None;
+        self.transient_message = None;
     }
 
     /// Toggle the display style.
@@ -761,15 +817,20 @@ mod tests {
     }
 
     #[test]
-    fn test_status_message() {
+    fn test_transient_message() {
         let mut app = App::default();
-        assert!(app.status_message.is_none());
+        assert!(app.transient_message.is_none());
 
         app.set_status("Test message");
-        assert_eq!(app.status_message, Some("Test message".to_string()));
+        assert!(app.transient_message.is_some());
+        assert_eq!(app.transient_message.as_ref().unwrap().text, "Test message");
+        assert!(!app.transient_message.as_ref().unwrap().is_error);
+
+        app.set_error("Error message");
+        assert!(app.transient_message.as_ref().unwrap().is_error);
 
         app.clear_status();
-        assert!(app.status_message.is_none());
+        assert!(app.transient_message.is_none());
     }
 
     #[test]

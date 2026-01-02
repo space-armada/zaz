@@ -184,29 +184,39 @@ impl FullStyle {
             String::new()
         };
 
-        let status = if let Some(ref msg) = app.status_message {
-            msg.clone()
-        } else {
-            format!(
-                " F1:Full* | {} | [q]uit [r]estart [?]help{}",
-                if app.logs.is_following() {
-                    "Follow:ON"
-                } else {
-                    "Follow:OFF"
-                },
-                filter_status
-            )
-        };
+        let status = format!(
+            " F1:Full* | {} | [q]uit [r]estart [?]help{}",
+            if app.logs.is_following() {
+                "Follow:ON"
+            } else {
+                "Follow:OFF"
+            },
+            filter_status
+        );
 
-        let line = Line::from(vec![
+        let mut lines = vec![Line::from(vec![
             Span::raw(" "),
             connection_status,
             Span::raw(" "),
             Span::raw(status),
-        ]);
+        ])];
+
+        // Add transient message if present
+        if let Some(msg) = app.active_transient_message() {
+            let style = if msg.is_error {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("→ ", style),
+                Span::styled(&msg.text, style),
+            ]));
+        }
 
         let paragraph =
-            Paragraph::new(line).block(Block::default().title(" Status ").borders(Borders::ALL));
+            Paragraph::new(lines).block(Block::default().title(" Status ").borders(Borders::ALL));
 
         frame.render_widget(paragraph, area);
     }

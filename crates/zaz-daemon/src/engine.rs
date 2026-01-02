@@ -899,7 +899,11 @@ impl Engine {
             .enumerate()
             .find(|(_, d)| d.name() == process_name)
         {
-            tracing::info!(group = group_name, daemon = process_name, "restarting daemon");
+            tracing::info!(
+                group = group_name,
+                daemon = process_name,
+                "restarting daemon"
+            );
 
             self.push_log(
                 LogLine::daemon(process_name, "restarting").with_group(group_name.to_string()),
@@ -917,7 +921,10 @@ impl Engine {
 
         Err(DaemonError::TaskFailed {
             task: process_name.to_string(),
-            error: format!("process '{}' not found in group '{}'", process_name, group_name),
+            error: format!(
+                "process '{}' not found in group '{}'",
+                process_name, group_name
+            ),
         })
     }
 
@@ -957,9 +964,7 @@ impl Engine {
             },
             ApiRequest::RestartProcess { group, process } => {
                 match self.restart_process(&group, &process).await {
-                    Ok(()) => {
-                        ApiResponse::ok_with_message(format!("restarted '{}'", process))
-                    }
+                    Ok(()) => ApiResponse::ok_with_message(format!("restarted '{}'", process)),
                     Err(e) => ApiResponse::error(format!(
                         "failed to restart '{}' in group '{}': {}",
                         process, group, e
