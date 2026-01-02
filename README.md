@@ -1,8 +1,9 @@
 # zaz
 
-> putting the zaz in pizzazz
+zaz :: putting the zaz in pizzazz
 
-A modern file-watching task runner and process manager for development.
+A modern file-watching task runner and process manager for development
+environments, heavily inspired by `modd`.
 
 ## Quick Start
 
