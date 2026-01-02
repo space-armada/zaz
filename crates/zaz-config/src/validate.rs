@@ -179,9 +179,16 @@ fn validate_commands(config: &Config, errors: &mut Vec<String>) {
                 ));
             }
             if task_names.contains(name) {
+                // Check if the name was derived (no explicit name set)
+                let has_explicit_name = task.has_explicit_name();
+                let hint = if has_explicit_name {
+                    String::new()
+                } else {
+                    " (use explicit 'name' field to disambiguate)".to_string()
+                };
                 errors.push(format!(
-                    "group '{}': duplicate task name '{}'",
-                    group.name, name
+                    "group '{}': duplicate task name '{}'{}",
+                    group.name, name, hint
                 ));
             }
             task_names.insert(name);
@@ -198,9 +205,15 @@ fn validate_commands(config: &Config, errors: &mut Vec<String>) {
                 ));
             }
             if daemon_names.contains(name) {
+                let has_explicit_name = daemon.has_explicit_name();
+                let hint = if has_explicit_name {
+                    String::new()
+                } else {
+                    " (use explicit 'name' field to disambiguate)".to_string()
+                };
                 errors.push(format!(
-                    "group '{}': duplicate daemon name '{}'",
-                    group.name, name
+                    "group '{}': duplicate daemon name '{}'{}",
+                    group.name, name, hint
                 ));
             }
             daemon_names.insert(name);
@@ -316,7 +329,8 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_task_names() {
+    fn test_duplicate_task_names_explicit() {
+        // Explicit duplicate names should error without hint
         let mut group = make_group("backend");
         group.tasks = vec![
             TaskCommand::new("test", "echo 1"),
@@ -327,6 +341,93 @@ mod tests {
             ..Default::default()
         };
         let err = validate(&config).unwrap_err();
-        assert!(err.to_string().contains("duplicate task name"));
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate task name 'test'"));
+        // Explicit names should NOT get the hint
+        assert!(!msg.contains("use explicit 'name' field"));
+    }
+
+    #[test]
+    fn test_duplicate_task_names_derived() {
+        // Derived duplicate names should error with hint
+        // Both commands derive to "cargo" (flags stop the derivation)
+        let mut group = make_group("backend");
+        group.tasks = vec![
+            TaskCommand::from_command("cargo --version"),
+            TaskCommand::from_command("cargo -V"),
+        ];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate task name 'cargo'"));
+        assert!(msg.contains("use explicit 'name' field to disambiguate"));
+    }
+
+    #[test]
+    fn test_explicit_names_disambiguate() {
+        // Explicit names should allow same-prefix commands
+        let mut group = make_group("backend");
+        group.tasks = vec![
+            TaskCommand::new("build", "cargo build"),
+            TaskCommand::new("test", "cargo test"),
+        ];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_derived_names_unique() {
+        // Different derived names should be valid
+        let mut group = make_group("backend");
+        group.tasks = vec![
+            TaskCommand::from_command("cargo build"),
+            TaskCommand::from_command("npm test"),
+        ];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_mixed_explicit_and_derived_names() {
+        // Mix of explicit and derived names that don't conflict
+        let mut group = make_group("backend");
+        group.tasks = vec![
+            TaskCommand::new("build", "cargo build --release"),
+            TaskCommand::from_command("npm install"),
+        ];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_derived_name_conflicts_with_explicit() {
+        // Derived name that conflicts with an explicit name
+        // "cargo --help" derives to "cargo" which conflicts with explicit "cargo"
+        let mut group = make_group("backend");
+        group.tasks = vec![
+            TaskCommand::new("cargo", "echo explicit"),
+            TaskCommand::from_command("cargo --help"),
+        ];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate task name 'cargo'"));
+        // The derived one should get the hint
+        assert!(msg.contains("use explicit 'name' field to disambiguate"));
     }
 }

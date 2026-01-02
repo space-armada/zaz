@@ -124,6 +124,11 @@ impl TaskCommand {
             .as_deref()
             .unwrap_or_else(|| derive_name(&self.command))
     }
+
+    /// Returns true if this task has an explicitly set name.
+    pub fn has_explicit_name(&self) -> bool {
+        self.name.is_some()
+    }
 }
 
 /// Derive a display name from a command string.
@@ -189,6 +194,11 @@ impl DaemonCommand {
         self.name
             .as_deref()
             .unwrap_or_else(|| derive_name(&self.command))
+    }
+
+    /// Returns true if this daemon has an explicitly set name.
+    pub fn has_explicit_name(&self) -> bool {
+        self.name.is_some()
     }
 }
 
