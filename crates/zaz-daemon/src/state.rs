@@ -43,8 +43,8 @@ pub struct GroupState {
     /// Current status.
     pub status: GroupStatus,
 
-    /// Prep command states.
-    pub preps: Vec<ProcessState>,
+    /// Task command states.
+    pub tasks: Vec<ProcessState>,
 
     /// Daemon states.
     pub daemons: Vec<ProcessState>,
@@ -58,17 +58,17 @@ pub enum GroupStatus {
     #[default]
     Pending,
 
-    /// Preps are running.
+    /// Tasks are running.
     Running,
 
-    /// All preps completed, daemons running.
+    /// All tasks completed, daemons running.
     Ready,
 
-    /// A prep failed.
+    /// A task failed.
     Failed,
 }
 
-/// State of a single process (prep or daemon).
+/// State of a single process (task or daemon).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessState {
     /// Process name.

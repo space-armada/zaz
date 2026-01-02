@@ -77,7 +77,9 @@ impl Daemon {
 
         tracing::info!(name = %self.config.name, "starting daemon");
 
-        let child = self.executor.spawn(&self.config.command, self.config.pty)?;
+        let child = self
+            .executor
+            .spawn(&self.config.command, !self.config.no_pty)?;
         self.child = Some(child);
         self.state = DaemonState::Running;
         self.last_start = Some(Instant::now());

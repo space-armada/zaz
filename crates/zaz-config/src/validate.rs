@@ -40,7 +40,7 @@ fn validate_groups(config: &Config, errors: &mut Vec<String>) {
         }
 
         // Check for empty patterns (warning-worthy but not an error)
-        if group.patterns.is_empty() && group.prep.is_empty() && group.daemons.is_empty() {
+        if group.patterns.is_empty() && group.tasks.is_empty() && group.daemons.is_empty() {
             errors.push(format!(
                 "group '{}': has no patterns and no commands",
                 group.name
@@ -168,28 +168,28 @@ fn validate_patterns(config: &Config, errors: &mut Vec<String>) {
 /// Validate command definitions.
 fn validate_commands(config: &Config, errors: &mut Vec<String>) {
     for group in &config.groups {
-        // Check prep commands
-        let mut prep_names: HashSet<&str> = HashSet::new();
-        for (index, prep) in group.prep.iter().enumerate() {
-            if prep.name.is_empty() {
+        // Check task commands
+        let mut task_names: HashSet<&str> = HashSet::new();
+        for (index, task) in group.tasks.iter().enumerate() {
+            if task.name.is_empty() {
                 errors.push(format!(
-                    "group '{}': prep[{}] has empty name",
+                    "group '{}': task[{}] has empty name",
                     group.name, index
                 ));
             }
-            if prep.command.is_empty() {
+            if task.command.is_empty() {
                 errors.push(format!(
-                    "group '{}': prep '{}' has empty command",
-                    group.name, prep.name
+                    "group '{}': task '{}' has empty command",
+                    group.name, task.name
                 ));
             }
-            if prep_names.contains(prep.name.as_str()) {
+            if task_names.contains(task.name.as_str()) {
                 errors.push(format!(
-                    "group '{}': duplicate prep name '{}'",
-                    group.name, prep.name
+                    "group '{}': duplicate task name '{}'",
+                    group.name, task.name
                 ));
             }
-            prep_names.insert(&prep.name);
+            task_names.insert(&task.name);
         }
 
         // Check daemon commands
@@ -221,7 +221,7 @@ fn validate_commands(config: &Config, errors: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Group, PrepCommand};
+    use crate::{Group, TaskCommand};
 
     fn make_group(name: &str) -> Group {
         Group {
@@ -314,9 +314,9 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_prep_command() {
+    fn test_empty_task_command() {
         let mut group = make_group("backend");
-        group.prep = vec![PrepCommand {
+        group.tasks = vec![TaskCommand {
             name: "test".to_string(),
             command: "".to_string(),
             on_change_only: false,
@@ -330,15 +330,15 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_prep_names() {
+    fn test_duplicate_task_names() {
         let mut group = make_group("backend");
-        group.prep = vec![
-            PrepCommand {
+        group.tasks = vec![
+            TaskCommand {
                 name: "test".to_string(),
                 command: "echo 1".to_string(),
                 on_change_only: false,
             },
-            PrepCommand {
+            TaskCommand {
                 name: "test".to_string(),
                 command: "echo 2".to_string(),
                 on_change_only: false,
@@ -349,6 +349,6 @@ mod tests {
             ..Default::default()
         };
         let err = validate(&config).unwrap_err();
-        assert!(err.to_string().contains("duplicate prep name"));
+        assert!(err.to_string().contains("duplicate task name"));
     }
 }

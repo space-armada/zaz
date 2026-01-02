@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 /// Root configuration structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Global settings.
     pub settings: Settings,
@@ -20,7 +20,7 @@ pub struct Config {
 
 /// Global settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// Shell to use for command execution (defaults to $SHELL).
     pub shell: Option<String>,
@@ -54,7 +54,7 @@ pub enum LogFormat {
 
 /// A watch group that pairs file patterns with commands.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Group {
     /// Unique name for this group.
     pub name: String,
@@ -71,17 +71,19 @@ pub struct Group {
     /// Working directory for commands (defaults to config file directory).
     pub working_dir: Option<String>,
 
-    /// Prep commands (run to completion).
-    pub prep: Vec<PrepCommand>,
+    /// Task commands (run to completion).
+    #[serde(alias = "task")]
+    pub tasks: Vec<TaskCommand>,
 
     /// Daemon commands (long-running).
     #[serde(alias = "daemon")]
     pub daemons: Vec<DaemonCommand>,
 }
 
-/// A prep command that runs to completion.
+/// A task command that runs to completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrepCommand {
+#[serde(deny_unknown_fields)]
+pub struct TaskCommand {
     /// Display name for this command.
     pub name: String,
 
@@ -95,6 +97,7 @@ pub struct PrepCommand {
 
 /// A daemon command that runs continuously.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonCommand {
     /// Display name for this daemon.
     pub name: String,
@@ -106,13 +109,10 @@ pub struct DaemonCommand {
     #[serde(default)]
     pub signal: Signal,
 
-    /// Whether to allocate a PTY for this process.
-    #[serde(default = "default_pty")]
-    pub pty: bool,
-}
-
-fn default_pty() -> bool {
-    true
+    /// Disable PTY allocation for this process.
+    /// By default, PTY is enabled (no_pty = false).
+    #[serde(default)]
+    pub no_pty: bool,
 }
 
 /// Unix signals for daemon control.
@@ -120,18 +120,11 @@ fn default_pty() -> bool {
 #[serde(rename_all = "UPPERCASE")]
 pub enum Signal {
     #[default]
-    #[serde(alias = "SIGTERM")]
     Sigterm,
-    #[serde(alias = "SIGINT")]
     Sigint,
-    #[serde(alias = "SIGHUP")]
     Sighup,
-    #[serde(alias = "SIGKILL")]
     Sigkill,
-    #[serde(alias = "SIGQUIT")]
     Sigquit,
-    #[serde(alias = "SIGUSR1")]
     Sigusr1,
-    #[serde(alias = "SIGUSR2")]
     Sigusr2,
 }

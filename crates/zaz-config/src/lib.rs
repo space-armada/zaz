@@ -7,7 +7,7 @@ mod schema;
 mod validate;
 
 pub use error::ConfigError;
-pub use schema::{Config, DaemonCommand, Group, LogFormat, PrepCommand, Settings, Signal};
+pub use schema::{Config, DaemonCommand, Group, LogFormat, Settings, Signal, TaskCommand};
 pub use validate::validate;
 
 use std::path::{Path, PathBuf};
@@ -128,7 +128,7 @@ name = "backend"
 patterns = ["**/*.go"]
 ignore = ["**/vendor/**"]
 
-[[group.prep]]
+[[group.task]]
 name = "test"
 command = "go test ./..."
 
@@ -136,7 +136,7 @@ command = "go test ./..."
 name = "server"
 command = "./server"
 signal = "SIGTERM"
-pty = true
+no_pty = false
 "#;
         let config = parse_toml(toml).unwrap();
         assert_eq!(config.settings.shell, Some("bash".to_string()));
@@ -148,7 +148,7 @@ pty = true
         );
         assert_eq!(config.groups.len(), 1);
         assert_eq!(config.groups[0].name, "backend");
-        assert_eq!(config.groups[0].prep.len(), 1);
+        assert_eq!(config.groups[0].tasks.len(), 1);
         assert_eq!(config.groups[0].daemons.len(), 1);
     }
 
@@ -167,7 +167,7 @@ pty = true
                 "name": "backend",
                 "patterns": ["**/*.go"],
                 "ignore": ["**/vendor/**"],
-                "prep": [{
+                "tasks": [{
                     "name": "test",
                     "command": "go test ./..."
                 }],
@@ -175,7 +175,7 @@ pty = true
                     "name": "server",
                     "command": "./server",
                     "signal": "SIGTERM",
-                    "pty": true
+                    "no_pty": false
                 }]
             }]
         }"#;
