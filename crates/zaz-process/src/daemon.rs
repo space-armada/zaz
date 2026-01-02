@@ -1,9 +1,9 @@
 //! Daemon process management.
 
+use crate::pty::ManagedChild;
 use crate::{Executor, ProcessError, SignalHandler};
 use nix::sys::signal::Signal;
 use std::time::{Duration, Instant};
-use tokio::process::Child;
 use zaz_config::DaemonCommand;
 
 /// Minimum restart delay.
@@ -35,7 +35,7 @@ pub enum DaemonState {
 pub struct Daemon {
     config: DaemonCommand,
     executor: Executor,
-    child: Option<Child>,
+    child: Option<ManagedChild>,
     state: DaemonState,
     restart_delay: Duration,
     last_start: Option<Instant>,

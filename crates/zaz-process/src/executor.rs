@@ -1,9 +1,10 @@
 //! Command execution.
 
+use crate::pty::ManagedChild;
 use crate::ProcessError;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 
 /// Output from a command execution.
@@ -44,9 +45,24 @@ impl Executor {
     }
 
     /// Spawn a command and return the child process.
-    pub fn spawn(&self, command: &str, use_pty: bool) -> Result<Child, ProcessError> {
-        let _ = use_pty; // TODO: implement PTY support
+    ///
+    /// If `use_pty` is true, the command runs in a pseudo-terminal,
+    /// which is required for some interactive programs.
+    pub fn spawn(&self, command: &str, use_pty: bool) -> Result<ManagedChild, ProcessError> {
+        if use_pty {
+            self.spawn_pty(command)
+        } else {
+            self.spawn_regular(command)
+        }
+    }
 
+    /// Spawn a command in a PTY.
+    fn spawn_pty(&self, command: &str) -> Result<ManagedChild, ProcessError> {
+        ManagedChild::spawn_pty(&self.shell, command, self.working_dir.as_deref())
+    }
+
+    /// Spawn a regular (non-PTY) command.
+    fn spawn_regular(&self, command: &str) -> Result<ManagedChild, ProcessError> {
         let mut cmd = Command::new(&self.shell);
         cmd.arg("-c").arg(command);
 
@@ -63,16 +79,26 @@ impl Executor {
             });
         }
 
-        cmd.stdout(Stdio::piped())
+        let child = cmd
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .spawn()
-            .map_err(ProcessError::Spawn)
+            .map_err(ProcessError::Spawn)?;
+
+        Ok(ManagedChild::Regular(child))
     }
 
     /// Run a command to completion and capture output.
+    ///
+    /// Note: This always runs without PTY since we need to capture stdout/stderr separately.
     pub async fn run(&self, command: &str) -> Result<CommandOutput, ProcessError> {
-        let mut child = self.spawn(command, false)?;
+        // For run-to-completion commands, we use regular spawn to capture output
+        let child = self.spawn_regular(command)?;
+
+        let ManagedChild::Regular(mut child) = child else {
+            unreachable!("spawn_regular always returns Regular variant");
+        };
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
