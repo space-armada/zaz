@@ -56,7 +56,7 @@ impl Daemon {
 
     /// Get the daemon name.
     pub fn name(&self) -> &str {
-        &self.config.name
+        self.config.name()
     }
 
     /// Get the current state.
@@ -75,7 +75,7 @@ impl Daemon {
             return Ok(());
         }
 
-        tracing::info!(name = %self.config.name, "starting daemon");
+        tracing::info!(name = %self.config.name(), "starting daemon");
 
         let child = self
             .executor
@@ -93,7 +93,7 @@ impl Daemon {
             if let Some(pid) = child.id() {
                 let signal = SignalHandler::to_nix_signal(self.config.signal);
                 tracing::info!(
-                    name = %self.config.name,
+                    name = %self.config.name(),
                     pid = pid,
                     signal = ?signal,
                     "sending restart signal"
@@ -110,7 +110,7 @@ impl Daemon {
 
         if let Some(child) = &self.child {
             if let Some(pid) = child.id() {
-                tracing::info!(name = %self.config.name, pid = pid, "stopping daemon");
+                tracing::info!(name = %self.config.name(), pid = pid, "stopping daemon");
                 SignalHandler::send_to_group(pid as i32, Signal::SIGTERM)?;
             }
         }
@@ -141,7 +141,7 @@ impl Daemon {
                 }
 
                 tracing::info!(
-                    name = %self.config.name,
+                    name = %self.config.name(),
                     status = ?status,
                     next_delay = ?self.restart_delay,
                     "daemon exited"

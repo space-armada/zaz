@@ -170,50 +170,40 @@ fn validate_commands(config: &Config, errors: &mut Vec<String>) {
     for group in &config.groups {
         // Check task commands
         let mut task_names: HashSet<&str> = HashSet::new();
-        for (index, task) in group.tasks.iter().enumerate() {
-            if task.name.is_empty() {
-                errors.push(format!(
-                    "group '{}': task[{}] has empty name",
-                    group.name, index
-                ));
-            }
+        for task in &group.tasks {
+            let name = task.name();
             if task.command.is_empty() {
                 errors.push(format!(
                     "group '{}': task '{}' has empty command",
-                    group.name, task.name
+                    group.name, name
                 ));
             }
-            if task_names.contains(task.name.as_str()) {
+            if task_names.contains(name) {
                 errors.push(format!(
                     "group '{}': duplicate task name '{}'",
-                    group.name, task.name
+                    group.name, name
                 ));
             }
-            task_names.insert(&task.name);
+            task_names.insert(name);
         }
 
         // Check daemon commands
         let mut daemon_names: HashSet<&str> = HashSet::new();
-        for (index, daemon) in group.daemons.iter().enumerate() {
-            if daemon.name.is_empty() {
-                errors.push(format!(
-                    "group '{}': daemon[{}] has empty name",
-                    group.name, index
-                ));
-            }
+        for daemon in &group.daemons {
+            let name = daemon.name();
             if daemon.command.is_empty() {
                 errors.push(format!(
                     "group '{}': daemon '{}' has empty command",
-                    group.name, daemon.name
+                    group.name, name
                 ));
             }
-            if daemon_names.contains(daemon.name.as_str()) {
+            if daemon_names.contains(name) {
                 errors.push(format!(
                     "group '{}': duplicate daemon name '{}'",
-                    group.name, daemon.name
+                    group.name, name
                 ));
             }
-            daemon_names.insert(&daemon.name);
+            daemon_names.insert(name);
         }
     }
 }
@@ -316,11 +306,7 @@ mod tests {
     #[test]
     fn test_empty_task_command() {
         let mut group = make_group("backend");
-        group.tasks = vec![TaskCommand {
-            name: "test".to_string(),
-            command: "".to_string(),
-            on_change_only: false,
-        }];
+        group.tasks = vec![TaskCommand::new("test", "")];
         let config = Config {
             groups: vec![group],
             ..Default::default()
@@ -333,16 +319,8 @@ mod tests {
     fn test_duplicate_task_names() {
         let mut group = make_group("backend");
         group.tasks = vec![
-            TaskCommand {
-                name: "test".to_string(),
-                command: "echo 1".to_string(),
-                on_change_only: false,
-            },
-            TaskCommand {
-                name: "test".to_string(),
-                command: "echo 2".to_string(),
-                on_change_only: false,
-            },
+            TaskCommand::new("test", "echo 1"),
+            TaskCommand::new("test", "echo 2"),
         ];
         let config = Config {
             groups: vec![group],

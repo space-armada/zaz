@@ -21,9 +21,9 @@ impl TaskRunner {
 
     /// Run a single task command.
     pub async fn run_one(&self, task: &TaskCommand) -> Result<(), ProcessError> {
-        tracing::info!(name = %task.name, "running task command");
+        tracing::info!(name = %task.name(), "running task command");
         self.executor.run(&task.command).await?;
-        tracing::info!(name = %task.name, "task command completed");
+        tracing::info!(name = %task.name(), "task command completed");
         Ok(())
     }
 

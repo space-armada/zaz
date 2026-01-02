@@ -108,7 +108,7 @@ impl Engine {
                     .tasks
                     .iter()
                     .map(|t| ProcessState {
-                        name: t.name.clone(),
+                        name: t.name().to_string(),
                         status: ProcessStatus::Pending,
                         ..Default::default()
                     })
@@ -117,7 +117,7 @@ impl Engine {
                     .daemons
                     .iter()
                     .map(|d| ProcessState {
-                        name: d.name.clone(),
+                        name: d.name().to_string(),
                         status: ProcessStatus::Pending,
                         ..Default::default()
                     })
@@ -214,7 +214,7 @@ impl Engine {
         for (idx, task) in tasks.iter().enumerate() {
             // Skip on_change_only tasks during initial startup
             if task.on_change_only && !is_change_triggered {
-                tracing::debug!(task = %task.name, "skipping on_change_only task during startup");
+                tracing::debug!(task = %task.name(), "skipping on_change_only task during startup");
                 continue;
             }
 
@@ -224,7 +224,7 @@ impl Engine {
                 .expand(&task.command)
                 .map_err(|e| DaemonError::VarExpansion(e.to_string()))?;
 
-            tracing::info!(task = %task.name, "running task");
+            tracing::info!(task = %task.name(), "running task");
 
             // Update state
             if let Some(group) = self.groups.get_mut(group_name) {
@@ -237,7 +237,7 @@ impl Engine {
                 Ok(output) => {
                     let duration = start.elapsed();
                     tracing::info!(
-                        task = %task.name,
+                        task = %task.name(),
                         duration_ms = duration.as_millis(),
                         exit_code = output.exit_code,
                         "task completed"
@@ -249,14 +249,14 @@ impl Engine {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(task = %task.name, error = %e, "task failed");
+                    tracing::error!(task = %task.name(), error = %e, "task failed");
                     if let Some(group) = self.groups.get_mut(group_name) {
                         group.state.tasks[idx].status = ProcessStatus::Failed;
                         group.state.status = GroupStatus::Failed;
                     }
                     self.update_state();
                     return Err(DaemonError::TaskFailed {
-                        task: task.name.clone(),
+                        task: task.name().to_string(),
                         error: e.to_string(),
                     });
                 }
