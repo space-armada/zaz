@@ -129,8 +129,6 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, detach: bool) -> Res
     tracing::info!(config = %config_path.display(), "starting daemon");
 
     let mut engine = Engine::new(config_path)?;
-
-    // Create command channel
     let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
 
     // Start API server
@@ -141,14 +139,14 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, detach: bool) -> Res
         }
     });
 
-    // Run initial startup
-    engine.startup().await?;
+    // Run initial startup, but don't exit on failure
+    // TODO(ripta): should this behavior be configurable?
+    if let Err(e) = engine.startup().await {
+        tracing::error!(error = %e, "initial startup failed, waiting for file changes to retry");
+    }
 
     tracing::info!("watching for file changes...");
-
     let mut shutdown_requested = false;
-
-    // Main event loop
     loop {
         tokio::select! {
             // Handle Ctrl+C
