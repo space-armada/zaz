@@ -6,6 +6,7 @@ license.workspace = true
 description = "Configuration parsing for zaz (TOML/JSON)"
 
 [dependencies]
+globset.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

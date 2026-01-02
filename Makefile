@@ -10,7 +10,7 @@ release:
 	cargo build --release
 
 test:
-	cargo test
+	cargo test --workspace
 
 lint: lint-rust lint-md
 
