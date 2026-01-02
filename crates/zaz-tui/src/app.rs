@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_new_app() {
-        let app = App::new(TuiStyle::Full, UserConfig::default());
+        let app = App::new(TuiStyle::Full, UserConfig::default(), "test.toml".to_string());
         assert_eq!(app.style, TuiStyle::Full);
         assert!(!app.should_quit);
         assert_eq!(app.input_mode, InputMode::Normal);

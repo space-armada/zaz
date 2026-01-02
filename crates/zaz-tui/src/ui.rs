@@ -268,12 +268,23 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .skip(scroll_offset)
         .take(visible_height)
-        .map(|(process, _idx, line)| {
-            let is_match = app.logs.is_search_match(line);
+        .map(|(process, _idx, log)| {
+            let is_match = app.logs.is_search_match(&log.content);
+            let is_daemon_log = log.source == crate::daemon::LogSource::Daemon;
+
             let line_style = if is_match {
                 Style::default().bg(Color::Yellow).fg(Color::Black)
+            } else if is_daemon_log {
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM)
             } else {
                 Style::default()
+            };
+
+            // Add [zaz] prefix for daemon logs
+            let content = if is_daemon_log {
+                format!("[zaz] {}", log.content)
+            } else {
+                log.content.clone()
             };
 
             ListItem::new(Line::from(vec![
@@ -281,7 +292,7 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
                     format!("[{}] ", process),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(*line, line_style),
+                Span::styled(content, line_style),
             ]))
         })
         .collect();

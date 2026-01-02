@@ -28,13 +28,43 @@ pub enum ClientCommand {
     RefreshStatus,
 }
 
+/// Source of a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSource {
+    /// Output from a process (stdout/stderr).
+    Process,
+    /// Internal daemon log (zaz messages).
+    Daemon,
+}
+
 /// A log line received from the daemon.
 #[derive(Debug, Clone)]
 pub struct LogLine {
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp: u64,
     /// Process name that emitted this log.
     pub process: String,
+    /// Group name (optional).
+    pub group: Option<String>,
     /// The log content.
     pub content: String,
+    /// Source of the log.
+    pub source: LogSource,
+}
+
+impl From<zaz_daemon::LogLine> for LogLine {
+    fn from(line: zaz_daemon::LogLine) -> Self {
+        Self {
+            timestamp: line.timestamp,
+            process: line.process,
+            group: line.group,
+            content: line.content,
+            source: match line.source {
+                zaz_daemon::LogSource::Process => LogSource::Process,
+                zaz_daemon::LogSource::Daemon => LogSource::Daemon,
+            },
+        }
+    }
 }
 
 /// Connection to the daemon with async background communication.
@@ -150,12 +180,15 @@ async fn background_task(
     socket_path: PathBuf,
     mut command_rx: mpsc::Receiver<ClientCommand>,
     state_tx: mpsc::Sender<DaemonState>,
-    _logs_tx: mpsc::Sender<LogLine>,
+    logs_tx: mpsc::Sender<LogLine>,
     connected: Arc<AtomicBool>,
 ) {
     let mut client: Option<Client> = None;
     let mut reconnect_delay = std::time::Duration::from_millis(100);
     const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Track last log timestamp to avoid duplicates
+    let mut last_log_timestamp: u64 = 0;
 
     loop {
         // Try to connect if not connected
@@ -201,9 +234,10 @@ async fn background_task(
                 }
             }
 
-            // Periodic status poll (every 500ms)
+            // Periodic status and logs poll (every 500ms)
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if let Some(ref mut c) = client {
+                    // Poll status
                     match c.request(&ApiRequest::Status).await {
                         Ok(ApiResponse::Status { state }) => {
                             let _ = state_tx.send(state).await;
@@ -212,6 +246,30 @@ async fn background_task(
                         Err(_) => {
                             // Connection lost
                             tracing::debug!("connection lost during poll, will reconnect");
+                            client = None;
+                            connected.store(false, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+
+                    // Poll logs (get all logs, filter by timestamp)
+                    match c.request(&ApiRequest::GetLogs {
+                        name: "*".to_string(),
+                        lines: Some(500),
+                    }).await {
+                        Ok(ApiResponse::Logs { lines, .. }) => {
+                            for line in lines {
+                                // Only send logs newer than what we've seen
+                                if line.timestamp > last_log_timestamp {
+                                    last_log_timestamp = line.timestamp;
+                                    let _ = logs_tx.send(line.into()).await;
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            // Connection lost
+                            tracing::debug!("connection lost during log poll, will reconnect");
                             client = None;
                             connected.store(false, Ordering::Relaxed);
                         }
@@ -284,10 +342,14 @@ mod tests {
     #[test]
     fn test_log_line() {
         let log = LogLine {
+            timestamp: 1234567890,
             process: "server".to_string(),
+            group: Some("web".to_string()),
             content: "Started on :8080".to_string(),
+            source: LogSource::Process,
         };
         assert_eq!(log.process, "server");
         assert_eq!(log.content, "Started on :8080");
+        assert_eq!(log.source, LogSource::Process);
     }
 }

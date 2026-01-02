@@ -12,9 +12,9 @@ pub mod styles;
 mod ui;
 
 pub use app::{App, Focus, InputMode, TuiStyle};
-pub use daemon::{ClientCommand, DaemonConnection, LogLine};
+pub use daemon::{ClientCommand, DaemonConnection, LogLine, LogSource};
 pub use error::TuiError;
 pub use events::Event;
 pub use help::draw_help;
-pub use logs::LogBuffer;
+pub use logs::{LogBuffer, StoredLog};
 pub use styles::{get_renderer, FullStyle, MinimalStyle, PaneLayout, StyleRenderer};

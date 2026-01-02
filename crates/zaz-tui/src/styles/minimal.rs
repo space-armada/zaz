@@ -12,7 +12,7 @@ use crate::app::{App, Focus};
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
@@ -345,14 +345,26 @@ impl MinimalStyle {
             .iter()
             .skip(scroll_offset)
             .take(visible_height)
-            .map(|(_idx, line)| {
-                let is_match = app.logs.is_search_match(line);
+            .map(|(_idx, log)| {
+                let is_match = app.logs.is_search_match(&log.content);
+                let is_daemon_log = log.source == crate::daemon::LogSource::Daemon;
+
                 let line_style = if is_match {
                     Style::default().bg(Color::Yellow).fg(Color::Black)
+                } else if is_daemon_log {
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM)
                 } else {
                     Style::default()
                 };
-                ListItem::new(Span::styled(*line, line_style))
+
+                // Add [zaz] prefix for daemon logs
+                let content = if is_daemon_log {
+                    format!("[zaz] {}", log.content)
+                } else {
+                    log.content.clone()
+                };
+
+                ListItem::new(Span::styled(content, line_style))
             })
             .collect();
 

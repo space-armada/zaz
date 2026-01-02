@@ -240,6 +240,9 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, detach: bool) -> Res
 
             // Poll for file changes and check daemons
             _ = async {
+                // Process incoming logs from PTY readers
+                engine.process_incoming_logs();
+
                 if let Err(e) = engine.poll().await {
                     tracing::error!(error = %e, "poll error");
                 }
@@ -466,6 +469,9 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
                     }
 
                     _ = async {
+                        // Process incoming logs from PTY readers
+                        engine.process_incoming_logs();
+
                         if let Err(e) = engine.poll().await {
                             tracing::error!(error = %e, "poll error");
                         }

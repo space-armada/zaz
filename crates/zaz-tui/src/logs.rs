@@ -5,7 +5,16 @@
 use regex::Regex;
 use std::collections::{HashMap, VecDeque};
 
-use crate::daemon::LogLine;
+use crate::daemon::{LogLine, LogSource};
+
+/// A stored log entry with source info.
+#[derive(Debug, Clone)]
+pub struct StoredLog {
+    /// The log content.
+    pub content: String,
+    /// Source of the log.
+    pub source: LogSource,
+}
 
 /// Default maximum lines per process.
 const DEFAULT_MAX_LINES: usize = 10_000;
@@ -81,7 +90,7 @@ impl SearchState {
 /// Per-process log storage with filtering and search.
 pub struct LogBuffer {
     /// Logs keyed by process name.
-    logs: HashMap<String, VecDeque<String>>,
+    logs: HashMap<String, VecDeque<StoredLog>>,
     /// Maximum lines to keep per process.
     max_lines: usize,
     /// Active filter pattern (hides non-matching lines).
@@ -127,8 +136,14 @@ impl LogBuffer {
 
     /// Add a log line for a process.
     pub fn push(&mut self, log: LogLine) {
-        let buffer = self.logs.entry(log.process).or_insert_with(VecDeque::new);
-        buffer.push_back(log.content);
+        let buffer = self
+            .logs
+            .entry(log.process)
+            .or_insert_with(VecDeque::new);
+        buffer.push_back(StoredLog {
+            content: log.content,
+            source: log.source,
+        });
 
         // Enforce max lines
         while buffer.len() > self.max_lines {
@@ -136,13 +151,13 @@ impl LogBuffer {
         }
     }
 
-    /// Add a log line with process and content directly.
-    pub fn push_line(&mut self, process: &str, content: String) {
+    /// Add a log line with process, content, and source directly.
+    pub fn push_line(&mut self, process: &str, content: String, source: LogSource) {
         let buffer = self
             .logs
             .entry(process.to_string())
             .or_insert_with(VecDeque::new);
-        buffer.push_back(content);
+        buffer.push_back(StoredLog { content, source });
 
         // Enforce max lines
         while buffer.len() > self.max_lines {
@@ -183,15 +198,15 @@ impl LogBuffer {
     }
 
     /// Get raw logs for a process (unfiltered).
-    pub fn raw_logs(&self, process: &str) -> Option<&VecDeque<String>> {
+    pub fn raw_logs(&self, process: &str) -> Option<&VecDeque<StoredLog>> {
         self.logs.get(process)
     }
 
     /// Get filtered logs for a process.
     ///
     /// If a filter is active, only matching lines are returned.
-    /// Returns (line_index, content) pairs for scroll position tracking.
-    pub fn filtered_logs(&self, process: &str) -> Vec<(usize, &str)> {
+    /// Returns (line_index, StoredLog) pairs for scroll position tracking.
+    pub fn filtered_logs(&self, process: &str) -> Vec<(usize, &StoredLog)> {
         let Some(buffer) = self.logs.get(process) else {
             return Vec::new();
         };
@@ -200,33 +215,28 @@ impl LogBuffer {
             Some(regex) => buffer
                 .iter()
                 .enumerate()
-                .filter(|(_, line)| regex.is_match(line))
-                .map(|(idx, line)| (idx, line.as_str()))
+                .filter(|(_, log)| regex.is_match(&log.content))
                 .collect(),
-            None => buffer
-                .iter()
-                .enumerate()
-                .map(|(idx, line)| (idx, line.as_str()))
-                .collect(),
+            None => buffer.iter().enumerate().collect(),
         }
     }
 
     /// Get all logs combined (for full style) with process prefix.
     ///
-    /// Returns (process, line_index, content) tuples.
-    pub fn all_logs_combined(&self) -> Vec<(&str, usize, &str)> {
+    /// Returns (process, line_index, StoredLog) tuples.
+    pub fn all_logs_combined(&self) -> Vec<(&str, usize, &StoredLog)> {
         // For combined view, we interleave logs chronologically
         // Since we don't have timestamps, we just concatenate per-process
         let mut result = Vec::new();
 
         for (process, buffer) in &self.logs {
-            for (idx, line) in buffer.iter().enumerate() {
+            for (idx, log) in buffer.iter().enumerate() {
                 let filtered = match &self.filter {
-                    Some(regex) => regex.is_match(line),
+                    Some(regex) => regex.is_match(&log.content),
                     None => true,
                 };
                 if filtered {
-                    result.push((process.as_str(), idx, line.as_str()));
+                    result.push((process.as_str(), idx, log));
                 }
             }
         }
@@ -363,9 +373,9 @@ mod tests {
     #[test]
     fn test_push_logs() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Started on :8080".to_string());
-        buffer.push_line("server", "Connection accepted".to_string());
-        buffer.push_line("worker", "Processing job 1".to_string());
+        buffer.push_line("server", "Started on :8080".to_string(), LogSource::Process);
+        buffer.push_line("server", "Connection accepted".to_string(), LogSource::Process);
+        buffer.push_line("worker", "Processing job 1".to_string(), LogSource::Process);
 
         assert!(!buffer.is_empty());
         assert_eq!(buffer.len_for("server"), 2);
@@ -378,23 +388,23 @@ mod tests {
         let mut buffer = LogBuffer::with_max_lines(3);
 
         for i in 0..5 {
-            buffer.push_line("test", format!("Line {}", i));
+            buffer.push_line("test", format!("Line {}", i), LogSource::Process);
         }
 
         assert_eq!(buffer.len_for("test"), 3);
 
         let logs = buffer.raw_logs("test").unwrap();
-        let lines: Vec<&str> = logs.iter().map(|s| s.as_str()).collect();
+        let lines: Vec<&str> = logs.iter().map(|s| s.content.as_str()).collect();
         assert_eq!(lines, vec!["Line 2", "Line 3", "Line 4"]);
     }
 
     #[test]
     fn test_filter() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "INFO: Started".to_string());
-        buffer.push_line("server", "DEBUG: Details".to_string());
-        buffer.push_line("server", "ERROR: Failed".to_string());
-        buffer.push_line("server", "INFO: Running".to_string());
+        buffer.push_line("server", "INFO: Started".to_string(), LogSource::Process);
+        buffer.push_line("server", "DEBUG: Details".to_string(), LogSource::Process);
+        buffer.push_line("server", "ERROR: Failed".to_string(), LogSource::Process);
+        buffer.push_line("server", "INFO: Running".to_string(), LogSource::Process);
 
         // No filter
         let logs = buffer.filtered_logs("server");
@@ -406,7 +416,7 @@ mod tests {
 
         let logs = buffer.filtered_logs("server");
         assert_eq!(logs.len(), 2);
-        assert!(logs.iter().all(|(_, line)| line.contains("INFO")));
+        assert!(logs.iter().all(|(_, log)| log.content.contains("INFO")));
 
         // Clear filter
         buffer.clear_filter();
@@ -426,10 +436,10 @@ mod tests {
     #[test]
     fn test_search() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Line 1".to_string());
-        buffer.push_line("server", "match here".to_string());
-        buffer.push_line("server", "Line 3".to_string());
-        buffer.push_line("server", "Another match".to_string());
+        buffer.push_line("server", "Line 1".to_string(), LogSource::Process);
+        buffer.push_line("server", "match here".to_string(), LogSource::Process);
+        buffer.push_line("server", "Line 3".to_string(), LogSource::Process);
+        buffer.push_line("server", "Another match".to_string(), LogSource::Process);
 
         buffer.start_search("match").unwrap();
         assert!(buffer.has_search());
@@ -446,7 +456,7 @@ mod tests {
     #[test]
     fn test_search_case_insensitive() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Match here".to_string());
+        buffer.push_line("server", "Match here".to_string(), LogSource::Process);
 
         // Case-insensitive search with regex
         buffer.start_search("(?i)match").unwrap();
@@ -491,8 +501,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Line 1".to_string());
-        buffer.push_line("worker", "Line 2".to_string());
+        buffer.push_line("server", "Line 1".to_string(), LogSource::Process);
+        buffer.push_line("worker", "Line 2".to_string(), LogSource::Process);
 
         buffer.clear_process("server");
         assert_eq!(buffer.len_for("server"), 0);
@@ -505,9 +515,9 @@ mod tests {
     #[test]
     fn test_all_logs_combined() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Server line 1".to_string());
-        buffer.push_line("worker", "Worker line 1".to_string());
-        buffer.push_line("server", "Server line 2".to_string());
+        buffer.push_line("server", "Server line 1".to_string(), LogSource::Process);
+        buffer.push_line("worker", "Worker line 1".to_string(), LogSource::Process);
+        buffer.push_line("server", "Server line 2".to_string(), LogSource::Process);
 
         let combined = buffer.all_logs_combined();
         assert_eq!(combined.len(), 3);
@@ -527,10 +537,15 @@ mod tests {
 
     #[test]
     fn test_push_log_line_struct() {
+        use crate::daemon::LogSource;
+
         let mut buffer = LogBuffer::new();
         buffer.push(LogLine {
+            timestamp: 0,
             process: "server".to_string(),
+            group: None,
             content: "Started".to_string(),
+            source: LogSource::Process,
         });
 
         assert_eq!(buffer.len_for("server"), 1);
