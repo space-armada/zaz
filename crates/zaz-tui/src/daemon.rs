@@ -16,6 +16,8 @@ use crate::TuiError;
 pub enum ClientCommand {
     /// Restart a specific group.
     RestartGroup(String),
+    /// Restart a specific process (task or daemon) within a group.
+    RestartProcess { group: String, process: String },
     /// Restart all groups.
     RestartAll,
     /// Shutdown the daemon.
@@ -297,6 +299,9 @@ async fn handle_command(
 ) -> Result<(), TuiError> {
     let request = match cmd {
         ClientCommand::RestartGroup(name) => ApiRequest::RestartGroup { name },
+        ClientCommand::RestartProcess { group, process } => {
+            ApiRequest::RestartProcess { group, process }
+        }
         ClientCommand::RestartAll => ApiRequest::RestartAll,
         ClientCommand::Shutdown => ApiRequest::Shutdown,
         ClientCommand::RefreshStatus => ApiRequest::Status,

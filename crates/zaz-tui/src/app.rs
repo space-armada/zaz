@@ -59,6 +59,17 @@ pub enum Focus {
     Pane(usize),
 }
 
+/// Describes what is currently selected in the groups pane.
+#[derive(Debug, Clone)]
+enum SelectedItem {
+    /// A group header is selected.
+    Group(String),
+    /// A task within a group is selected.
+    Task { group: String, task: String },
+    /// A daemon within a group is selected.
+    Daemon { group: String, daemon: String },
+}
+
 /// Main application state.
 pub struct App {
     // === Core ===
@@ -421,15 +432,37 @@ impl App {
             .sum()
     }
 
-    /// Get the group name for the currently selected item.
-    fn selected_group_name(&self) -> Option<String> {
+    /// Get detailed info about the currently selected item.
+    fn selected_item_info(&self) -> Option<SelectedItem> {
         let mut idx = 0;
         for group in self.state.groups.values() {
-            let group_items = 1 + group.tasks.len() + group.daemons.len();
-            if self.selected_item >= idx && self.selected_item < idx + group_items {
-                return Some(group.name.clone());
+            // Check if group header is selected
+            if self.selected_item == idx {
+                return Some(SelectedItem::Group(group.name.clone()));
             }
-            idx += group_items;
+            idx += 1;
+
+            // Check tasks
+            for task in &group.tasks {
+                if self.selected_item == idx {
+                    return Some(SelectedItem::Task {
+                        group: group.name.clone(),
+                        task: task.name.clone(),
+                    });
+                }
+                idx += 1;
+            }
+
+            // Check daemons
+            for daemon in &group.daemons {
+                if self.selected_item == idx {
+                    return Some(SelectedItem::Daemon {
+                        group: group.name.clone(),
+                        daemon: daemon.name.clone(),
+                    });
+                }
+                idx += 1;
+            }
         }
         None
     }
@@ -537,10 +570,27 @@ impl App {
     }
 
     fn restart_selected(&mut self) {
-        // Get the group name containing the selected item
-        if let Some(name) = self.selected_group_name() {
-            self.send_command(ClientCommand::RestartGroup(name.clone()));
-            self.set_status(format!("Restarting {}", name));
+        // Determine what's selected and send the appropriate command
+        match self.selected_item_info() {
+            Some(SelectedItem::Group(name)) => {
+                self.send_command(ClientCommand::RestartGroup(name.clone()));
+                self.set_status(format!("Restarting group {}", name));
+            }
+            Some(SelectedItem::Task { group, task }) => {
+                self.send_command(ClientCommand::RestartProcess {
+                    group: group.clone(),
+                    process: task.clone(),
+                });
+                self.set_status(format!("Restarting task {}", task));
+            }
+            Some(SelectedItem::Daemon { group, daemon }) => {
+                self.send_command(ClientCommand::RestartProcess {
+                    group: group.clone(),
+                    process: daemon.clone(),
+                });
+                self.set_status(format!("Restarting daemon {}", daemon));
+            }
+            None => {}
         }
     }
 
