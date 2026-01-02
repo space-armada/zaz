@@ -126,6 +126,34 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, detach: bool) -> Res
         anyhow::bail!("detached daemon mode not yet implemented");
     }
 
+    // Check if a daemon is already running by trying to connect and send a request
+    let check_timeout = Duration::from_secs(1);
+    match tokio::time::timeout(check_timeout, Client::connect(socket_path)).await {
+        Ok(Ok(mut client)) => {
+            // Try to actually communicate with the daemon
+            match tokio::time::timeout(check_timeout, client.request(&ApiRequest::Status)).await {
+                Ok(Ok(_)) => {
+                    anyhow::bail!(
+                        "daemon already running (socket {} is active)",
+                        socket_path.display()
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "stale socket (request failed), will replace");
+                }
+                Err(_) => {
+                    tracing::debug!("stale socket (request timed out), will replace");
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "no existing daemon (connect failed)");
+        }
+        Err(_) => {
+            tracing::debug!("no existing daemon (connect timed out)");
+        }
+    }
+
     tracing::info!(config = %config_path.display(), "starting daemon");
 
     let mut engine = Engine::new(config_path)?;
