@@ -25,17 +25,13 @@ pub struct UserConfig {
 /// TUI style preference for user config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum TuiStylePreference {
     /// Full style with group tree and logs pane.
+    #[default]
     Full,
     /// Minimal style with one pane per task.
     Minimal,
-}
-
-impl Default for TuiStylePreference {
-    fn default() -> Self {
-        Self::Full
-    }
 }
 
 /// Get the path to the user configuration file.

@@ -405,7 +405,7 @@ impl MinimalStyle {
         };
 
         let page_info = if task_count > 6 {
-            let total_pages = (task_count + 5) / 6;
+            let total_pages = task_count.div_ceil(6);
             format!(" Page {}/{} | ", app.current_page + 1, total_pages)
         } else {
             String::new()

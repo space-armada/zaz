@@ -235,10 +235,7 @@ impl Engine {
         }
 
         // Store in per-process buffer
-        let buffer = self
-            .log_buffers
-            .entry(log.process.clone())
-            .or_insert_with(VecDeque::new);
+        let buffer = self.log_buffers.entry(log.process.clone()).or_default();
         buffer.push_back(log.clone());
 
         // Trim to max size

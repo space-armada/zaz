@@ -226,7 +226,7 @@ impl App {
         if count <= 6 {
             1
         } else {
-            (count + 5) / 6 // Ceiling division
+            count.div_ceil(6) // Ceiling division
         }
     }
 

@@ -125,7 +125,7 @@ fn local_offset_secs() -> i64 {
 
             if !localtime_r(&time_t, tm.as_mut_ptr()).is_null() {
                 let tm = tm.assume_init();
-                return tm.tm_gmtoff as i64;
+                return tm.tm_gmtoff;
             }
         }
     }
@@ -310,7 +310,7 @@ impl LogBuffer {
 
     /// Add a log line for a process.
     pub fn push(&mut self, log: LogLine) {
-        let buffer = self.logs.entry(log.process).or_insert_with(VecDeque::new);
+        let buffer = self.logs.entry(log.process).or_default();
         buffer.push_back(StoredLog {
             timestamp: log.timestamp,
             content: sanitize_log_content(&log.content),
@@ -325,10 +325,7 @@ impl LogBuffer {
 
     /// Add a log line with process, content, timestamp, and source directly.
     pub fn push_line(&mut self, process: &str, content: String, timestamp: u64, source: LogSource) {
-        let buffer = self
-            .logs
-            .entry(process.to_string())
-            .or_insert_with(VecDeque::new);
+        let buffer = self.logs.entry(process.to_string()).or_default();
         buffer.push_back(StoredLog {
             timestamp,
             content: sanitize_log_content(&content),
