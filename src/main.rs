@@ -246,6 +246,9 @@ async fn run_daemon(
 
             // Handle API commands
             Some(cmd) = command_rx.recv() => {
+                // Drain log channel before handling request (ensures GetLogs returns fresh data)
+                engine.process_incoming_logs();
+
                 let is_shutdown = matches!(cmd.request, ApiRequest::Shutdown);
                 let response = engine.handle_request(cmd.request).await;
                 let _ = cmd.response_tx.send(response);
@@ -477,6 +480,9 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
             loop {
                 tokio::select! {
                     Some(cmd) = command_rx.recv() => {
+                        // Drain log channel before handling request (ensures GetLogs returns fresh data)
+                        engine.process_incoming_logs();
+
                         let is_shutdown = matches!(cmd.request, ApiRequest::Shutdown);
                         let response = engine.handle_request(cmd.request).await;
                         let _ = cmd.response_tx.send(response);
