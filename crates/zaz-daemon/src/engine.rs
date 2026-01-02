@@ -13,12 +13,162 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group};
-use zaz_process::{Daemon, Executor, TaskRunner};
+use zaz_process::{Daemon, Executor, OutputLine, TaskRunner};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
 
 /// Maximum number of log lines to store per process.
 const MAX_LOG_LINES: usize = 10_000;
+
+/// Completion signal from a spawned task execution.
+#[derive(Debug)]
+struct TaskCompletion {
+    /// Unique task identifier ("group_name:task_name").
+    task_id: String,
+    /// Group name (for state updates).
+    group_name: String,
+    /// Task index in the group (for state updates).
+    task_index: usize,
+    /// Whether the task execution succeeded.
+    success: bool,
+    /// Final status.
+    status: ProcessStatus,
+    /// Duration in milliseconds.
+    duration_ms: Option<u64>,
+    /// Exit code.
+    exit_code: Option<i32>,
+}
+
+/// Context for executing a single task in a spawned task.
+#[derive(Clone)]
+struct TaskExecutionContext {
+    /// Unique task identifier ("group_name:task_name").
+    task_id: String,
+    /// Group name.
+    group_name: String,
+    /// Task name.
+    task_name: String,
+    /// Task index in the group.
+    task_index: usize,
+    /// Command to execute.
+    command: String,
+    /// Executor for running commands.
+    executor: Executor,
+}
+
+/// Execute a single task in a spawned task.
+/// Sends logs via log_tx and returns completion result.
+async fn execute_task(ctx: TaskExecutionContext, log_tx: mpsc::Sender<LogLine>) -> TaskCompletion {
+    let task_runner = TaskRunner::new(ctx.executor);
+
+    tracing::info!(task = %ctx.task_name, "running task");
+
+    // Send "running" log
+    let _ = log_tx
+        .send(
+            LogLine::daemon(&ctx.task_name, format!("running: {}", ctx.command))
+                .with_group(ctx.group_name.clone()),
+        )
+        .await;
+
+    let start = std::time::Instant::now();
+
+    // Create channel for streaming output
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
+
+    // Run command with streaming
+    let command_future = task_runner.run_streaming(&ctx.command, output_tx);
+    tokio::pin!(command_future);
+
+    let result = loop {
+        tokio::select! {
+            biased;
+
+            result = &mut command_future => {
+                // Drain remaining output
+                while let Some(line) = output_rx.recv().await {
+                    let content = match line {
+                        OutputLine::Stdout(s) | OutputLine::Stderr(s) => s,
+                    };
+                    let _ = log_tx
+                        .send(
+                            LogLine::process(&ctx.task_name, content)
+                                .with_group(ctx.group_name.clone()),
+                        )
+                        .await;
+                }
+                break result;
+            }
+
+            Some(line) = output_rx.recv() => {
+                let content = match line {
+                    OutputLine::Stdout(s) | OutputLine::Stderr(s) => s,
+                };
+                let _ = log_tx
+                    .send(
+                        LogLine::process(&ctx.task_name, content)
+                            .with_group(ctx.group_name.clone()),
+                    )
+                    .await;
+            }
+        }
+    };
+
+    let duration = start.elapsed();
+
+    match result {
+        Ok(output) => {
+            let is_success = output.exit_code.map(|c| c == 0).unwrap_or(true);
+            let status = if is_success {
+                ProcessStatus::Success
+            } else {
+                ProcessStatus::Failed
+            };
+
+            // Send completion log
+            let log_msg = if is_success {
+                format!("completed in {:.2}s", duration.as_secs_f64())
+            } else {
+                format!(
+                    "failed: process exited with status {}",
+                    output.exit_code.unwrap_or(-1)
+                )
+            };
+            let _ = log_tx
+                .send(LogLine::daemon(&ctx.task_name, log_msg).with_group(ctx.group_name.clone()))
+                .await;
+
+            TaskCompletion {
+                task_id: ctx.task_id,
+                group_name: ctx.group_name,
+                task_index: ctx.task_index,
+                success: is_success,
+                status,
+                duration_ms: Some(duration.as_millis() as u64),
+                exit_code: output.exit_code,
+            }
+        }
+        Err(e) => {
+            tracing::error!(task = %ctx.task_name, error = %e, "task execution failed");
+            let _ = log_tx
+                .send(
+                    LogLine::daemon(&ctx.task_name, format!("failed: {}", e))
+                        .with_group(ctx.group_name.clone()),
+                )
+                .await;
+
+            TaskCompletion {
+                task_id: ctx.task_id,
+                group_name: ctx.group_name,
+                task_index: ctx.task_index,
+                success: false,
+                status: ProcessStatus::Failed,
+                duration_ms: Some(duration.as_millis() as u64),
+                exit_code: None,
+            }
+        }
+    }
+}
 
 /// The core orchestration engine.
 pub struct Engine {
@@ -60,6 +210,19 @@ pub struct Engine {
 
     /// Whether to print process output to stdout (verbose mode).
     verbose_output: bool,
+
+    /// Currently running tasks (by "group:task" id). All tasks can run in parallel.
+    running_tasks: std::collections::HashSet<String>,
+
+    /// Tasks that need to re-run after their current execution completes.
+    /// Maximum 1 pending per task (HashSet deduplicates).
+    pending_tasks: std::collections::HashSet<String>,
+
+    /// Channel for receiving task completion signals from spawned tasks.
+    task_completion_rx: mpsc::Receiver<TaskCompletion>,
+
+    /// Sender for spawned tasks to signal task completion.
+    task_completion_tx: mpsc::Sender<TaskCompletion>,
 }
 
 /// A managed watch group with its processes.
@@ -190,6 +353,9 @@ impl Engine {
         // Create mpsc channel for PTY reader tasks to submit logs
         let (log_tx, log_rx) = mpsc::channel(1024);
 
+        // Create mpsc channel for group completion signals
+        let (task_completion_tx, task_completion_rx) = mpsc::channel(64);
+
         Ok(Self {
             config,
             config_path,
@@ -204,6 +370,10 @@ impl Engine {
             log_rx,
             log_tx,
             verbose_output,
+            running_tasks: std::collections::HashSet::new(),
+            pending_tasks: std::collections::HashSet::new(),
+            task_completion_rx,
+            task_completion_tx,
         })
     }
 
@@ -425,26 +595,47 @@ impl Engine {
             let task_name = task.name().to_string();
             let group_name_owned = group_name.to_string();
 
-            // Run task and collect all output (simpler than channel-based streaming)
-            tracing::debug!(task = %task_name, "running task");
-            let inner_result = task_runner.run(&command).await;
-            tracing::debug!(task = %task_name, result = ?inner_result.as_ref().map(|r| r.exit_code), "task finished");
+            // Create channel for streaming output
+            let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
 
-            // Push all collected output as logs
-            if let Ok(ref output) = inner_result {
-                for line in &output.stdout {
-                    self.push_log(
-                        LogLine::process(&task_name, line.clone())
-                            .with_group(group_name_owned.clone()),
-                    );
+            // Run command directly (no spawn) - use select to stream output in real-time
+            tracing::debug!(task = %task_name, "starting streaming command");
+            let command_future = task_runner.run_streaming(&command, output_tx);
+            tokio::pin!(command_future);
+
+            let inner_result = loop {
+                tokio::select! {
+                    biased; // Check in order: command completion first
+
+                    result = &mut command_future => {
+                        tracing::debug!(task = %task_name, "command completed, draining output");
+                        // Command completed - drain any remaining output
+                        while let Some(line) = output_rx.recv().await {
+                            let content = match line {
+                                OutputLine::Stdout(s) => s,
+                                OutputLine::Stderr(s) => s,
+                            };
+                            self.push_log(
+                                LogLine::process(&task_name, content)
+                                    .with_group(group_name_owned.clone()),
+                            );
+                        }
+                        tracing::debug!(task = %task_name, "output drained");
+                        break result;
+                    }
+
+                    Some(line) = output_rx.recv() => {
+                        let content = match line {
+                            OutputLine::Stdout(s) => s,
+                            OutputLine::Stderr(s) => s,
+                        };
+                        self.push_log(
+                            LogLine::process(&task_name, content)
+                                .with_group(group_name_owned.clone()),
+                        );
+                    }
                 }
-                for line in &output.stderr {
-                    self.push_log(
-                        LogLine::process(&task_name, line.clone())
-                            .with_group(group_name_owned.clone()),
-                    );
-                }
-            }
+            };
 
             match inner_result {
                 Ok(output) => {
@@ -583,13 +774,14 @@ impl Engine {
     }
 
     /// Process file change events.
+    ///
+    /// All tasks run in parallel. Same task cannot run concurrently - it gets queued.
     pub async fn handle_changes(&mut self, events: Vec<FileEvent>) -> Result<(), DaemonError> {
         if events.is_empty() {
             return Ok(());
         }
 
         let changed_paths: Vec<PathBuf> = events.iter().map(|e| e.path.clone()).collect();
-        tracing::info!(files = changed_paths.len(), "processing file changes");
 
         self.state.last_change = Some(
             std::time::SystemTime::now()
@@ -611,25 +803,180 @@ impl Engine {
             return Ok(());
         }
 
-        // Sort affected groups by execution order
-        let order: HashMap<&str, usize> = self
-            .execution_order
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.as_str(), i))
-            .collect();
-        affected_groups.sort_by_key(|n| order.get(n.as_str()).copied().unwrap_or(usize::MAX));
+        tracing::info!(files = changed_paths.len(), groups = ?affected_groups, "processing file changes");
 
-        // Run affected groups with their dependencies
+        // Build variable context for command expansion
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        let context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_files(changed_paths)
+            .with_root(config_dir.to_path_buf());
+
+        // Spawn each task in affected groups (all tasks run in parallel)
         for group_name in affected_groups {
-            self.run_group(&group_name, &changed_paths, true).await?;
+            self.spawn_group_tasks(&group_name, &context, true);
         }
 
         Ok(())
     }
 
+    /// Spawn all tasks in a group. Each task runs in parallel with per-task deduplication.
+    fn spawn_group_tasks(
+        &mut self,
+        group_name: &str,
+        context: &Context,
+        is_change_triggered: bool,
+    ) {
+        // Get group configuration
+        let (tasks, executor) = {
+            let Some(group) = self.groups.get_mut(group_name) else {
+                tracing::warn!(group = %group_name, "group not found");
+                return;
+            };
+            group.state.status = GroupStatus::Running;
+            (group.config.tasks.clone(), group.executor.clone())
+        };
+
+        // Spawn each task independently (parallel execution)
+        for (idx, task) in tasks.iter().enumerate() {
+            // Skip on_change_only tasks during startup
+            if task.on_change_only && !is_change_triggered {
+                tracing::debug!(task = %task.name(), "skipping on_change_only task during startup");
+                continue;
+            }
+
+            // Expand variables in command
+            let expander = zaz_vars::Expander::new(context);
+            let command = match expander.expand(&task.command) {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    tracing::error!(task = %task.name(), error = %e, "variable expansion failed");
+                    continue;
+                }
+            };
+
+            self.spawn_task(group_name, task.name(), idx, command, executor.clone());
+        }
+
+        self.update_state();
+    }
+
+    /// Spawn a single task if not already running.
+    /// If already running, adds to pending_tasks for later execution.
+    fn spawn_task(
+        &mut self,
+        group_name: &str,
+        task_name: &str,
+        task_index: usize,
+        command: String,
+        executor: Executor,
+    ) {
+        let task_id = format!("{}:{}", group_name, task_name);
+
+        // Check if this task is already running
+        if self.running_tasks.contains(&task_id) {
+            tracing::debug!(task_id = %task_id, "task already running, queuing for later");
+            self.pending_tasks.insert(task_id);
+            return;
+        }
+
+        // Mark task as running
+        self.running_tasks.insert(task_id.clone());
+        if let Some(group) = self.groups.get_mut(group_name) {
+            if task_index < group.state.tasks.len() {
+                group.state.tasks[task_index].status = ProcessStatus::Running;
+            }
+        }
+
+        let ctx = TaskExecutionContext {
+            task_id,
+            group_name: group_name.to_string(),
+            task_name: task_name.to_string(),
+            task_index,
+            command,
+            executor,
+        };
+
+        let log_tx = self.log_tx.clone();
+        let completion_tx = self.task_completion_tx.clone();
+
+        tracing::info!(task = %task_name, group = %group_name, "spawning task execution");
+
+        // Spawn the task execution
+        tokio::spawn(async move {
+            let completion = execute_task(ctx, log_tx).await;
+            // Send completion signal (ignore error if receiver dropped)
+            let _ = completion_tx.send(completion).await;
+        });
+    }
+
+    /// Process completed task executions and handle pending re-runs.
+    pub fn process_task_completions(&mut self) {
+        while let Ok(completion) = self.task_completion_rx.try_recv() {
+            tracing::info!(
+                task_id = %completion.task_id,
+                success = %completion.success,
+                "task execution completed"
+            );
+
+            // Update task state
+            if let Some(group) = self.groups.get_mut(&completion.group_name) {
+                if completion.task_index < group.state.tasks.len() {
+                    group.state.tasks[completion.task_index].status = completion.status;
+                    group.state.tasks[completion.task_index].duration_ms = completion.duration_ms;
+                    group.state.tasks[completion.task_index].exit_code = completion.exit_code;
+                }
+                // Update group status based on all tasks
+                // For now, just mark as Ready if any task is done (simplified)
+                // A more complete implementation would track all task states
+            }
+
+            // Remove from running set
+            self.running_tasks.remove(&completion.task_id);
+
+            // Check if this task is pending re-run
+            if self.pending_tasks.remove(&completion.task_id) {
+                tracing::info!(task_id = %completion.task_id, "re-running pending task");
+                // Parse task_id back to group:task
+                if let Some((group_name, task_name)) = completion.task_id.split_once(':') {
+                    // Get executor and command for re-run
+                    if let Some(group) = self.groups.get(group_name) {
+                        if let Some(task) =
+                            group.config.tasks.iter().find(|t| t.name() == task_name)
+                        {
+                            // For re-run, we use empty context (no specific changed files)
+                            let context = Context::new()
+                                .with_variables(self.config.variables.clone())
+                                .with_root(
+                                    self.config_path
+                                        .parent()
+                                        .unwrap_or(Path::new("."))
+                                        .to_path_buf(),
+                                );
+                            let expander = zaz_vars::Expander::new(&context);
+                            if let Ok(command) = expander.expand(&task.command) {
+                                self.spawn_task(
+                                    group_name,
+                                    task_name,
+                                    completion.task_index,
+                                    command,
+                                    group.executor.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.update_state();
+        }
+    }
+
     /// Poll for file changes and process them.
     pub async fn poll(&mut self) -> Result<bool, DaemonError> {
+        // Process any completed tasks first
+        self.process_task_completions();
+
         // Create a combined pattern set for polling
         let combined = self.combined_patterns()?;
 
@@ -745,16 +1092,32 @@ impl Engine {
     }
 
     /// Restart a specific group.
-    pub async fn restart_group(&mut self, group_name: &str) -> Result<(), DaemonError> {
+    ///
+    /// Spawns the group execution asynchronously. Returns immediately.
+    pub fn restart_group(&mut self, group_name: &str) -> Result<(), DaemonError> {
+        if !self.groups.contains_key(group_name) {
+            return Err(DaemonError::GroupNotFound(group_name.to_string()));
+        }
         tracing::info!(group = group_name, "restarting group");
-        self.run_group(group_name, &[], false).await
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        let context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir.to_path_buf());
+        self.spawn_group_tasks(group_name, &context, false);
+        Ok(())
     }
 
     /// Restart all groups.
-    pub async fn restart_all(&mut self) -> Result<(), DaemonError> {
+    ///
+    /// Spawns all group executions asynchronously. Returns immediately.
+    pub fn restart_all(&mut self) -> Result<(), DaemonError> {
         tracing::info!("restarting all groups");
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        let context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir.to_path_buf());
         for group_name in &self.execution_order.clone() {
-            self.run_group(group_name, &[], false).await?;
+            self.spawn_group_tasks(group_name, &context, false);
         }
         Ok(())
     }
@@ -810,27 +1173,49 @@ impl Engine {
                     .with_group(group_name.to_string()),
             );
 
-            // Run task and collect output
+            // Run task with real-time streaming
             let task_runner = TaskRunner::new(executor);
-            let inner_result = task_runner.run(&command).await;
-
-            // Push all collected output as logs
             let task_name = process_name.to_string();
             let group_name_owned = group_name.to_string();
-            if let Ok(ref output) = inner_result {
-                for line in &output.stdout {
-                    self.push_log(
-                        LogLine::process(&task_name, line.clone())
-                            .with_group(group_name_owned.clone()),
-                    );
+
+            // Create channel for streaming output
+            let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
+
+            // Run command directly (no spawn) - use select to stream output in real-time
+            let command_future = task_runner.run_streaming(&command, output_tx);
+            tokio::pin!(command_future);
+
+            let inner_result = loop {
+                tokio::select! {
+                    biased; // Check in order: command completion first
+
+                    result = &mut command_future => {
+                        // Command completed - drain any remaining output
+                        while let Some(line) = output_rx.recv().await {
+                            let content = match line {
+                                OutputLine::Stdout(s) => s,
+                                OutputLine::Stderr(s) => s,
+                            };
+                            self.push_log(
+                                LogLine::process(&task_name, content)
+                                    .with_group(group_name_owned.clone()),
+                            );
+                        }
+                        break result;
+                    }
+
+                    Some(line) = output_rx.recv() => {
+                        let content = match line {
+                            OutputLine::Stdout(s) => s,
+                            OutputLine::Stderr(s) => s,
+                        };
+                        self.push_log(
+                            LogLine::process(&task_name, content)
+                                .with_group(group_name_owned.clone()),
+                        );
+                    }
                 }
-                for line in &output.stderr {
-                    self.push_log(
-                        LogLine::process(&task_name, line.clone())
-                            .with_group(group_name_owned.clone()),
-                    );
-                }
-            }
+            };
 
             let duration = start.elapsed();
 
@@ -940,8 +1325,10 @@ impl Engine {
                 let logs = self.get_logs(&name, Some(100));
                 ApiResponse::Logs { name, lines: logs }
             }
-            ApiRequest::RestartGroup { name } => match self.restart_group(&name).await {
-                Ok(()) => ApiResponse::ok_with_message(format!("restarted group '{}'", name)),
+            ApiRequest::RestartGroup { name } => match self.restart_group(&name) {
+                Ok(()) => {
+                    ApiResponse::ok_with_message(format!("restart initiated for group '{}'", name))
+                }
                 Err(e) => ApiResponse::error(format!("failed to restart group '{}': {}", name, e)),
             },
             ApiRequest::RestartProcess { group, process } => {
@@ -953,8 +1340,8 @@ impl Engine {
                     )),
                 }
             }
-            ApiRequest::RestartAll => match self.restart_all().await {
-                Ok(()) => ApiResponse::ok_with_message("restarted all groups"),
+            ApiRequest::RestartAll => match self.restart_all() {
+                Ok(()) => ApiResponse::ok_with_message("restart initiated for all groups"),
                 Err(e) => ApiResponse::error(format!("failed to restart: {}", e)),
             },
             ApiRequest::ReloadConfig => {

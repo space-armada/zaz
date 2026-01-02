@@ -112,11 +112,15 @@ impl Executor {
         command: &str,
         output_tx: mpsc::UnboundedSender<OutputLine>,
     ) -> Result<CommandOutput, ProcessError> {
-        self.run_with_callback(command, move |line| {
-            // Unbounded send never blocks and only fails if receiver dropped
-            let _ = output_tx.send(line);
-        })
-        .await
+        tracing::debug!(command = %command, "run_streaming: starting");
+        let result = self
+            .run_with_callback(command, move |line| {
+                // Unbounded send never blocks and only fails if receiver dropped
+                let _ = output_tx.send(line);
+            })
+            .await;
+        tracing::debug!(command = %command, success = %result.is_ok(), "run_streaming: completed");
+        result
     }
 
     /// Run a command to completion, streaming output to a callback.
@@ -141,8 +145,9 @@ impl Executor {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        let (stdout_tx, mut stdout_rx) = mpsc::channel(100);
-        let (stderr_tx, mut stderr_rx) = mpsc::channel(100);
+        // Use unbounded channels to prevent deadlock when child produces lots of output
+        let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel();
+        let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel();
 
         // Spawn tasks to read stdout/stderr
         // Important: if not spawning a reader, drop the sender so recv() returns None
@@ -152,7 +157,7 @@ impl Executor {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = tx.send(line).await;
+                    let _ = tx.send(line);
                 }
             });
         } else {
@@ -165,7 +170,7 @@ impl Executor {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = tx.send(line).await;
+                    let _ = tx.send(line);
                 }
             });
         } else {
@@ -180,6 +185,7 @@ impl Executor {
         let mut stderr_lines = Vec::new();
 
         // Process output as it arrives
+        tracing::debug!("run_with_callback: entering select loop");
         loop {
             tokio::select! {
                 biased;  // Prefer earlier branches to ensure we drain output before checking wait
@@ -193,6 +199,7 @@ impl Executor {
                     stderr_lines.push(line);
                 }
                 status = child.wait() => {
+                    tracing::debug!("run_with_callback: child.wait() returned");
                     let status = status.map_err(ProcessError::Spawn)?;
 
                     // Drain remaining output
@@ -208,6 +215,7 @@ impl Executor {
                         stderr_lines.push(line);
                     }
 
+                    tracing::debug!(exit_code = ?status.code(), "run_with_callback: returning");
                     // Always return output, even on non-zero exit.
                     // Caller can check exit_code to determine success/failure.
                     return Ok(CommandOutput {
