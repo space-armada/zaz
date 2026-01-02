@@ -24,4 +24,20 @@ pub enum DaemonError {
     /// Serialization error.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// Group not found.
+    #[error("group not found: {0}")]
+    GroupNotFound(String),
+
+    /// Cyclic dependency detected.
+    #[error("cyclic dependency detected involving: {0}")]
+    CyclicDependency(String),
+
+    /// Variable expansion error.
+    #[error("variable expansion error: {0}")]
+    VarExpansion(String),
+
+    /// Task failed.
+    #[error("task '{task}' failed: {error}")]
+    TaskFailed { task: String, error: String },
 }
