@@ -567,7 +567,7 @@ impl Engine {
                     // Start daemon for the first time
                     tracing::info!(daemon = %daemon.name(), "starting daemon");
                     daemon.start().map_err(DaemonError::Process)?;
-                    
+
                     // Get PTY reader for streaming output
                     if let Some(reader) = daemon.try_clone_reader() {
                         pty_readers.push((

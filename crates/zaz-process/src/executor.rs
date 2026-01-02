@@ -33,7 +33,9 @@ const DEFAULT_SHELL: &str = "/bin/sh";
 impl Executor {
     /// Create a new executor with the given shell.
     pub fn new(shell: Option<String>) -> Self {
-        let shell = shell.unwrap_or_else(|| std::env::var(SHELL_ENV_VAR).unwrap_or_else(|_| DEFAULT_SHELL.to_string()));
+        let shell = shell.unwrap_or_else(|| {
+            std::env::var(SHELL_ENV_VAR).unwrap_or_else(|_| DEFAULT_SHELL.to_string())
+        });
 
         Self {
             shell,

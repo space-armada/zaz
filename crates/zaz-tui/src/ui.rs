@@ -82,7 +82,10 @@ fn calculate_groups_width(app: &App) -> u16 {
         }
 
         for daemon in &group.daemons {
-            let suffix_len = daemon.pid.map(|p| format!(" (pid {})", p).len()).unwrap_or(0);
+            let suffix_len = daemon
+                .pid
+                .map(|p| format!(" (pid {})", p).len())
+                .unwrap_or(0);
             let daemon_width = 10 + daemon.name.len() + suffix_len;
             max_width = max_width.max(daemon_width);
         }
@@ -164,7 +167,10 @@ fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
         };
 
         items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
+            Span::styled(
+                format!(" {} ", status_icon),
+                Style::default().fg(status_color),
+            ),
             Span::styled(&group.name, style),
             Span::styled(
                 format!(" ({})", group_status_text),
@@ -209,17 +215,16 @@ fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
 
             // Format duration or status suffix
             let suffix = match task.status {
-                zaz_daemon::ProcessStatus::Success | zaz_daemon::ProcessStatus::Failed => {
-                    task.duration_ms
-                        .map(|d| {
-                            if d >= 1000 {
-                                format!(" ({:.1}s)", d as f64 / 1000.0)
-                            } else {
-                                format!(" ({}ms)", d)
-                            }
-                        })
-                        .unwrap_or_default()
-                }
+                zaz_daemon::ProcessStatus::Success | zaz_daemon::ProcessStatus::Failed => task
+                    .duration_ms
+                    .map(|d| {
+                        if d >= 1000 {
+                            format!(" ({:.1}s)", d as f64 / 1000.0)
+                        } else {
+                            format!(" ({}ms)", d)
+                        }
+                    })
+                    .unwrap_or_default(),
                 _ => String::new(),
             };
 
@@ -232,7 +237,10 @@ fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             items.push(ListItem::new(Line::from(vec![
-                Span::styled(format!("   {} ", tree_branch), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("   {} ", tree_branch),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled(format!("[{}] ", task_icon), Style::default().fg(task_color)),
                 Span::styled(&task.name, name_style),
                 Span::styled(suffix, Style::default().fg(Color::DarkGray)),
@@ -288,8 +296,14 @@ fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             items.push(ListItem::new(Line::from(vec![
-                Span::styled(format!("   {} ", tree_branch), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("[{}] ", daemon_icon), Style::default().fg(daemon_color)),
+                Span::styled(
+                    format!("   {} ", tree_branch),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("[{}] ", daemon_icon),
+                    Style::default().fg(daemon_color),
+                ),
                 Span::styled(&daemon.name, name_style),
                 Span::styled(suffix, Style::default().fg(Color::DarkGray)),
             ])));
@@ -363,11 +377,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         ])]
     } else if use_multi_line {
         // Multi-line: detailed status
-        let daemon_indicator = if app.started_daemon {
-            " (daemon)"
-        } else {
-            ""
-        };
+        let daemon_indicator = if app.started_daemon { " (daemon)" } else { "" };
         vec![
             Line::from(vec![
                 Span::raw(" "),

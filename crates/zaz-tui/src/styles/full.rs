@@ -143,7 +143,10 @@ impl FullStyle {
             };
 
             items.push(ListItem::new(Line::from(vec![
-                Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
+                Span::styled(
+                    format!(" {} ", status_icon),
+                    Style::default().fg(status_color),
+                ),
                 Span::styled(&group.name, style),
             ])));
 

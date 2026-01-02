@@ -176,7 +176,12 @@ async fn run_tasks(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_daemon(config_path: &Path, socket_path: &Path, detach: bool, quiet: bool) -> Result<()> {
+async fn run_daemon(
+    config_path: &Path,
+    socket_path: &Path,
+    detach: bool,
+    quiet: bool,
+) -> Result<()> {
     if detach {
         // TODO: implement daemonization
         anyhow::bail!("detached daemon mode not yet implemented");
