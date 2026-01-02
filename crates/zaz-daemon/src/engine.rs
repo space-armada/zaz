@@ -1168,112 +1168,18 @@ impl Engine {
             .enumerate()
             .find(|(_, t)| t.name() == process_name)
         {
-            let task_config = task_config.clone();
-            let executor = group.executor.clone();
-
             tracing::info!(group = group_name, task = process_name, "restarting task");
 
-            // Update state
-            if let Some(group) = self.groups.get_mut(group_name) {
-                group.state.tasks[task_idx].status = ProcessStatus::Running;
-                group.state.tasks[task_idx].duration_ms = None;
-            }
-            self.update_state();
-
-            // Run the task
-            let start = std::time::Instant::now();
             let expander = zaz_vars::Expander::new(&context);
             let command = expander
                 .expand(&task_config.command)
                 .map_err(|e| DaemonError::VarExpansion(e.to_string()))?;
 
-            self.push_log(
-                LogLine::daemon(process_name, format!("running: {}", command))
-                    .with_group(group_name.to_string()),
-            );
+            let executor = group.executor.clone();
 
-            // Run task with real-time streaming
-            let task_runner = TaskRunner::new(executor);
-            let task_name = process_name.to_string();
-            let group_name_owned = group_name.to_string();
+            // Spawn task in background (same as restart_group) for proper log streaming
+            self.spawn_task(group_name, process_name, task_idx, command, executor);
 
-            // Create channel for streaming output
-            let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
-
-            // Run command directly (no spawn) - use select to stream output in real-time
-            let command_future = task_runner.run_streaming(&command, output_tx);
-            tokio::pin!(command_future);
-
-            let inner_result = loop {
-                tokio::select! {
-                    biased; // Check in order: command completion first
-
-                    result = &mut command_future => {
-                        // Command completed - drain any remaining output
-                        while let Some(line) = output_rx.recv().await {
-                            let content = match line {
-                                OutputLine::Stdout(s) => s,
-                                OutputLine::Stderr(s) => s,
-                            };
-                            self.push_log(
-                                LogLine::process(&task_name, content)
-                                    .with_group(group_name_owned.clone()),
-                            );
-                        }
-                        break result;
-                    }
-
-                    Some(line) = output_rx.recv() => {
-                        let content = match line {
-                            OutputLine::Stdout(s) => s,
-                            OutputLine::Stderr(s) => s,
-                        };
-                        self.push_log(
-                            LogLine::process(&task_name, content)
-                                .with_group(group_name_owned.clone()),
-                        );
-                    }
-                }
-            };
-
-            let duration = start.elapsed();
-
-            match inner_result {
-                Ok(output) => {
-                    let success = output.exit_code == Some(0);
-                    if let Some(group) = self.groups.get_mut(group_name) {
-                        group.state.tasks[task_idx].status = if success {
-                            ProcessStatus::Success
-                        } else {
-                            ProcessStatus::Failed
-                        };
-                        group.state.tasks[task_idx].duration_ms = Some(duration.as_millis() as u64);
-                    }
-                    self.push_log(
-                        LogLine::daemon(
-                            process_name,
-                            format!(
-                                "completed in {:.2}s (exit code: {:?})",
-                                duration.as_secs_f64(),
-                                output.exit_code
-                            ),
-                        )
-                        .with_group(group_name.to_string()),
-                    );
-                }
-                Err(e) => {
-                    if let Some(group) = self.groups.get_mut(group_name) {
-                        group.state.tasks[task_idx].status = ProcessStatus::Failed;
-                        group.state.tasks[task_idx].duration_ms = Some(duration.as_millis() as u64);
-                    }
-                    self.push_log(
-                        LogLine::daemon(process_name, format!("failed: {}", e))
-                            .with_group(group_name.to_string()),
-                    );
-                }
-            }
-
-            self.update_state();
             return Ok(());
         }
 
