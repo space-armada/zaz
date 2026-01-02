@@ -48,13 +48,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("[/]", "Previous/next page (Minimal)"),
         ],
     ),
-    (
-        "General",
-        &[
-            ("q", "Quit"),
-            ("?", "Toggle this help"),
-        ],
-    ),
+    ("General", &[("q", "Quit"), ("?", "Toggle this help")]),
 ];
 
 /// Draw the help overlay.
@@ -74,14 +68,12 @@ pub fn draw_help(frame: &mut Frame) {
     let mut lines: Vec<Line> = vec![];
 
     // Title
-    lines.push(Line::from(vec![
-        Span::styled(
-            "Keyboard Shortcuts",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "Keyboard Shortcuts",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )]));
     lines.push(Line::from(""));
 
     for (section_title, shortcuts) in HELP_SECTIONS {
@@ -95,10 +87,7 @@ pub fn draw_help(frame: &mut Frame) {
 
         for (key, description) in *shortcuts {
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("    {:12}", key),
-                    Style::default().fg(Color::Green),
-                ),
+                Span::styled(format!("    {:12}", key), Style::default().fg(Color::Green)),
                 Span::raw(*description),
             ]));
         }

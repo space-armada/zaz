@@ -388,7 +388,9 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
 
     // Check if daemon is running
     let check_timeout = Duration::from_secs(1);
-    let daemon_running = match tokio::time::timeout(check_timeout, Client::connect(socket_path)).await {
+    let daemon_running = match tokio::time::timeout(check_timeout, Client::connect(socket_path))
+        .await
+    {
         Ok(Ok(mut client)) => {
             // Try to communicate
             match tokio::time::timeout(check_timeout, client.request(&ApiRequest::Status)).await {
@@ -511,7 +513,12 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
         tui_style: Some(options.style),
     };
 
-    let mut app = App::new(style, user_config);
+    let config_name = config_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "zaz.toml".to_string());
+
+    let mut app = App::new(style, user_config, config_name);
     app.started_daemon = started_daemon;
 
     // Connect to daemon

@@ -383,10 +383,7 @@ impl MinimalStyle {
         let status = if let Some(ref msg) = app.status_message {
             msg.clone()
         } else {
-            format!(
-                " F2:Mini* |{}[q]uit [r]estart [?]help",
-                page_info
-            )
+            format!(" F2:Mini* |{}[q]uit [r]estart [?]help", page_info)
         };
 
         let line = Line::from(vec![

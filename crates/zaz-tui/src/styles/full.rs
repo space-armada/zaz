@@ -135,7 +135,10 @@ impl FullStyle {
                 };
 
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
+                    Span::styled(
+                        format!(" {} ", status_icon),
+                        Style::default().fg(status_color),
+                    ),
                     Span::styled(&group.name, style),
                 ]))
             })
@@ -211,7 +214,8 @@ impl FullStyle {
         let scroll_offset = if app.logs.is_following() {
             total_lines.saturating_sub(visible_height)
         } else {
-            app.log_scroll.min(total_lines.saturating_sub(visible_height))
+            app.log_scroll
+                .min(total_lines.saturating_sub(visible_height))
         };
 
         let items: Vec<ListItem> = combined

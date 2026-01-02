@@ -62,6 +62,8 @@ pub enum Focus {
 /// Main application state.
 pub struct App {
     // === Core ===
+    /// Config file name (e.g., "zaz.toml").
+    pub config_name: String,
     /// Current display style.
     pub style: TuiStyle,
     /// Daemon state (updated periodically).
@@ -109,9 +111,10 @@ pub struct App {
 }
 
 impl App {
-    /// Create a new application with the given style and user config.
-    pub fn new(style: TuiStyle, user_config: UserConfig) -> Self {
+    /// Create a new application with the given style, user config, and config file name.
+    pub fn new(style: TuiStyle, user_config: UserConfig, config_name: String) -> Self {
         Self {
+            config_name,
             style,
             state: DaemonState::default(),
             daemon: None,
@@ -396,12 +399,12 @@ impl App {
                     // Detach: leave daemon running
                     self.should_quit = true;
                 }
-                KeyCode::Char('x') => {
-                    // Exit: shutdown daemon
+                KeyCode::Char('q') | KeyCode::Char('y') => {
+                    // Quit: shutdown daemon
                     self.send_command(ClientCommand::Shutdown);
                     self.should_quit = true;
                 }
-                KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Esc => {
                     self.input_mode = InputMode::Normal;
                 }
                 _ => {}
@@ -590,7 +593,11 @@ impl App {
 
 impl Default for App {
     fn default() -> Self {
-        Self::new(TuiStyle::Full, UserConfig::default())
+        Self::new(
+            TuiStyle::Full,
+            UserConfig::default(),
+            "zaz.toml".to_string(),
+        )
     }
 }
 
@@ -685,10 +692,7 @@ mod tests {
 
     #[test]
     fn test_tui_style_from_preference() {
-        assert_eq!(
-            TuiStyle::from(TuiStylePreference::Full),
-            TuiStyle::Full
-        );
+        assert_eq!(TuiStyle::from(TuiStylePreference::Full), TuiStyle::Full);
         assert_eq!(
             TuiStyle::from(TuiStylePreference::Minimal),
             TuiStyle::Minimal
