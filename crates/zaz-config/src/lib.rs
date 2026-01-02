@@ -4,10 +4,12 @@
 
 mod error;
 mod schema;
+pub mod user;
 mod validate;
 
 pub use error::ConfigError;
 pub use schema::{Config, DaemonCommand, Group, LogFormat, Settings, Signal, TaskCommand};
+pub use user::{load_user_config, user_config_path, TuiStylePreference, UserConfig};
 pub use validate::validate;
 
 use std::path::{Path, PathBuf};
