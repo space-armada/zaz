@@ -1,7 +1,7 @@
 //! Daemon state management.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Overall daemon state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -9,8 +9,8 @@ pub struct DaemonState {
     /// Current status.
     pub status: DaemonStatus,
 
-    /// Watch groups.
-    pub groups: HashMap<String, GroupState>,
+    /// Watch groups (ordered by config file order).
+    pub groups: IndexMap<String, GroupState>,
 
     /// Number of files being watched.
     pub watched_files: usize,

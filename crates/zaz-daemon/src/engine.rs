@@ -6,6 +6,7 @@ use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
 };
 use crate::{ApiResponse, DaemonError};
+use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -29,8 +30,8 @@ pub struct Engine {
     /// Pattern sets for each group.
     group_patterns: HashMap<String, PatternSet>,
 
-    /// Managed groups with their state.
-    groups: HashMap<String, ManagedGroup>,
+    /// Managed groups with their state (ordered by config file order).
+    groups: IndexMap<String, ManagedGroup>,
 
     /// Current daemon state (for status queries).
     state: DaemonState,
@@ -83,7 +84,7 @@ impl Engine {
 
         // Build pattern sets and managed groups
         let mut group_patterns = HashMap::new();
-        let mut groups = HashMap::new();
+        let mut groups = IndexMap::new();
 
         for group in &config.groups {
             // Create pattern set for this group
