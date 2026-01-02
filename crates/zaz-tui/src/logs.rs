@@ -83,7 +83,10 @@ fn local_offset_secs() -> i64 {
 
     // Get current time in both UTC and local
     let now = SystemTime::now();
-    let utc_secs = now.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let utc_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // Use the tm_gmtoff from localtime if available (Unix)
     // For simplicity, we'll calculate based on current time behavior
@@ -300,13 +303,7 @@ impl LogBuffer {
     }
 
     /// Add a log line with process, content, timestamp, and source directly.
-    pub fn push_line(
-        &mut self,
-        process: &str,
-        content: String,
-        timestamp: u64,
-        source: LogSource,
-    ) {
+    pub fn push_line(&mut self, process: &str, content: String, timestamp: u64, source: LogSource) {
         let buffer = self
             .logs
             .entry(process.to_string())
@@ -531,14 +528,24 @@ mod tests {
     #[test]
     fn test_push_logs() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Started on :8080".to_string(), 1000, LogSource::Process);
+        buffer.push_line(
+            "server",
+            "Started on :8080".to_string(),
+            1000,
+            LogSource::Process,
+        );
         buffer.push_line(
             "server",
             "Connection accepted".to_string(),
             2000,
             LogSource::Process,
         );
-        buffer.push_line("worker", "Processing job 1".to_string(), 3000, LogSource::Process);
+        buffer.push_line(
+            "worker",
+            "Processing job 1".to_string(),
+            3000,
+            LogSource::Process,
+        );
 
         assert!(!buffer.is_empty());
         assert_eq!(buffer.len_for("server"), 2);
@@ -551,7 +558,12 @@ mod tests {
         let mut buffer = LogBuffer::with_max_lines(3);
 
         for i in 0..5 {
-            buffer.push_line("test", format!("Line {}", i), i as u64 * 1000, LogSource::Process);
+            buffer.push_line(
+                "test",
+                format!("Line {}", i),
+                i as u64 * 1000,
+                LogSource::Process,
+            );
         }
 
         assert_eq!(buffer.len_for("test"), 3);
@@ -564,10 +576,30 @@ mod tests {
     #[test]
     fn test_filter() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "INFO: Started".to_string(), 1000, LogSource::Process);
-        buffer.push_line("server", "DEBUG: Details".to_string(), 2000, LogSource::Process);
-        buffer.push_line("server", "ERROR: Failed".to_string(), 3000, LogSource::Process);
-        buffer.push_line("server", "INFO: Running".to_string(), 4000, LogSource::Process);
+        buffer.push_line(
+            "server",
+            "INFO: Started".to_string(),
+            1000,
+            LogSource::Process,
+        );
+        buffer.push_line(
+            "server",
+            "DEBUG: Details".to_string(),
+            2000,
+            LogSource::Process,
+        );
+        buffer.push_line(
+            "server",
+            "ERROR: Failed".to_string(),
+            3000,
+            LogSource::Process,
+        );
+        buffer.push_line(
+            "server",
+            "INFO: Running".to_string(),
+            4000,
+            LogSource::Process,
+        );
 
         // No filter
         let logs = buffer.filtered_logs("server");
@@ -602,7 +634,12 @@ mod tests {
         buffer.push_line("server", "Line 1".to_string(), 1000, LogSource::Process);
         buffer.push_line("server", "match here".to_string(), 2000, LogSource::Process);
         buffer.push_line("server", "Line 3".to_string(), 3000, LogSource::Process);
-        buffer.push_line("server", "Another match".to_string(), 4000, LogSource::Process);
+        buffer.push_line(
+            "server",
+            "Another match".to_string(),
+            4000,
+            LogSource::Process,
+        );
 
         buffer.start_search("match").unwrap();
         assert!(buffer.has_search());
@@ -678,9 +715,24 @@ mod tests {
     #[test]
     fn test_all_logs_combined() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "Server line 1".to_string(), 1000, LogSource::Process);
-        buffer.push_line("worker", "Worker line 1".to_string(), 2000, LogSource::Process);
-        buffer.push_line("server", "Server line 2".to_string(), 3000, LogSource::Process);
+        buffer.push_line(
+            "server",
+            "Server line 1".to_string(),
+            1000,
+            LogSource::Process,
+        );
+        buffer.push_line(
+            "worker",
+            "Worker line 1".to_string(),
+            2000,
+            LogSource::Process,
+        );
+        buffer.push_line(
+            "server",
+            "Server line 2".to_string(),
+            3000,
+            LogSource::Process,
+        );
 
         let combined = buffer.all_logs_combined();
         assert_eq!(combined.len(), 3);
