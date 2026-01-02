@@ -465,7 +465,7 @@ impl Engine {
                         self.push_log(
                             LogLine::daemon(
                                 &task_name,
-                                format!("completed in {}ms", duration.as_millis()),
+                                format!("completed in {:.2}s", duration.as_secs_f64()),
                             )
                             .with_group(group_name_owned.clone()),
                         );
@@ -864,7 +864,7 @@ impl Engine {
                         LogLine::daemon(
                             process_name,
                             format!(
-                                "completed in {:.1}s (exit code: {:?})",
+                                "completed in {:.2}s (exit code: {:?})",
                                 duration.as_secs_f64(),
                                 output.exit_code
                             ),
