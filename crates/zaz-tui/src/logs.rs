@@ -396,10 +396,8 @@ impl LogBuffer {
 
     /// Get all logs combined (for full style) with process prefix.
     ///
-    /// Returns (process, line_index, StoredLog) tuples.
+    /// Returns (process, line_index, StoredLog) tuples sorted by timestamp.
     pub fn all_logs_combined(&self) -> Vec<(&str, usize, &StoredLog)> {
-        // For combined view, we interleave logs chronologically
-        // Since we don't have timestamps, we just concatenate per-process
         let mut result = Vec::new();
 
         for (process, buffer) in &self.logs {
@@ -413,6 +411,9 @@ impl LogBuffer {
                 }
             }
         }
+
+        // Sort by timestamp for chronological display
+        result.sort_by_key(|(_, _, log)| log.timestamp);
 
         result
     }
