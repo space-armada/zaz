@@ -4,8 +4,29 @@
 
 use regex::Regex;
 use std::collections::{HashMap, VecDeque};
+use std::sync::LazyLock;
 
 use crate::daemon::{LogLine, LogSource};
+
+/// Regex to match ANSI escape sequences that are NOT color/style codes.
+/// Keeps: `\x1b[...m` (color/style)
+/// Strips: cursor movement (A,B,C,D,E,F,G,H,f), clear (J,K), scroll (S,T), etc.
+static STRIP_ANSI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    // Match ESC[ followed by params and a non-'m' command letter
+    // Also match other ESC sequences like ESC(B for character set
+    Regex::new(r"\x1b\[[0-9;]*[ABCDEFGHJKSTfsu]|\x1b\([A-Z0-9]|\x1b[78]").unwrap()
+});
+
+/// Sanitize a log line by stripping terminal control sequences that would
+/// corrupt the TUI display (cursor movement, screen clearing, etc.)
+/// while preserving ANSI color codes.
+fn sanitize_log_content(content: &str) -> String {
+    // Strip problematic escape sequences
+    let sanitized = STRIP_ANSI_REGEX.replace_all(content, "");
+
+    // Also strip carriage returns which can cause display issues
+    sanitized.replace('\r', "")
+}
 
 /// A stored log entry with source info.
 #[derive(Debug, Clone)]
@@ -292,7 +313,7 @@ impl LogBuffer {
         let buffer = self.logs.entry(log.process).or_insert_with(VecDeque::new);
         buffer.push_back(StoredLog {
             timestamp: log.timestamp,
-            content: log.content,
+            content: sanitize_log_content(&log.content),
             source: log.source,
         });
 
@@ -310,7 +331,7 @@ impl LogBuffer {
             .or_insert_with(VecDeque::new);
         buffer.push_back(StoredLog {
             timestamp,
-            content,
+            content: sanitize_log_content(&content),
             source,
         });
 
@@ -764,5 +785,42 @@ mod tests {
         });
 
         assert_eq!(buffer.len_for("server"), 1);
+    }
+
+    #[test]
+    fn test_sanitize_log_content() {
+        // Cursor movement codes should be stripped
+        let input = "Building \x1b[2K\x1b[1Gcrate v1.0";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Building crate v1.0");
+
+        // Color codes should be preserved
+        let input = "\x1b[31mError\x1b[0m: something failed";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "\x1b[31mError\x1b[0m: something failed");
+
+        // Carriage returns should be stripped
+        let input = "Progress: 50%\r";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Progress: 50%");
+
+        // Mix of both
+        let input = "\x1b[2K\x1b[1G\x1b[32mDone\x1b[0m\r";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "\x1b[32mDone\x1b[0m");
+    }
+
+    #[test]
+    fn test_push_sanitizes_content() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line(
+            "test",
+            "Building \x1b[2K\x1b[1Gcrate".to_string(),
+            1000,
+            LogSource::Process,
+        );
+
+        let logs = buffer.raw_logs("test").unwrap();
+        assert_eq!(logs[0].content, "Building crate");
     }
 }
