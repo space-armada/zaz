@@ -1,6 +1,7 @@
 //! Unix socket server.
 
 use crate::{ApiRequest, ApiResponse, DaemonError, EngineCommand};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -20,8 +21,9 @@ pub fn default_socket_path() -> PathBuf {
     // Fall back to user's state directory (user-private via home directory permissions)
     if let Ok(home) = std::env::var("HOME") {
         let state_dir = PathBuf::from(home).join(".local/state/zaz");
-        // Create directory if it doesn't exist (with user-only permissions)
-        let _ = std::fs::create_dir_all(&state_dir);
+        if !state_dir.exists() && std::fs::create_dir_all(&state_dir).is_ok() {
+            let _ = std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700));
+        }
         return state_dir.join("zaz.sock");
     }
 
@@ -56,9 +58,9 @@ impl Server {
         }
 
         let listener = UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 
         tracing::info!(path = %path.display(), "API server listening");
-
         Ok(Self {
             listener,
             socket_path: path.to_path_buf(),
