@@ -40,24 +40,26 @@ fn draw_full_style(frame: &mut Frame, app: &App) {
         3
     };
 
+    // First split: main content + status bar at bottom (full width)
+    let vertical_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(status_bar_height)])
+        .split(area);
+
     // Calculate the width needed for the groups pane based on content
     let groups_width = calculate_groups_width(app);
     // Add 4 for borders and padding, cap at 50% of screen
     let left_width = (groups_width + 4).min(area.width / 2).max(20);
 
-    let chunks = Layout::default()
+    // Then split main content: groups on left + logs on right
+    let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(left_width), Constraint::Min(0)])
-        .split(area);
+        .split(vertical_chunks[0]);
 
-    let left_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(status_bar_height)])
-        .split(chunks[0]);
-
-    draw_groups(frame, app, left_chunks[0]);
-    draw_status_bar(frame, app, left_chunks[1]);
-    draw_logs(frame, app, chunks[1]);
+    draw_groups(frame, app, horizontal_chunks[0]);
+    draw_logs(frame, app, horizontal_chunks[1]);
+    draw_status_bar(frame, app, vertical_chunks[1]);
 }
 
 /// Calculate the width needed for the groups pane content.
