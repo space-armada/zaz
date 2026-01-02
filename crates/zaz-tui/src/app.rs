@@ -336,9 +336,24 @@ impl App {
     }
 
     fn handle_normal_mode(&mut self, event: Event) {
-        use crossterm::event::KeyCode;
+        use crossterm::event::{KeyCode, KeyModifiers};
 
         if let Event::Key(key) = event {
+            // Handle Ctrl+key combinations first
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('d') => {
+                        self.page_down();
+                        return;
+                    }
+                    KeyCode::Char('u') => {
+                        self.page_up();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
             match key.code {
                 // Navigation
                 KeyCode::Char('j') | KeyCode::Down => self.navigate_down(),
