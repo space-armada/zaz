@@ -2,6 +2,7 @@
 //!
 //! Provides an interactive terminal interface using Ratatui.
 
+pub mod ansi;
 mod app;
 pub mod daemon;
 mod error;

@@ -541,6 +541,8 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
         no_autostart: options.no_autostart,
         disable_animations: options.disable_animations,
         tui_style: Some(options.style),
+        log_colors: zaz_config::LogColorConfig::default(),
+        notifications: zaz_config::NotificationConfig::default(),
     };
 
     let config_name = config_path

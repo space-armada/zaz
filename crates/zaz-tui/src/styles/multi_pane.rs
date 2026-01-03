@@ -23,6 +23,7 @@
 //! - Filter applies to all panes
 
 use super::{KeyResult, PaneLayout, SelectedProcess, StyleRenderer};
+use crate::ansi;
 use crate::app::{App, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -841,31 +842,41 @@ impl MultiPaneStyle {
                 let is_match = app.logs.is_search_match(&log.content);
                 let is_daemon_log = log.source == crate::daemon::LogSource::Daemon;
 
-                let line_style = if is_match {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else if is_daemon_log {
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::DIM)
-                } else {
-                    Style::default()
-                };
-
-                let content = if is_daemon_log {
-                    format!("[zaz] {}", log.content)
-                } else {
-                    log.content.clone()
-                };
-
                 let timestamp = log.format_timestamp(reference_day, app.show_full_timestamp);
 
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{} ", timestamp),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(content, line_style),
-                ]))
+                // Build prefix spans (timestamp only for multi-pane since process name is in title)
+                let prefix_spans = vec![Span::styled(
+                    format!("{} ", timestamp),
+                    Style::default().fg(Color::DarkGray),
+                )];
+
+                // Build the log line with ANSI color parsing
+                let line = if is_daemon_log {
+                    // Daemon logs (zaz internal) get special styling
+                    let mut spans = prefix_spans;
+                    spans.push(Span::styled(
+                        format!("[zaz] {}", log.content),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                    Line::from(spans)
+                } else if app.user_config.log_colors.preserve_ansi {
+                    // Parse ANSI codes for process logs
+                    ansi::parse_ansi_with_prefix(prefix_spans, &log.content)
+                } else {
+                    // No ANSI parsing - plain text
+                    let mut spans = prefix_spans;
+                    spans.push(Span::raw(log.content.clone()));
+                    Line::from(spans)
+                };
+
+                // Apply search highlight if matching
+                if is_match {
+                    ListItem::new(line).style(Style::default().add_modifier(Modifier::REVERSED))
+                } else {
+                    ListItem::new(line)
+                }
             })
             .collect();
 
