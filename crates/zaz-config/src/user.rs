@@ -20,6 +20,101 @@ pub struct UserConfig {
 
     /// Default TUI style preference.
     pub tui_style: Option<TuiStylePreference>,
+
+    /// Log colorization settings.
+    pub log_colors: LogColorConfig,
+
+    /// Notification settings.
+    pub notifications: NotificationConfig,
+}
+
+/// Log colorization configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogColorConfig {
+    /// Preserve ANSI colors from command output (default: true).
+    pub preserve_ansi: bool,
+
+    /// Pattern-based colorization rules.
+    /// Each rule maps a regex pattern to a color name.
+    pub rules: Vec<ColorRule>,
+
+    /// Enable JSON log parsing (default: false).
+    /// When enabled, attempts to parse JSON logs and extract structured fields.
+    pub parse_json: bool,
+
+    /// JSON field to use as log level (e.g., "level", "severity").
+    pub json_level_field: Option<String>,
+
+    /// JSON field to use as message (e.g., "msg", "message").
+    pub json_message_field: Option<String>,
+}
+
+impl Default for LogColorConfig {
+    fn default() -> Self {
+        Self {
+            preserve_ansi: true,
+            rules: vec![
+                ColorRule {
+                    pattern: "(?i)\\berror\\b".to_string(),
+                    color: "red".to_string(),
+                },
+                ColorRule {
+                    pattern: "(?i)\\bwarn(ing)?\\b".to_string(),
+                    color: "yellow".to_string(),
+                },
+                ColorRule {
+                    pattern: "(?i)\\binfo\\b".to_string(),
+                    color: "green".to_string(),
+                },
+                ColorRule {
+                    pattern: "(?i)\\bdebug\\b".to_string(),
+                    color: "gray".to_string(),
+                },
+            ],
+            parse_json: false,
+            json_level_field: Some("level".to_string()),
+            json_message_field: Some("msg".to_string()),
+        }
+    }
+}
+
+/// A pattern-based colorization rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorRule {
+    /// Regex pattern to match against log content.
+    pub pattern: String,
+
+    /// Color name: red, green, yellow, blue, magenta, cyan, white, gray.
+    pub color: String,
+}
+
+/// Notification configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationConfig {
+    /// Enable desktop notifications (default: false).
+    pub enabled: bool,
+
+    /// Show notification on task failure (default: true when enabled).
+    pub on_failure: bool,
+
+    /// Show notification on task success (default: false).
+    pub on_success: bool,
+
+    /// Show notification when all groups complete (default: true when enabled).
+    pub on_group_complete: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            on_failure: true,
+            on_success: false,
+            on_group_complete: true,
+        }
+    }
 }
 
 /// TUI style preference for user config.
