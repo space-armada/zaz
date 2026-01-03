@@ -15,5 +15,5 @@ pub use api::{ApiRequest, ApiResponse, EngineCommand, LogLine, LogSource};
 pub use engine::Engine;
 pub use error::DaemonError;
 pub use log_layer::DaemonLogLayer;
-pub use server::{default_socket_path, Client, Server};
+pub use server::{default_socket_path, socket_path_for_config, Client, Server};
 pub use state::{DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus};

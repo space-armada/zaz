@@ -7,7 +7,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
 use zaz_daemon::{
-    default_socket_path, ApiRequest, ApiResponse, Client, Engine, EngineCommand, Server,
+    default_socket_path, socket_path_for_config, ApiRequest, ApiResponse, Client, Engine,
+    EngineCommand, Server,
 };
 
 #[derive(Parser)]
@@ -106,9 +107,6 @@ impl TuiOptions {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Determine socket path
-    let socket_path = cli.socket.clone().unwrap_or_else(default_socket_path);
-
     // Determine if we're running in TUI mode (default command with no subcommand)
     let is_tui_mode = cli.command.is_none();
 
@@ -125,6 +123,13 @@ async fn main() -> Result<()> {
             .init();
     }
 
+    // Helper to get socket path: CLI override, or config-specific path
+    let get_socket_path = |config_path: &Path| -> PathBuf {
+        cli.socket
+            .clone()
+            .unwrap_or_else(|| socket_path_for_config(config_path))
+    };
+
     match cli.command {
         Some(Commands::Task) => {
             let config_path = find_config(&cli.config)?;
@@ -132,14 +137,38 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Daemon { detach, quiet }) => {
             let config_path = find_config(&cli.config)?;
+            let socket_path = get_socket_path(&config_path);
             run_daemon(&config_path, &socket_path, detach, quiet).await
         }
-        Some(Commands::Status) => show_status(&socket_path).await,
-        Some(Commands::Restart { group }) => restart(&socket_path, group).await,
-        Some(Commands::Stop) => stop_daemon(&socket_path).await,
+        Some(Commands::Status) => {
+            // For status/restart/stop without config, try to find config for socket path
+            let socket_path = if let Ok(config_path) = find_config(&cli.config) {
+                get_socket_path(&config_path)
+            } else {
+                cli.socket.clone().unwrap_or_else(default_socket_path)
+            };
+            show_status(&socket_path).await
+        }
+        Some(Commands::Restart { group }) => {
+            let socket_path = if let Ok(config_path) = find_config(&cli.config) {
+                get_socket_path(&config_path)
+            } else {
+                cli.socket.clone().unwrap_or_else(default_socket_path)
+            };
+            restart(&socket_path, group).await
+        }
+        Some(Commands::Stop) => {
+            let socket_path = if let Ok(config_path) = find_config(&cli.config) {
+                get_socket_path(&config_path)
+            } else {
+                cli.socket.clone().unwrap_or_else(default_socket_path)
+            };
+            stop_daemon(&socket_path).await
+        }
         Some(Commands::Ignores) => show_ignores(),
         None => {
             let config_path = find_config(&cli.config)?;
+            let socket_path = get_socket_path(&config_path);
             let user_config = load_user_config();
             let tui_options = TuiOptions::from_cli_and_user_config(&cli, &user_config);
             run_tui(&config_path, &socket_path, &tui_options).await

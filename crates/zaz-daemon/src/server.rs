@@ -1,13 +1,56 @@
 //! Unix socket server.
 
 use crate::{ApiRequest, ApiResponse, DaemonError, EngineCommand};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
-/// Default socket path.
+/// Get socket path for a specific config file.
+///
+/// 1. If `.zaz/` directory exists in the config's parent directory, uses `.zaz/daemon.sock`
+/// 2. Otherwise, uses `~/.local/state/zaz/<hash>.sock` where hash is based on config path
+pub fn socket_path_for_config(config_path: &Path) -> PathBuf {
+    // Canonicalize the config path for consistent hashing
+    let canonical = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+
+    // Check if .zaz directory exists in project
+    if let Some(parent) = canonical.parent() {
+        let zaz_dir = parent.join(".zaz");
+        if zaz_dir.is_dir() {
+            return zaz_dir.join("daemon.sock");
+        }
+    }
+
+    // Fall back to user state directory with hashed path
+    let hash = {
+        let mut hasher = DefaultHasher::new();
+        canonical.hash(&mut hasher);
+        hasher.finish()
+    };
+
+    let state_dir = if let Ok(home) = std::env::var("HOME") {
+        let dir = PathBuf::from(home).join(".local/state/zaz");
+        if !dir.exists() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        dir
+    } else {
+        // Last resort: /tmp with username
+        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        PathBuf::from(format!("/tmp/zaz-{}", user))
+    };
+
+    state_dir.join(format!("{:016x}.sock", hash))
+}
+
+/// Default socket path (legacy, for when no config is known).
 ///
 /// Uses `$XDG_RUNTIME_DIR/zaz.sock` if available (preferred).
 /// Falls back to `~/.local/state/zaz/zaz.sock` for user-specific access.
