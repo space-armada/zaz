@@ -14,7 +14,7 @@
 
 use super::{KeyResult, PaneLayout, SelectedProcess, StyleRenderer};
 use crate::ansi;
-use crate::app::{App, Focus};
+use crate::app::{App, ConnectionStatus, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -712,31 +712,58 @@ impl FullStyle {
 
         let use_multi_line = area.height >= 5 && area.width >= 60;
 
-        let mut lines = if use_multi_line {
-            let daemon_indicator = if app.started_daemon { " (daemon)" } else { "" };
-            vec![
-                Line::from(vec![
-                    Span::raw(" "),
-                    connection_status.clone(),
+        // Build connection status text based on state
+        let connection_text_spans: Vec<Span> = match app.connection_status {
+            ConnectionStatus::Loaded => {
+                let daemon_indicator = if app.started_daemon { " (daemon)" } else { "" };
+                vec![
                     Span::raw(" Loaded "),
                     Span::styled(
                         &app.config_name,
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(daemon_indicator, Style::default().fg(Color::Cyan)),
-                    Span::raw(" │ Follow "),
-                    Span::styled(
-                        follow_icon,
-                        if app.logs.is_following() {
-                            Style::default().fg(Color::Green)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        },
-                    ),
-                    Span::raw(" │ "),
-                    Span::raw(&last_change_text),
-                    Span::raw(&filter_status),
-                ]),
+                ]
+            }
+            ConnectionStatus::Disconnected => {
+                vec![Span::styled(
+                    " Disconnected",
+                    Style::default().fg(Color::Red),
+                )]
+            }
+            ConnectionStatus::Reconnected => {
+                vec![Span::styled(
+                    " Reconnected",
+                    Style::default().fg(Color::Yellow),
+                )]
+            }
+            ConnectionStatus::Initial => {
+                vec![Span::styled(
+                    " Connecting...",
+                    Style::default().fg(Color::DarkGray),
+                )]
+            }
+        };
+
+        let mut lines = if use_multi_line {
+            let mut first_line_spans = vec![Span::raw(" "), connection_status.clone()];
+            first_line_spans.extend(connection_text_spans);
+            first_line_spans.extend(vec![
+                Span::raw(" │ Follow "),
+                Span::styled(
+                    follow_icon,
+                    if app.logs.is_following() {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+                Span::raw(" │ "),
+                Span::raw(&last_change_text),
+                Span::raw(&filter_status),
+            ]);
+            vec![
+                Line::from(first_line_spans),
                 Line::from(vec![
                     Span::raw(" "),
                     Span::styled("[f]", Style::default().fg(Color::Cyan)),
@@ -752,9 +779,24 @@ impl FullStyle {
                 ]),
             ]
         } else {
+            // Compact single-line status for small terminals
+            let compact_text = match app.connection_status {
+                ConnectionStatus::Loaded => app.config_name.clone(),
+                ConnectionStatus::Disconnected => "Disconnected".to_string(),
+                ConnectionStatus::Reconnected => "Reconnected".to_string(),
+                ConnectionStatus::Initial => "Connecting...".to_string(),
+            };
+            let text_style = match app.connection_status {
+                ConnectionStatus::Loaded => Style::default(),
+                ConnectionStatus::Disconnected => Style::default().fg(Color::Red),
+                ConnectionStatus::Reconnected => Style::default().fg(Color::Yellow),
+                ConnectionStatus::Initial => Style::default().fg(Color::DarkGray),
+            };
             vec![Line::from(vec![
                 Span::raw(" "),
                 connection_status,
+                Span::raw(" "),
+                Span::styled(compact_text, text_style),
                 Span::raw(" "),
                 Span::styled("[?]", Style::default().fg(Color::Cyan)),
                 Span::raw(" help"),

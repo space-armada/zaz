@@ -61,6 +61,20 @@ pub enum Focus {
     Pane(usize),
 }
 
+/// Connection status for display in status bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectionStatus {
+    /// Initial state, not yet connected.
+    #[default]
+    Initial,
+    /// Connected and loaded config.
+    Loaded,
+    /// Disconnected from daemon.
+    Disconnected,
+    /// Just reconnected, waiting for sync.
+    Reconnected,
+}
+
 /// Main application state.
 pub struct App {
     // === Core ===
@@ -122,6 +136,12 @@ pub struct App {
     pub transient_message: Option<TransientMessage>,
     /// Whether to show help overlay.
     pub show_help: bool,
+
+    // === Connection State ===
+    /// Current connection status for display.
+    pub connection_status: ConnectionStatus,
+    /// Previous connection state (to detect transitions).
+    was_connected: bool,
 }
 
 /// A transient status message that auto-expires.
@@ -199,6 +219,8 @@ impl App {
             should_quit: false,
             transient_message: None,
             show_help: false,
+            connection_status: ConnectionStatus::Initial,
+            was_connected: false,
         }
     }
 
@@ -286,10 +308,33 @@ impl App {
 
     /// Poll for updates from the daemon.
     pub fn poll_daemon(&mut self) {
+        // Check for connection state transitions
+        let is_connected = self.is_connected();
+        if is_connected != self.was_connected {
+            if is_connected {
+                // Just reconnected
+                self.connection_status = ConnectionStatus::Reconnected;
+            } else {
+                // Just disconnected
+                self.connection_status = ConnectionStatus::Disconnected;
+            }
+            self.was_connected = is_connected;
+        }
+
         if let Some(ref mut daemon) = self.daemon {
             // Receive state updates
+            let mut received_state = false;
             while let Some(state) = daemon.try_recv_state() {
                 self.state = state;
+                received_state = true;
+            }
+
+            // If we received state after reconnecting, transition to Loaded
+            if received_state
+                && (self.connection_status == ConnectionStatus::Reconnected
+                    || self.connection_status == ConnectionStatus::Initial)
+            {
+                self.connection_status = ConnectionStatus::Loaded;
             }
 
             // Receive log lines

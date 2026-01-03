@@ -24,7 +24,7 @@
 
 use super::{KeyResult, PaneLayout, SelectedProcess, StyleRenderer};
 use crate::ansi;
-use crate::app::{App, Focus};
+use crate::app::{App, ConnectionStatus, Focus};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -942,11 +942,38 @@ impl MultiPaneStyle {
             String::new()
         };
 
+        // Build connection status text based on state
+        let (connection_text, connection_text_style) = match app.connection_status {
+            ConnectionStatus::Loaded => {
+                let daemon_indicator = if app.started_daemon { " (daemon)" } else { "" };
+                (
+                    format!(" {} {}", app.config_name, daemon_indicator)
+                        .trim()
+                        .to_string(),
+                    Style::default(),
+                )
+            }
+            ConnectionStatus::Disconnected => {
+                ("Disconnected".to_string(), Style::default().fg(Color::Red))
+            }
+            ConnectionStatus::Reconnected => (
+                "Reconnected".to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            ConnectionStatus::Initial => (
+                "Connecting...".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        };
+
         let mut lines = vec![Line::from(vec![
             Span::raw(" "),
             connection_status,
+            Span::raw(" "),
+            Span::styled(connection_text, connection_text_style),
+            Span::raw(" │"),
             Span::raw(page_info),
-            Span::raw(" │ Follow "),
+            Span::raw(" Follow "),
             Span::styled(follow_icon, follow_style),
             Span::raw(&filter_status),
             Span::raw(" │ [q]uit [r]estart [?]help"),
