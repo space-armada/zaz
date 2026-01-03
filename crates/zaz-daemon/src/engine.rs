@@ -482,13 +482,18 @@ impl Engine {
     /// Run the initial startup sequence.
     ///
     /// This runs all tasks (respecting on_change_only) and starts all daemons.
-    pub async fn startup(&mut self) -> Result<(), DaemonError> {
+    pub fn startup(&mut self) -> Result<(), DaemonError> {
         tracing::info!("starting initial run");
         self.state.status = DaemonStatus::Running;
 
-        // Run groups in dependency order
+        // Spawn all group tasks (non-blocking, same as restart_all)
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        let context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir.to_path_buf());
+
         for group_name in &self.execution_order.clone() {
-            self.run_group(group_name, &[], false).await?;
+            self.spawn_group_tasks(group_name, &context, false);
         }
 
         Ok(())
@@ -1028,6 +1033,21 @@ impl Engine {
 
             self.update_state();
         }
+    }
+
+    /// Wait for all running tasks to complete.
+    ///
+    /// This polls for task completions until no tasks are running.
+    pub async fn wait_for_tasks(&mut self) {
+        while !self.running_tasks.is_empty() {
+            self.process_task_completions();
+            if self.running_tasks.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Final drain of any remaining completions
+        self.process_task_completions();
     }
 
     /// Poll for file changes and process them.
