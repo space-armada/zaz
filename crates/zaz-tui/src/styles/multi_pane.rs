@@ -49,6 +49,13 @@ impl StyleRenderer for MultiPaneStyle {
         let main_area = chunks[0];
         let status_area = chunks[1];
 
+        // Auto-initialize panes_per_page based on terminal width
+        if app.panes_per_page == 0 {
+            let is_wide = (main_area.width as f32 / main_area.height as f32) > 2.0;
+            app.panes_per_page = if is_wide { 3 } else { 2 };
+        }
+        let panes_per_page = app.panes_per_page;
+
         // Get all tasks/daemons
         let processes = self.get_processes(app);
         let task_count = processes.len();
@@ -56,11 +63,12 @@ impl StyleRenderer for MultiPaneStyle {
         if task_count == 0 {
             self.draw_empty(frame, main_area);
         } else {
-            let layouts = self.calculate_layout(main_area, task_count);
+            let layouts =
+                self.calculate_layout_for_panes(main_area, panes_per_page.min(task_count));
 
             // Calculate which tasks to show on current page
-            let start_idx = app.current_page * 6;
-            let end_idx = (start_idx + 6).min(task_count);
+            let start_idx = app.current_page * panes_per_page;
+            let end_idx = (start_idx + panes_per_page).min(task_count);
             let visible_processes: Vec<_> = processes
                 .iter()
                 .skip(start_idx)
@@ -124,8 +132,9 @@ impl StyleRenderer for MultiPaneStyle {
             }
             KeyCode::Tab => {
                 if task_count > 0 {
+                    let panes_per_page = app.panes_per_page.max(1);
                     app.selected_pane = (app.selected_pane + 1) % task_count;
-                    app.current_page = app.selected_pane / 6;
+                    app.current_page = app.selected_pane / panes_per_page;
                     app.focus = Focus::Pane(app.selected_pane);
                 }
                 KeyResult::Handled
@@ -133,12 +142,13 @@ impl StyleRenderer for MultiPaneStyle {
             KeyCode::BackTab => {
                 // Shift+Tab: cycle panes in reverse
                 if task_count > 0 {
+                    let panes_per_page = app.panes_per_page.max(1);
                     app.selected_pane = if app.selected_pane == 0 {
                         task_count - 1
                     } else {
                         app.selected_pane - 1
                     };
-                    app.current_page = app.selected_pane / 6;
+                    app.current_page = app.selected_pane / panes_per_page;
                     app.focus = Focus::Pane(app.selected_pane);
                 }
                 KeyResult::Handled
@@ -146,19 +156,39 @@ impl StyleRenderer for MultiPaneStyle {
 
             // Pagination
             KeyCode::Char('[') => {
+                let panes_per_page = app.panes_per_page.max(1);
                 if app.current_page > 0 {
                     app.current_page -= 1;
-                    app.selected_pane = app.current_page * 6;
+                    app.selected_pane = app.current_page * panes_per_page;
                     app.focus = Focus::Pane(app.selected_pane);
                 }
                 KeyResult::Handled
             }
             KeyCode::Char(']') => {
-                let max_page = task_count.saturating_sub(1) / 6;
+                let panes_per_page = app.panes_per_page.max(1);
+                let max_page = task_count.saturating_sub(1) / panes_per_page;
                 if app.current_page < max_page {
                     app.current_page += 1;
-                    app.selected_pane = app.current_page * 6;
+                    app.selected_pane = app.current_page * panes_per_page;
                     app.focus = Focus::Pane(app.selected_pane);
+                }
+                KeyResult::Handled
+            }
+
+            // Adjust panes per page
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                if app.panes_per_page < 6 {
+                    app.panes_per_page += 1;
+                    // Recalculate current page to keep selected pane visible
+                    app.current_page = app.selected_pane / app.panes_per_page;
+                }
+                KeyResult::Handled
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                if app.panes_per_page > 1 {
+                    app.panes_per_page -= 1;
+                    // Recalculate current page to keep selected pane visible
+                    app.current_page = app.selected_pane / app.panes_per_page;
                 }
                 KeyResult::Handled
             }
@@ -423,23 +453,66 @@ impl MultiPaneStyle {
         }
     }
 
-    /// Get the number of columns in the current grid layout.
-    fn columns_for_count(&self, count: usize) -> usize {
-        match count {
+    /// Get the number of columns for a given pane count.
+    /// Prioritizes horizontal layout to give each pane more vertical space.
+    fn columns_for_panes(&self, panes: usize) -> usize {
+        match panes {
             0 | 1 => 1,
             2 => 2,
-            3 | 4 => 2,
+            3 => 3,
+            4 => 2, // 2x2 grid
+            5 => 3, // 3+2 layout
+            6 => 3, // 3x2 grid
             _ => 3,
         }
     }
 
-    /// Get the number of rows in the current grid layout.
+    /// Calculate layout for a specific number of panes.
+    fn calculate_layout_for_panes(&self, area: Rect, panes: usize) -> Vec<PaneLayout> {
+        if panes == 0 {
+            return vec![];
+        }
+
+        let rects = match panes {
+            1 => vec![area],
+            2 => self.hsplit(area, 2),
+            3 => self.hsplit(area, 3),
+            4 => self.grid(area, 2, 2),
+            5 => {
+                // 3 on top, 2 on bottom
+                let rows = self.vsplit(area, 2);
+                let mut cells = self.hsplit(rows[0], 3);
+                cells.extend(self.hsplit(rows[1], 2));
+                cells
+            }
+            6 => self.grid(area, 3, 2),
+            _ => self.grid(area, 3, 2),
+        };
+
+        rects
+            .into_iter()
+            .take(panes)
+            .map(|r| PaneLayout {
+                area: r,
+                process: None,
+                focused: false,
+            })
+            .collect()
+    }
+
+    /// Get the number of columns in the current grid layout (legacy, for tests).
+    #[allow(dead_code)]
+    fn columns_for_count(&self, count: usize) -> usize {
+        self.columns_for_panes(count.min(6))
+    }
+
+    /// Get the number of rows in the current grid layout (legacy, for tests).
     #[allow(dead_code)]
     fn rows_for_count(&self, count: usize) -> usize {
-        match count {
+        match count.min(6) {
             0 | 1 => 1,
-            2 => 1,
-            3 | 4 => 2,
+            2 | 3 => 1,
+            4..=6 => 2,
             _ => 2,
         }
     }
@@ -451,9 +524,10 @@ impl MultiPaneStyle {
             return;
         }
 
-        let visible_count = task_count.min(6);
-        let cols = self.columns_for_count(visible_count);
-        let page_offset = app.current_page * 6;
+        let panes_per_page = app.panes_per_page.max(1);
+        let visible_count = task_count.min(panes_per_page);
+        let cols = self.columns_for_panes(panes_per_page);
+        let page_offset = app.current_page * panes_per_page;
         let local_idx = app.selected_pane.saturating_sub(page_offset);
 
         let new_local = if direction > 0 {
@@ -463,7 +537,7 @@ impl MultiPaneStyle {
                 next
             } else {
                 // Wrap to next page or first item
-                if app.current_page * 6 + visible_count < task_count {
+                if app.current_page * panes_per_page + visible_count < task_count {
                     app.current_page += 1;
                     0
                 } else {
@@ -478,7 +552,8 @@ impl MultiPaneStyle {
                 // Wrap to previous page or last row
                 if app.current_page > 0 {
                     app.current_page -= 1;
-                    let prev_visible = 6.min(task_count - app.current_page * 6);
+                    let prev_visible =
+                        panes_per_page.min(task_count - app.current_page * panes_per_page);
                     let rows = prev_visible.div_ceil(cols);
                     let target_row = rows - 1;
                     (target_row * cols + local_idx).min(prev_visible - 1)
@@ -490,7 +565,7 @@ impl MultiPaneStyle {
             }
         };
 
-        app.selected_pane = app.current_page * 6 + new_local;
+        app.selected_pane = app.current_page * panes_per_page + new_local;
         app.focus = Focus::Pane(app.selected_pane);
     }
 
@@ -501,9 +576,10 @@ impl MultiPaneStyle {
             return;
         }
 
-        let visible_count = task_count.min(6);
-        let cols = self.columns_for_count(visible_count);
-        let page_offset = app.current_page * 6;
+        let panes_per_page = app.panes_per_page.max(1);
+        let visible_count = task_count.min(panes_per_page);
+        let cols = self.columns_for_panes(panes_per_page);
+        let page_offset = app.current_page * panes_per_page;
         let local_idx = app.selected_pane.saturating_sub(page_offset);
         let row = local_idx / cols;
         let col = local_idx % cols;
@@ -528,7 +604,7 @@ impl MultiPaneStyle {
 
         let new_local = row * cols + new_col;
         if new_local < visible_count {
-            app.selected_pane = app.current_page * 6 + new_local;
+            app.selected_pane = app.current_page * panes_per_page + new_local;
             app.focus = Focus::Pane(app.selected_pane);
         }
     }
@@ -738,11 +814,17 @@ impl MultiPaneStyle {
             Span::styled("○", Style::default().fg(Color::Red))
         };
 
-        let page_info = if task_count > 6 {
-            let total_pages = task_count.div_ceil(6);
-            format!(" Page {}/{} |", app.current_page + 1, total_pages)
+        let panes_per_page = app.panes_per_page.max(1);
+        let page_info = if task_count > panes_per_page {
+            let total_pages = task_count.div_ceil(panes_per_page);
+            format!(
+                " Page {}/{} ({} panes) |",
+                app.current_page + 1,
+                total_pages,
+                panes_per_page
+            )
         } else {
-            String::new()
+            format!(" {} panes |", panes_per_page.min(task_count))
         };
 
         // Show follow status for focused pane

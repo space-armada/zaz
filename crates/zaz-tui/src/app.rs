@@ -82,8 +82,10 @@ pub struct App {
     pub selected_item: usize,
     /// Selected pane index (minimal style).
     pub selected_pane: usize,
-    /// Current page for pagination (minimal style, >6 tasks).
+    /// Current page for pagination (Multi Pane style).
     pub current_page: usize,
+    /// Number of panes per page (Multi Pane style, default 2-3 based on width).
+    pub panes_per_page: usize,
     /// Log scroll offset (first visible line) for Full style.
     pub log_scroll: usize,
     /// Visible height of log pane (updated during render) for Full style.
@@ -181,6 +183,7 @@ impl App {
             selected_item: 0,
             selected_pane: 0,
             current_page: 0,
+            panes_per_page: 0, // 0 = auto (2 narrow, 3 wide), set during first render
             log_scroll: 0,
             log_visible_height: 20, // Default, updated during render
             pane_scroll: HashMap::new(),
