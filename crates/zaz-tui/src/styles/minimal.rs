@@ -32,7 +32,6 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame,
 };
-use std::collections::HashMap;
 
 /// Minimal style renderer with one pane per task.
 pub struct MinimalStyle;
@@ -78,7 +77,14 @@ impl StyleRenderer for MinimalStyle {
                 let visible_height = pane_layout.area.height.saturating_sub(2) as usize;
                 app.pane_visible_height.insert(global_idx, visible_height);
 
-                self.draw_pane(frame, app, pane_layout.area, process, global_idx, is_focused);
+                self.draw_pane(
+                    frame,
+                    app,
+                    pane_layout.area,
+                    process,
+                    global_idx,
+                    is_focused,
+                );
             }
         }
 
@@ -144,7 +150,11 @@ impl StyleRenderer for MinimalStyle {
                 // Scroll to bottom of focused pane
                 if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
                     let logs = app.logs.filtered_logs(&process.name);
-                    let visible_height = app.pane_visible_height.get(&app.selected_pane).copied().unwrap_or(20);
+                    let visible_height = app
+                        .pane_visible_height
+                        .get(&app.selected_pane)
+                        .copied()
+                        .unwrap_or(20);
                     let max_scroll = logs.len().saturating_sub(visible_height);
                     app.set_pane_scroll(app.selected_pane, max_scroll);
                     app.pane_follow.insert(app.selected_pane, true);
@@ -152,7 +162,11 @@ impl StyleRenderer for MinimalStyle {
                 KeyResult::Handled
             }
             KeyCode::PageUp => {
-                let visible_height = app.pane_visible_height.get(&app.selected_pane).copied().unwrap_or(20);
+                let visible_height = app
+                    .pane_visible_height
+                    .get(&app.selected_pane)
+                    .copied()
+                    .unwrap_or(20);
                 let current = app.get_pane_scroll(app.selected_pane);
                 app.set_pane_scroll(app.selected_pane, current.saturating_sub(visible_height));
                 app.pane_follow.insert(app.selected_pane, false);
@@ -161,10 +175,17 @@ impl StyleRenderer for MinimalStyle {
             KeyCode::PageDown => {
                 if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
                     let logs = app.logs.filtered_logs(&process.name);
-                    let visible_height = app.pane_visible_height.get(&app.selected_pane).copied().unwrap_or(20);
+                    let visible_height = app
+                        .pane_visible_height
+                        .get(&app.selected_pane)
+                        .copied()
+                        .unwrap_or(20);
                     let max_scroll = logs.len().saturating_sub(visible_height);
                     let current = app.get_pane_scroll(app.selected_pane);
-                    app.set_pane_scroll(app.selected_pane, (current + visible_height).min(max_scroll));
+                    app.set_pane_scroll(
+                        app.selected_pane,
+                        (current + visible_height).min(max_scroll),
+                    );
                 }
                 KeyResult::Handled
             }
@@ -268,7 +289,11 @@ impl StyleRenderer for MinimalStyle {
     fn log_dimensions(&self, app: &App) -> (usize, usize) {
         if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
             let logs = app.logs.filtered_logs(&process.name);
-            let visible_height = app.pane_visible_height.get(&app.selected_pane).copied().unwrap_or(20);
+            let visible_height = app
+                .pane_visible_height
+                .get(&app.selected_pane)
+                .copied()
+                .unwrap_or(20);
             (visible_height, logs.len())
         } else {
             (20, 0)
@@ -360,6 +385,7 @@ impl MinimalStyle {
     }
 
     /// Get the number of rows in the current grid layout.
+    #[allow(dead_code)]
     fn rows_for_count(&self, count: usize) -> usize {
         match count {
             0 | 1 => 1,
@@ -657,8 +683,16 @@ impl MinimalStyle {
 
         // Show follow status for focused pane
         let follow_status = {
-            let is_following = app.pane_follow.get(&app.selected_pane).copied().unwrap_or(true);
-            if is_following { "Follow:ON" } else { "Follow:OFF" }
+            let is_following = app
+                .pane_follow
+                .get(&app.selected_pane)
+                .copied()
+                .unwrap_or(true);
+            if is_following {
+                "Follow:ON"
+            } else {
+                "Follow:OFF"
+            }
         };
 
         let filter_status = if app.logs.has_filter() {
@@ -668,7 +702,7 @@ impl MinimalStyle {
         };
 
         let status = format!(
-            " F2:Mini* |{} {} |{}[q]uit [r]estart [?]help",
+            " F2:Mini* |{} {} |{} [q]uit [r]estart [?]help",
             page_info, follow_status, filter_status
         );
 

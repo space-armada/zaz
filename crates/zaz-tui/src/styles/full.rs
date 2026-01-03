@@ -14,7 +14,7 @@
 
 use super::{KeyResult, PaneLayout, SelectedProcess, StyleRenderer};
 use crate::app::{App, Focus};
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -377,7 +377,11 @@ impl FullStyle {
                 let task_icon = match task.status {
                     zaz_daemon::ProcessStatus::Pending => "○",
                     zaz_daemon::ProcessStatus::Running => {
-                        if app.blink_on() { "●" } else { "○" }
+                        if app.blink_on() {
+                            "●"
+                        } else {
+                            "○"
+                        }
                     }
                     zaz_daemon::ProcessStatus::Success => "✓",
                     zaz_daemon::ProcessStatus::Failed => "✗",
@@ -435,7 +439,11 @@ impl FullStyle {
                 let daemon_icon = match daemon.status {
                     zaz_daemon::ProcessStatus::Pending => "○",
                     zaz_daemon::ProcessStatus::Running => {
-                        if app.blink_on() { "●" } else { "○" }
+                        if app.blink_on() {
+                            "●"
+                        } else {
+                            "○"
+                        }
                     }
                     zaz_daemon::ProcessStatus::Success => "✓",
                     zaz_daemon::ProcessStatus::Failed => "✗",
@@ -471,7 +479,10 @@ impl FullStyle {
                         format!("   {} ", tree_branch),
                         Style::default().fg(Color::DarkGray),
                     ),
-                    Span::styled(format!("[{}] ", daemon_icon), Style::default().fg(daemon_color)),
+                    Span::styled(
+                        format!("[{}] ", daemon_icon),
+                        Style::default().fg(daemon_color),
+                    ),
                     Span::styled(&daemon.name, name_style),
                     Span::styled(suffix, Style::default().fg(Color::DarkGray)),
                 ])));
@@ -608,7 +619,11 @@ impl FullStyle {
             "no changes".to_string()
         };
 
-        let follow_icon = if app.logs.is_following() { "✓" } else { "○" };
+        let follow_icon = if app.logs.is_following() {
+            "✓"
+        } else {
+            "○"
+        };
 
         let filter_status = if app.logs.has_filter() {
             format!(" [filter: {}]", app.logs.filter_pattern().unwrap_or(""))

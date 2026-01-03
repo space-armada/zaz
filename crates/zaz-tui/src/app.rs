@@ -2,7 +2,7 @@
 
 use crate::daemon::{ClientCommand, DaemonConnection};
 use crate::logs::LogBuffer;
-use crate::styles::{get_renderer, KeyResult, StyleRenderer};
+use crate::styles::{get_renderer, KeyResult};
 use crate::{events, Event, TuiError};
 use crossterm::{
     execute,
@@ -59,17 +59,6 @@ pub enum Focus {
     Logs,
     /// Task pane (minimal style).
     Pane(usize),
-}
-
-/// Describes what is currently selected in the groups pane.
-#[derive(Debug, Clone)]
-enum SelectedItem {
-    /// A group header is selected.
-    Group(String),
-    /// A task within a group is selected.
-    Task { group: String, task: String },
-    /// A daemon within a group is selected.
-    Daemon { group: String, daemon: String },
 }
 
 /// Main application state.
@@ -357,109 +346,101 @@ impl App {
     }
 
     fn handle_normal_mode(&mut self, event: Event) {
-        use crossterm::event::{KeyCode, KeyModifiers};
+        use crossterm::event::KeyCode;
 
         if let Event::Key(key) = event {
-            // Handle Ctrl+key combinations first
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    KeyCode::Char('d') => {
-                        self.page_down();
-                        return;
-                    }
-                    KeyCode::Char('u') => {
-                        self.page_up();
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-
+            // Handle global keys first (style switching, help, modes)
             match key.code {
-                // Navigation
-                KeyCode::Char('j') | KeyCode::Down => self.navigate_down(),
-                KeyCode::Char('k') | KeyCode::Up => self.navigate_up(),
-                KeyCode::Char('h') | KeyCode::Left => self.navigate_left(),
-                KeyCode::Char('l') | KeyCode::Right => self.navigate_right(),
-                KeyCode::Tab => self.cycle_focus(),
-
                 // Style switching
                 KeyCode::F(1) => {
                     self.style = TuiStyle::Full;
-                    self.focus = Focus::Groups;
+                    let renderer = get_renderer(self.style);
+                    renderer.on_activate(self);
+                    return;
                 }
                 KeyCode::F(2) => {
                     self.style = TuiStyle::Minimal;
-                    self.focus = Focus::Pane(0);
+                    let renderer = get_renderer(self.style);
+                    renderer.on_activate(self);
+                    return;
                 }
 
-                // Actions
-                KeyCode::Char('r') => self.restart_selected(),
-                KeyCode::Char('R') => self.restart_all(),
-                KeyCode::Char('c') => self.clear_logs(),
+                // Help toggle
+                KeyCode::Char('?') => {
+                    self.show_help = true;
+                    return;
+                }
 
-                // Log navigation
-                KeyCode::Char('g') => self.scroll_to_top(),
-                KeyCode::Char('G') => self.scroll_to_bottom(),
-                KeyCode::PageUp => self.page_up(),
-                KeyCode::PageDown => self.page_down(),
-
-                // Modes
+                // Input modes (filter/search)
                 KeyCode::Char('f') => {
                     self.input_mode = InputMode::Filter;
                     self.filter_input.clear();
+                    return;
                 }
                 KeyCode::Char('/') => {
                     self.input_mode = InputMode::Search;
                     self.search_input.clear();
+                    return;
                 }
+
+                // Search navigation
                 KeyCode::Char('n') => {
                     if let Some(line) = self.logs.next_search_match() {
                         self.log_scroll = line;
                     }
+                    return;
                 }
                 KeyCode::Char('N') => {
                     if let Some(line) = self.logs.prev_search_match() {
                         self.log_scroll = line;
                     }
-                }
-                KeyCode::Char('?') => {
-                    self.show_help = true;
+                    return;
                 }
 
-                // Pagination (minimal style)
-                KeyCode::Char('[') => self.prev_page(),
-                KeyCode::Char(']') => self.next_page(),
-
-                // Follow mode toggle
-                KeyCode::Char('F') => {
-                    self.logs.toggle_follow();
-                    let status = if self.logs.is_following() {
-                        "Follow mode ON"
-                    } else {
-                        "Follow mode OFF"
-                    };
-                    self.set_status(status);
-                }
-
-                // Timestamp display toggle
-                KeyCode::Char('t') => {
-                    self.toggle_timestamp();
-                    let status = if self.show_full_timestamp {
-                        "Full timestamps"
-                    } else {
-                        "Compact timestamps"
-                    };
-                    self.set_status(status);
-                }
-
+                // Clear filter/search
                 KeyCode::Esc => {
                     self.logs.clear_filter();
                     self.logs.clear_search();
                     self.clear_status();
+                    return;
                 }
 
                 _ => {}
+            }
+
+            // Delegate to style-specific handler
+            let renderer = get_renderer(self.style);
+            let result = renderer.handle_key(self, key.code);
+
+            // Handle the result
+            match result {
+                KeyResult::Handled => {}
+                KeyResult::NotHandled => {}
+                KeyResult::Restart(selected) => {
+                    if selected.is_group {
+                        self.send_command(ClientCommand::RestartGroup(selected.group.clone()));
+                        self.set_status(format!("Restarting group {}", selected.group));
+                    } else {
+                        self.send_command(ClientCommand::RestartProcess {
+                            group: selected.group.clone(),
+                            process: selected.process.clone(),
+                        });
+                        self.set_status(format!("Restarting {}", selected.process));
+                    }
+                }
+                KeyResult::RestartAll => {
+                    self.send_command(ClientCommand::RestartAll);
+                    self.set_status("Restarting all groups");
+                }
+                KeyResult::Command(cmd) => {
+                    self.send_command(cmd);
+                }
+                KeyResult::SetStatus(msg) => {
+                    self.set_status(msg);
+                }
+                KeyResult::SetError(msg) => {
+                    self.set_error(msg);
+                }
             }
         }
     }
@@ -515,246 +496,6 @@ impl App {
                 }
                 _ => {}
             }
-        }
-    }
-
-    /// Count total items in the groups pane (groups + tasks + daemons).
-    fn groups_item_count(&self) -> usize {
-        self.state
-            .groups
-            .values()
-            .map(|g| 1 + g.tasks.len() + g.daemons.len())
-            .sum()
-    }
-
-    /// Get detailed info about the currently selected item.
-    fn selected_item_info(&self) -> Option<SelectedItem> {
-        let mut idx = 0;
-        for group in self.state.groups.values() {
-            // Check if group header is selected
-            if self.selected_item == idx {
-                return Some(SelectedItem::Group(group.name.clone()));
-            }
-            idx += 1;
-
-            // Check tasks
-            for task in &group.tasks {
-                if self.selected_item == idx {
-                    return Some(SelectedItem::Task {
-                        group: group.name.clone(),
-                        task: task.name.clone(),
-                    });
-                }
-                idx += 1;
-            }
-
-            // Check daemons
-            for daemon in &group.daemons {
-                if self.selected_item == idx {
-                    return Some(SelectedItem::Daemon {
-                        group: group.name.clone(),
-                        daemon: daemon.name.clone(),
-                    });
-                }
-                idx += 1;
-            }
-        }
-        None
-    }
-
-    /// Get the maximum valid scroll offset for logs.
-    fn max_log_scroll(&self) -> usize {
-        let total = self.logs.all_logs_combined().len();
-        total.saturating_sub(self.log_visible_height)
-    }
-
-    /// Sync log_scroll to the actual position when leaving follow mode.
-    fn sync_log_scroll(&mut self) {
-        if self.logs.is_following() {
-            // When following, the view is at the bottom
-            self.log_scroll = self.max_log_scroll();
-        } else {
-            // Clamp to valid range
-            self.log_scroll = self.log_scroll.min(self.max_log_scroll());
-        }
-    }
-
-    fn navigate_down(&mut self) {
-        match self.style {
-            TuiStyle::Full => {
-                match self.focus {
-                    Focus::Groups => {
-                        let total = self.groups_item_count();
-                        if total > 0 {
-                            self.selected_item = (self.selected_item + 1) % total;
-                        }
-                    }
-                    Focus::Logs => {
-                        // Sync scroll position before disabling follow mode
-                        self.sync_log_scroll();
-                        self.logs.disable_follow();
-                        let max_scroll = self.max_log_scroll();
-                        if self.log_scroll < max_scroll {
-                            self.log_scroll += 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            TuiStyle::Minimal => {
-                let count = self.task_count();
-                if count > 0 {
-                    self.selected_pane = (self.selected_pane + 1) % count;
-                    // Adjust page if needed
-                    self.current_page = self.selected_pane / 6;
-                }
-            }
-        }
-    }
-
-    fn navigate_up(&mut self) {
-        match self.style {
-            TuiStyle::Full => {
-                match self.focus {
-                    Focus::Groups => {
-                        let total = self.groups_item_count();
-                        if total > 0 {
-                            self.selected_item = self
-                                .selected_item
-                                .checked_sub(1)
-                                .unwrap_or(total.saturating_sub(1));
-                        }
-                    }
-                    Focus::Logs => {
-                        // Sync scroll position before disabling follow mode
-                        self.sync_log_scroll();
-                        self.logs.disable_follow();
-                        if self.log_scroll > 0 {
-                            self.log_scroll -= 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            TuiStyle::Minimal => {
-                let count = self.task_count();
-                if count > 0 {
-                    self.selected_pane = self
-                        .selected_pane
-                        .checked_sub(1)
-                        .unwrap_or(count.saturating_sub(1));
-                    self.current_page = self.selected_pane / 6;
-                }
-            }
-        }
-    }
-
-    fn navigate_left(&mut self) {
-        // In minimal style, move to previous pane
-        // In full style, same as up (for now)
-        match self.style {
-            TuiStyle::Minimal => self.navigate_up(),
-            TuiStyle::Full => self.navigate_up(),
-        }
-    }
-
-    fn navigate_right(&mut self) {
-        // In minimal style, move to next pane
-        // In full style, same as down (for now)
-        match self.style {
-            TuiStyle::Minimal => self.navigate_down(),
-            TuiStyle::Full => self.navigate_down(),
-        }
-    }
-
-    fn cycle_focus(&mut self) {
-        self.focus = match (&self.style, &self.focus) {
-            (TuiStyle::Full, Focus::Groups) => Focus::Logs,
-            (TuiStyle::Full, Focus::Logs) => Focus::Groups,
-            (TuiStyle::Minimal, Focus::Pane(i)) => {
-                let count = self.task_count();
-                if count > 0 {
-                    Focus::Pane((i + 1) % count)
-                } else {
-                    Focus::Pane(0)
-                }
-            }
-            _ => Focus::Groups,
-        };
-    }
-
-    fn restart_selected(&mut self) {
-        // Determine what's selected and send the appropriate command
-        match self.selected_item_info() {
-            Some(SelectedItem::Group(name)) => {
-                self.send_command(ClientCommand::RestartGroup(name.clone()));
-                self.set_status(format!("Restarting group {}", name));
-            }
-            Some(SelectedItem::Task { group, task }) => {
-                self.send_command(ClientCommand::RestartProcess {
-                    group: group.clone(),
-                    process: task.clone(),
-                });
-                self.set_status(format!("Restarting task {}", task));
-            }
-            Some(SelectedItem::Daemon { group, daemon }) => {
-                self.send_command(ClientCommand::RestartProcess {
-                    group: group.clone(),
-                    process: daemon.clone(),
-                });
-                self.set_status(format!("Restarting daemon {}", daemon));
-            }
-            None => {}
-        }
-    }
-
-    fn restart_all(&mut self) {
-        self.send_command(ClientCommand::RestartAll);
-        self.set_status("Restarting all groups");
-    }
-
-    fn clear_logs(&mut self) {
-        self.logs.clear_all();
-        self.log_scroll = 0;
-        self.set_status("Logs cleared");
-    }
-
-    fn scroll_to_top(&mut self) {
-        self.log_scroll = 0;
-        self.logs.disable_follow();
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        self.log_scroll = self.max_log_scroll();
-        self.logs.enable_follow();
-    }
-
-    fn page_up(&mut self) {
-        self.sync_log_scroll();
-        self.log_scroll = self.log_scroll.saturating_sub(20);
-        self.logs.disable_follow();
-    }
-
-    fn page_down(&mut self) {
-        self.sync_log_scroll();
-        self.log_scroll = self
-            .log_scroll
-            .saturating_add(20)
-            .min(self.max_log_scroll());
-    }
-
-    fn prev_page(&mut self) {
-        if self.current_page > 0 {
-            self.current_page -= 1;
-            self.selected_pane = self.current_page * 6;
-        }
-    }
-
-    fn next_page(&mut self) {
-        let max_page = self.page_count().saturating_sub(1);
-        if self.current_page < max_page {
-            self.current_page += 1;
-            self.selected_pane = self.current_page * 6;
         }
     }
 
