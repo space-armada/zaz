@@ -413,7 +413,7 @@ impl App {
 
             // Delegate to style-specific handler
             let renderer = get_renderer(self.style);
-            let result = renderer.handle_key(self, key.code);
+            let result = renderer.handle_key(self, key);
 
             // Handle the result
             match result {

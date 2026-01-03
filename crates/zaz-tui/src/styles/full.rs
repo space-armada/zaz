@@ -14,7 +14,7 @@
 
 use super::{KeyResult, PaneLayout, SelectedProcess, StyleRenderer};
 use crate::app::{App, Focus};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -61,8 +61,31 @@ impl StyleRenderer for FullStyle {
         self.draw_status_bar(frame, app, vertical_chunks[1]);
     }
 
-    fn handle_key(&self, app: &mut App, key: KeyCode) -> KeyResult {
-        match key {
+    fn handle_key(&self, app: &mut App, key: KeyEvent) -> KeyResult {
+        // Handle Ctrl+key combinations first
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => {
+                    // Half page down
+                    let half_page = app.log_visible_height / 2;
+                    let total = app.logs.all_logs_combined().len();
+                    let max_scroll = total.saturating_sub(app.log_visible_height);
+                    app.log_scroll = (app.log_scroll + half_page).min(max_scroll);
+                    app.logs.disable_follow();
+                    return KeyResult::Handled;
+                }
+                KeyCode::Char('u') => {
+                    // Half page up
+                    let half_page = app.log_visible_height / 2;
+                    app.log_scroll = app.log_scroll.saturating_sub(half_page);
+                    app.logs.disable_follow();
+                    return KeyResult::Handled;
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
             // Navigation
             KeyCode::Char('j') | KeyCode::Down => {
                 self.navigate_down(app);

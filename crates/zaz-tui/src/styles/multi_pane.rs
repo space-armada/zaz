@@ -24,7 +24,7 @@
 
 use super::{KeyResult, PaneLayout, SelectedProcess, StyleRenderer};
 use crate::app::{App, Focus};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -99,10 +99,50 @@ impl StyleRenderer for MultiPaneStyle {
         self.draw_status_bar(frame, app, status_area, task_count);
     }
 
-    fn handle_key(&self, app: &mut App, key: KeyCode) -> KeyResult {
+    fn handle_key(&self, app: &mut App, key: KeyEvent) -> KeyResult {
         let task_count = app.task_count();
 
-        match key {
+        // Handle Ctrl+key combinations first
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => {
+                    // Half page down in focused pane
+                    if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
+                        let logs = app.logs.filtered_logs(&process.name);
+                        let visible_height = app
+                            .pane_visible_height
+                            .get(&app.selected_pane)
+                            .copied()
+                            .unwrap_or(20);
+                        let half_page = visible_height / 2;
+                        let max_scroll = logs.len().saturating_sub(visible_height);
+                        let current = app.get_pane_scroll(app.selected_pane);
+                        app.set_pane_scroll(
+                            app.selected_pane,
+                            (current + half_page).min(max_scroll),
+                        );
+                        app.pane_follow.insert(app.selected_pane, false);
+                    }
+                    return KeyResult::Handled;
+                }
+                KeyCode::Char('u') => {
+                    // Half page up in focused pane
+                    let visible_height = app
+                        .pane_visible_height
+                        .get(&app.selected_pane)
+                        .copied()
+                        .unwrap_or(20);
+                    let half_page = visible_height / 2;
+                    let current = app.get_pane_scroll(app.selected_pane);
+                    app.set_pane_scroll(app.selected_pane, current.saturating_sub(half_page));
+                    app.pane_follow.insert(app.selected_pane, false);
+                    return KeyResult::Handled;
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
             // Log scrolling (j/k scroll the focused pane)
             KeyCode::Char('j') => {
                 self.scroll_pane(app, 1);

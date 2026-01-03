@@ -22,7 +22,7 @@ pub use multi_pane::MultiPaneStyle;
 
 use crate::app::App;
 use crate::daemon::ClientCommand;
-use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
 use ratatui::{layout::Rect, Frame};
 
 /// Layout information for a single pane in the TUI.
@@ -111,7 +111,7 @@ pub trait StyleRenderer: Send + Sync {
     /// - `NotHandled`: Key was not recognized, try default handlers
     /// - `Restart(process)`: Request to restart a process
     /// - `Command(cmd)`: Send a command to the daemon
-    fn handle_key(&self, app: &mut App, key: KeyCode) -> KeyResult;
+    fn handle_key(&self, app: &mut App, key: KeyEvent) -> KeyResult;
 
     /// Get the display name of this style.
     fn name(&self) -> &'static str;
