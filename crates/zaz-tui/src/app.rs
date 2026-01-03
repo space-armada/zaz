@@ -2,12 +2,14 @@
 
 use crate::daemon::{ClientCommand, DaemonConnection};
 use crate::logs::LogBuffer;
+use crate::styles::{get_renderer, KeyResult, StyleRenderer};
 use crate::{events, Event, TuiError};
 use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::time::Duration;
@@ -93,10 +95,16 @@ pub struct App {
     pub selected_pane: usize,
     /// Current page for pagination (minimal style, >6 tasks).
     pub current_page: usize,
-    /// Log scroll offset (first visible line).
+    /// Log scroll offset (first visible line) for Full style.
     pub log_scroll: usize,
-    /// Visible height of log pane (updated during render).
+    /// Visible height of log pane (updated during render) for Full style.
     pub log_visible_height: usize,
+    /// Per-pane scroll offsets (for Minimal style).
+    pub pane_scroll: HashMap<usize, usize>,
+    /// Per-pane follow mode (for Minimal style).
+    pub pane_follow: HashMap<usize, bool>,
+    /// Per-pane visible height (for Minimal style, updated during render).
+    pub pane_visible_height: HashMap<usize, usize>,
     /// Whether to show full timestamps (vs compact time-only).
     pub show_full_timestamp: bool,
 
@@ -186,6 +194,9 @@ impl App {
             current_page: 0,
             log_scroll: 0,
             log_visible_height: 20, // Default, updated during render
+            pane_scroll: HashMap::new(),
+            pane_follow: HashMap::new(),
+            pane_visible_height: HashMap::new(),
             show_full_timestamp: false,
             input_mode: InputMode::Normal,
             filter_input: String::new(),
@@ -197,6 +208,16 @@ impl App {
             transient_message: None,
             show_help: false,
         }
+    }
+
+    /// Get scroll offset for a specific pane.
+    pub fn get_pane_scroll(&self, pane: usize) -> usize {
+        self.pane_scroll.get(&pane).copied().unwrap_or(0)
+    }
+
+    /// Set scroll offset for a specific pane.
+    pub fn set_pane_scroll(&mut self, pane: usize, offset: usize) {
+        self.pane_scroll.insert(pane, offset);
     }
 
     /// Connect to the daemon.
