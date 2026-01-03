@@ -123,8 +123,16 @@ async fn execute_task(ctx: TaskExecutionContext, log_tx: mpsc::Sender<LogLine>) 
             };
 
             // Send completion log
+            let exit_code_str = output
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".to_string());
             let log_msg = if is_success {
-                format!("completed in {:.2}s", duration.as_secs_f64())
+                format!(
+                    "completed in {:.2}s (exit code: {})",
+                    duration.as_secs_f64(),
+                    exit_code_str
+                )
             } else {
                 format!(
                     "failed: process exited with status {}",
@@ -576,10 +584,18 @@ impl Engine {
                     let is_success = output.exit_code.map(|c| c == 0).unwrap_or(true);
                     if is_success {
                         // Push daemon log for task completion
+                        let exit_code_str = output
+                            .exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "?".to_string());
                         self.push_log(
                             LogLine::daemon(
                                 &task_name,
-                                format!("completed in {:.2}s", duration.as_secs_f64()),
+                                format!(
+                                    "completed in {:.2}s (exit code: {})",
+                                    duration.as_secs_f64(),
+                                    exit_code_str
+                                ),
                             )
                             .with_group(group_name_owned.clone()),
                         );
@@ -587,7 +603,6 @@ impl Engine {
                         tracing::info!(
                             task = %task_name,
                             duration_ms = duration.as_millis(),
-                            exit_code = output.exit_code,
                             "task completed"
                         );
                         if let Some(group) = self.groups.get_mut(group_name) {
