@@ -24,14 +24,15 @@ pub struct UserConfig {
 
 /// TUI style preference for user config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum TuiStylePreference {
     /// Full style with group tree and logs pane.
     #[default]
+    #[serde(rename = "full")]
     Full,
-    /// Minimal style with one pane per task.
-    Minimal,
+    /// Multi-pane style with one pane per task.
+    #[serde(rename = "multi_pane", alias = "minimal")]
+    MultiPane,
 }
 
 /// Get the path to the user configuration file.
@@ -101,12 +102,22 @@ mod tests {
         let toml = r#"
 no_autostart = true
 disable_animations = true
-tui_style = "minimal"
+tui_style = "multi_pane"
 "#;
         let config: UserConfig = toml::from_str(toml).unwrap();
         assert!(config.no_autostart);
         assert!(config.disable_animations);
-        assert_eq!(config.tui_style, Some(TuiStylePreference::Minimal));
+        assert_eq!(config.tui_style, Some(TuiStylePreference::MultiPane));
+    }
+
+    #[test]
+    fn test_parse_legacy_minimal_alias() {
+        // "minimal" should still work as an alias for "multi_pane"
+        let toml = r#"
+tui_style = "minimal"
+"#;
+        let config: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.tui_style, Some(TuiStylePreference::MultiPane));
     }
 
     #[test]
