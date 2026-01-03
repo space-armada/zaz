@@ -51,6 +51,19 @@ struct TaskExecutionContext {
     command: String,
     /// Executor for running commands.
     executor: Executor,
+    /// Log suppression level.
+    silence: zaz_config::Silence,
+}
+
+/// Check if output should be suppressed based on silence setting and output kind.
+fn should_suppress(silence: zaz_config::Silence, is_stderr: bool) -> bool {
+    use zaz_config::Silence;
+    match silence {
+        Silence::None => false,
+        Silence::All => true,
+        Silence::Stdout => !is_stderr,
+        Silence::Stderr => is_stderr,
+    }
 }
 
 /// Execute a single task in a spawned task.
@@ -84,29 +97,41 @@ async fn execute_task(ctx: TaskExecutionContext, log_tx: mpsc::Sender<LogLine>) 
             result = &mut command_future => {
                 // Drain remaining output
                 while let Some(line) = output_rx.recv().await {
-                    let content = match line {
-                        OutputLine::Stdout(s) | OutputLine::Stderr(s) => s,
+                    let (content, is_stderr) = match line {
+                        OutputLine::Stdout(s) => (s, false),
+                        OutputLine::Stderr(s) => (s, true),
                     };
-                    let _ = log_tx
-                        .send(
-                            LogLine::process(&ctx.task_name, content)
-                                .with_group(ctx.group_name.clone()),
-                        )
-                        .await;
+                    // Check silence setting before sending
+                    if !should_suppress(ctx.silence, is_stderr) {
+                        let log_line = if is_stderr {
+                            LogLine::stderr(&ctx.task_name, content)
+                        } else {
+                            LogLine::stdout(&ctx.task_name, content)
+                        };
+                        let _ = log_tx
+                            .send(log_line.with_group(ctx.group_name.clone()))
+                            .await;
+                    }
                 }
                 break result;
             }
 
             Some(line) = output_rx.recv() => {
-                let content = match line {
-                    OutputLine::Stdout(s) | OutputLine::Stderr(s) => s,
+                let (content, is_stderr) = match line {
+                    OutputLine::Stdout(s) => (s, false),
+                    OutputLine::Stderr(s) => (s, true),
                 };
-                let _ = log_tx
-                    .send(
-                        LogLine::process(&ctx.task_name, content)
-                            .with_group(ctx.group_name.clone()),
-                    )
-                    .await;
+                // Check silence setting before sending
+                if !should_suppress(ctx.silence, is_stderr) {
+                    let log_line = if is_stderr {
+                        LogLine::stderr(&ctx.task_name, content)
+                    } else {
+                        LogLine::stdout(&ctx.task_name, content)
+                    };
+                    let _ = log_tx
+                        .send(log_line.with_group(ctx.group_name.clone()))
+                        .await;
+                }
             }
         }
     };
@@ -296,17 +321,29 @@ impl Engine {
                 PatternSet::new(&group.patterns, &group.ignore).map_err(DaemonError::Watch)?;
             group_patterns.insert(group.name.clone(), patterns);
 
-            // Create executor with shell and working directory
+            // Create executor with shell, working directory, and group env
             let mut executor = Executor::new(config.settings.shell.clone());
             if let Some(ref dir) = group.working_dir {
                 executor = executor.with_working_dir(dir.clone());
             }
+            if !group.env.is_empty() {
+                executor = executor.with_env(group.env.clone());
+            }
 
-            // Create daemons
+            // Create daemons with per-daemon working_dir and env overrides
             let daemons: Vec<Daemon> = group
                 .daemons
                 .iter()
-                .map(|d| Daemon::new(d.clone(), executor.clone()))
+                .map(|d| {
+                    let mut daemon_executor = executor.clone();
+                    if let Some(ref dir) = d.working_dir {
+                        daemon_executor = daemon_executor.with_working_dir(dir.clone());
+                    }
+                    if !d.env.is_empty() {
+                        daemon_executor = daemon_executor.extend_env(d.env.clone());
+                    }
+                    Daemon::new(d.clone(), daemon_executor)
+                })
                 .collect();
 
             // Initialize group state
@@ -432,7 +469,6 @@ impl Engine {
         use std::io::BufRead;
 
         let log_tx = self.log_store.sender();
-
         tokio::task::spawn_blocking(move || {
             let mut buf_reader = std::io::BufReader::new(reader);
             let mut line = String::new();
@@ -744,6 +780,16 @@ impl Engine {
                     tracing::info!(daemon = %daemon.name(), "signaling daemon restart");
                     daemon.signal_restart().map_err(DaemonError::Process)?;
                 } else {
+                    // Apply startup delay if configured
+                    if let Some(delay) = daemon.startup_delay() {
+                        tracing::info!(
+                            daemon = %daemon.name(),
+                            delay_ms = delay.as_millis(),
+                            "waiting before starting daemon"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+
                     // Start daemon for the first time
                     tracing::info!(daemon = %daemon.name(), "starting daemon");
                     daemon.start().map_err(DaemonError::Process)?;
@@ -856,7 +902,23 @@ impl Engine {
                 }
             };
 
-            self.spawn_task(group_name, task.name(), idx, command, executor.clone());
+            // Use task-specific working_dir and env if set
+            let mut task_executor = executor.clone();
+            if let Some(ref dir) = task.working_dir {
+                task_executor = task_executor.with_working_dir(dir.clone());
+            }
+            if !task.env.is_empty() {
+                task_executor = task_executor.extend_env(task.env.clone());
+            }
+
+            self.spawn_task(
+                group_name,
+                task.name(),
+                idx,
+                command,
+                task_executor,
+                task.silence,
+            );
         }
 
         self.update_state();
@@ -871,6 +933,7 @@ impl Engine {
         task_index: usize,
         command: String,
         executor: Executor,
+        silence: zaz_config::Silence,
     ) {
         let task_id = format!("{}:{}", group_name, task_name);
 
@@ -896,6 +959,7 @@ impl Engine {
             task_index,
             command,
             executor,
+            silence,
         };
 
         let log_tx = self.log_store.sender();
@@ -1018,12 +1082,21 @@ impl Engine {
                                 );
                             let expander = zaz_vars::Expander::new(&context);
                             if let Ok(command) = expander.expand(&task.command) {
+                                // Use task-specific working_dir and env if set
+                                let mut task_executor = group.executor.clone();
+                                if let Some(ref dir) = task.working_dir {
+                                    task_executor = task_executor.with_working_dir(dir.clone());
+                                }
+                                if !task.env.is_empty() {
+                                    task_executor = task_executor.extend_env(task.env.clone());
+                                }
                                 self.spawn_task(
                                     group_name,
                                     task_name,
                                     completion.task_index,
                                     command,
-                                    group.executor.clone(),
+                                    task_executor,
+                                    task.silence,
                                 );
                             }
                         }
@@ -1346,17 +1419,29 @@ impl Engine {
                 PatternSet::new(&group.patterns, &group.ignore).map_err(DaemonError::Watch)?;
             self.group_patterns.insert(group.name.clone(), patterns);
 
-            // Create executor with shell and working directory
+            // Create executor with shell, working directory, and group env
             let mut executor = Executor::new(self.config.settings.shell.clone());
             if let Some(ref dir) = group.working_dir {
                 executor = executor.with_working_dir(dir.clone());
             }
+            if !group.env.is_empty() {
+                executor = executor.with_env(group.env.clone());
+            }
 
-            // Create daemons
+            // Create daemons with per-daemon working_dir and env overrides
             let daemons: Vec<Daemon> = group
                 .daemons
                 .iter()
-                .map(|d| Daemon::new(d.clone(), executor.clone()))
+                .map(|d| {
+                    let mut daemon_executor = executor.clone();
+                    if let Some(ref dir) = d.working_dir {
+                        daemon_executor = daemon_executor.with_working_dir(dir.clone());
+                    }
+                    if !d.env.is_empty() {
+                        daemon_executor = daemon_executor.extend_env(d.env.clone());
+                    }
+                    Daemon::new(d.clone(), daemon_executor)
+                })
                 .collect();
 
             // Initialize group state
@@ -1440,10 +1525,25 @@ impl Engine {
                 .expand(&task_config.command)
                 .map_err(|e| DaemonError::VarExpansion(e.to_string()))?;
 
-            let executor = group.executor.clone();
+            // Use task-specific working_dir and env if set
+            let mut executor = group.executor.clone();
+            if let Some(ref dir) = task_config.working_dir {
+                executor = executor.with_working_dir(dir.clone());
+            }
+            if !task_config.env.is_empty() {
+                executor = executor.extend_env(task_config.env.clone());
+            }
+            let silence = task_config.silence;
 
             // Spawn task in background (same as restart_group) for proper log streaming
-            self.spawn_task(group_name, process_name, task_idx, command, executor);
+            self.spawn_task(
+                group_name,
+                process_name,
+                task_idx,
+                command,
+                executor,
+                silence,
+            );
 
             return Ok(());
         }

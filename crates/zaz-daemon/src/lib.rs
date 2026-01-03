@@ -11,7 +11,7 @@ pub mod notify;
 mod server;
 mod state;
 
-pub use api::{ApiRequest, ApiResponse, EngineCommand, LogLine, LogSource};
+pub use api::{ApiRequest, ApiResponse, EngineCommand, LogLine, LogSource, OutputKind};
 pub use engine::Engine;
 pub use error::DaemonError;
 pub use log_layer::DaemonLogLayer;

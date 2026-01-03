@@ -205,6 +205,7 @@ mod tests {
             content: content.to_string(),
             timestamp,
             source: LogSource::Process,
+            output_kind: crate::api::OutputKind::Combined,
         }
     }
 

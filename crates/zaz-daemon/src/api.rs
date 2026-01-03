@@ -14,6 +14,19 @@ pub enum LogSource {
     Daemon,
 }
 
+/// Kind of output stream for process logs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputKind {
+    /// Standard output.
+    #[default]
+    Stdout,
+    /// Standard error.
+    Stderr,
+    /// Combined output (from PTY, cannot distinguish).
+    Combined,
+}
+
 /// A single log line with metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogLine {
@@ -28,10 +41,14 @@ pub struct LogLine {
     pub content: String,
     /// Source of the log (process output vs daemon internal).
     pub source: LogSource,
+    /// Kind of output stream (stdout, stderr, or combined).
+    /// Only meaningful when source is Process.
+    #[serde(default)]
+    pub output_kind: OutputKind,
 }
 
 impl LogLine {
-    /// Create a new process log line.
+    /// Create a new process log line, defaulting to combined output kind.
     pub fn process(process: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             timestamp: now_ms(),
@@ -39,6 +56,31 @@ impl LogLine {
             group: None,
             content: content.into(),
             source: LogSource::Process,
+            output_kind: OutputKind::Combined,
+        }
+    }
+
+    /// Create a new process log line from stdout.
+    pub fn stdout(process: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            timestamp: now_ms(),
+            process: process.into(),
+            group: None,
+            content: content.into(),
+            source: LogSource::Process,
+            output_kind: OutputKind::Stdout,
+        }
+    }
+
+    /// Create a new process log line from stderr.
+    pub fn stderr(process: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            timestamp: now_ms(),
+            process: process.into(),
+            group: None,
+            content: content.into(),
+            source: LogSource::Process,
+            output_kind: OutputKind::Stderr,
         }
     }
 
@@ -50,12 +92,19 @@ impl LogLine {
             group: None,
             content: content.into(),
             source: LogSource::Daemon,
+            output_kind: OutputKind::Combined,
         }
     }
 
     /// Set the group for this log line.
     pub fn with_group(mut self, group: impl Into<String>) -> Self {
         self.group = Some(group.into());
+        self
+    }
+
+    /// Set the output kind for this log line.
+    pub fn with_output_kind(mut self, output_kind: OutputKind) -> Self {
+        self.output_kind = output_kind;
         self
     }
 }
