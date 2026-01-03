@@ -95,25 +95,10 @@ fn calculate_groups_width(app: &App) -> u16 {
     max_width as u16
 }
 
-fn draw_minimal_style(frame: &mut Frame, app: &mut App) {
-    // Placeholder: will be fully implemented in Phase 7.8
-    // For now, just show a simple layout
-    let area = frame.area();
-
-    // Use taller status bar (5 lines) on larger screens for multi-line layout
-    let status_bar_height = if area.height >= 20 && area.width >= 60 {
-        5
-    } else {
-        3
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(status_bar_height)])
-        .split(area);
-
-    draw_logs(frame, app, chunks[0]);
-    draw_status_bar(frame, app, chunks[1]);
+fn draw_minimal_style(frame: &mut Frame, app: &App) {
+    use crate::styles::{MinimalStyle, StyleRenderer};
+    let style = MinimalStyle;
+    style.draw(frame, app);
 }
 
 fn draw_groups(frame: &mut Frame, app: &App, area: Rect) {

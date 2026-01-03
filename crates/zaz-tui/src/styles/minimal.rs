@@ -166,9 +166,15 @@ impl StyleRenderer for MinimalStyle {
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub name: String,
+    /// Group name (kept for potential future use in disambiguation).
+    #[allow(dead_code)]
     pub group: String,
     pub status: ProcessStatus,
     pub kind: ProcessKind,
+    /// Duration of last run in milliseconds (for tasks).
+    pub duration_ms: Option<u64>,
+    /// Process ID (for running daemons).
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -203,6 +209,8 @@ impl MinimalStyle {
                         zaz_daemon::ProcessStatus::Backoff => ProcessStatus::Pending,
                     },
                     kind: ProcessKind::Task,
+                    duration_ms: task.duration_ms,
+                    pid: None,
                 });
             }
             for daemon in &group.daemons {
@@ -217,6 +225,8 @@ impl MinimalStyle {
                         zaz_daemon::ProcessStatus::Backoff => ProcessStatus::Pending,
                     },
                     kind: ProcessKind::Daemon,
+                    duration_ms: None,
+                    pid: daemon.pid,
                 });
             }
         }
@@ -319,15 +329,27 @@ impl MinimalStyle {
             ProcessStatus::Failed => Color::Red,
         };
 
-        let kind_indicator = match process.kind {
-            ProcessKind::Task => "T",
-            ProcessKind::Daemon => "D",
+        // Format title according to plan:
+        // Tasks: [✓] test (0.5s)
+        // Daemons: [●] vite (pid 1235)
+        let info = match process.kind {
+            ProcessKind::Task => {
+                if let Some(ms) = process.duration_ms {
+                    format!("({:.1}s)", ms as f64 / 1000.0)
+                } else {
+                    String::new()
+                }
+            }
+            ProcessKind::Daemon => {
+                if let Some(pid) = process.pid {
+                    format!("(pid {})", pid)
+                } else {
+                    String::new()
+                }
+            }
         };
 
-        let title = format!(
-            " {} {} {} ({}) ",
-            status_icon, kind_indicator, process.name, process.group
-        );
+        let title = format!(" [{}] {} {} ", status_icon, process.name, info).trim_end().to_string() + " ";
 
         let border_style = if focused {
             Style::default().fg(Color::Cyan)
