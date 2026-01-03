@@ -52,6 +52,24 @@ pub enum LogFormat {
     Json,
 }
 
+/// Log suppression level for tasks and daemons.
+///
+/// Controls which output streams are suppressed in the TUI.
+/// Suppressed output is still captured for API/debugging purposes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Silence {
+    /// No suppression - show all output (default).
+    #[default]
+    None,
+    /// Suppress stdout only.
+    Stdout,
+    /// Suppress stderr only.
+    Stderr,
+    /// Suppress all output.
+    All,
+}
+
 /// A watch group that pairs file patterns with commands.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -70,6 +88,10 @@ pub struct Group {
 
     /// Working directory for commands (defaults to config file directory).
     pub working_dir: Option<String>,
+
+    /// Environment variables for all commands in this group.
+    /// These are merged with task/daemon-specific env vars.
+    pub env: HashMap<String, String>,
 
     /// Task commands (run to completion).
     #[serde(alias = "task")]
@@ -94,6 +116,18 @@ pub struct TaskCommand {
     /// Only run on file changes, not on initial startup.
     #[serde(default)]
     pub on_change_only: bool,
+
+    /// Log suppression level.
+    #[serde(default)]
+    pub silence: Silence,
+
+    /// Working directory for this command (overrides group working_dir).
+    #[serde(default)]
+    pub working_dir: Option<String>,
+
+    /// Environment variables for this task (merged with group env).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 impl TaskCommand {
@@ -103,6 +137,9 @@ impl TaskCommand {
             name: Some(name.into()),
             command: command.into(),
             on_change_only: false,
+            silence: Silence::None,
+            working_dir: None,
+            env: HashMap::new(),
         }
     }
 
@@ -112,6 +149,9 @@ impl TaskCommand {
             name: None,
             command: command.into(),
             on_change_only: false,
+            silence: Silence::None,
+            working_dir: None,
+            env: HashMap::new(),
         }
     }
 
@@ -166,6 +206,23 @@ pub struct DaemonCommand {
     /// By default, PTY is enabled (no_pty = false).
     #[serde(default)]
     pub no_pty: bool,
+
+    /// Log suppression level.
+    #[serde(default)]
+    pub silence: Silence,
+
+    /// Working directory for this daemon (overrides group working_dir).
+    #[serde(default)]
+    pub working_dir: Option<String>,
+
+    /// Delay in milliseconds before starting the daemon (after tasks complete).
+    /// This is different from `debounce_ms` which controls file change batching.
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+
+    /// Environment variables for this daemon (merged with group env).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 impl DaemonCommand {
@@ -176,6 +233,10 @@ impl DaemonCommand {
             command: command.into(),
             signal: Signal::default(),
             no_pty: false,
+            silence: Silence::None,
+            working_dir: None,
+            delay_ms: None,
+            env: HashMap::new(),
         }
     }
 
@@ -186,6 +247,10 @@ impl DaemonCommand {
             command: command.into(),
             signal: Signal::default(),
             no_pty: false,
+            silence: Silence::None,
+            working_dir: None,
+            delay_ms: None,
+            env: HashMap::new(),
         }
     }
 

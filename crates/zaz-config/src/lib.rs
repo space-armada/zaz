@@ -8,7 +8,7 @@ pub mod user;
 mod validate;
 
 pub use error::ConfigError;
-pub use schema::{Config, DaemonCommand, Group, LogFormat, Settings, Signal, TaskCommand};
+pub use schema::{Config, DaemonCommand, Group, LogFormat, Settings, Signal, Silence, TaskCommand};
 pub use user::{
     load_user_config, user_config_path, ColorRule, LogColorConfig, NotificationConfig,
     TuiStylePreference, UserConfig,
@@ -271,5 +271,213 @@ depends_on = ["backend"]
         let result = parse_json("{invalid}");
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ConfigError::Json(_)));
+    }
+
+    #[test]
+    fn test_silence_parsing() {
+        use crate::Silence;
+
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.task]]
+name = "quiet"
+command = "echo hello"
+silence = "all"
+
+[[group.task]]
+name = "stdout_only"
+command = "echo hello"
+silence = "stderr"
+
+[[group.daemon]]
+name = "srv"
+command = "./srv"
+silence = "stdout"
+"#;
+        let config = parse_toml(toml).unwrap();
+
+        // Task with silence = "all"
+        assert_eq!(config.groups[0].tasks[0].silence, Silence::All);
+        // Task with silence = "stderr" (shows only stderr)
+        assert_eq!(config.groups[0].tasks[1].silence, Silence::Stderr);
+        // Daemon with silence = "stdout"
+        assert_eq!(config.groups[0].daemons[0].silence, Silence::Stdout);
+    }
+
+    #[test]
+    fn test_silence_default() {
+        use crate::Silence;
+
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.task]]
+name = "default"
+command = "echo hello"
+"#;
+        let config = parse_toml(toml).unwrap();
+        // Default should be None
+        assert_eq!(config.groups[0].tasks[0].silence, Silence::None);
+    }
+
+    #[test]
+    fn test_working_dir_parsing() {
+        let toml = r#"
+[[group]]
+name = "monorepo"
+patterns = ["**/*.ts"]
+working_dir = "./packages"
+
+[[group.task]]
+name = "frontend-lint"
+command = "npm run lint"
+working_dir = "./packages/frontend"
+
+[[group.task]]
+name = "backend-lint"
+command = "npm run lint"
+working_dir = "./packages/backend"
+
+[[group.daemon]]
+name = "server"
+command = "./server"
+working_dir = "./packages/server"
+"#;
+        let config = parse_toml(toml).unwrap();
+
+        // Group working_dir
+        assert_eq!(config.groups[0].working_dir, Some("./packages".to_string()));
+
+        // Task working_dir overrides
+        assert_eq!(
+            config.groups[0].tasks[0].working_dir,
+            Some("./packages/frontend".to_string())
+        );
+        assert_eq!(
+            config.groups[0].tasks[1].working_dir,
+            Some("./packages/backend".to_string())
+        );
+
+        // Daemon working_dir override
+        assert_eq!(
+            config.groups[0].daemons[0].working_dir,
+            Some("./packages/server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_working_dir_default() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.task]]
+name = "default"
+command = "echo hello"
+
+[[group.daemon]]
+name = "srv"
+command = "./srv"
+"#;
+        let config = parse_toml(toml).unwrap();
+        // Default should be None
+        assert!(config.groups[0].working_dir.is_none());
+        assert!(config.groups[0].tasks[0].working_dir.is_none());
+        assert!(config.groups[0].daemons[0].working_dir.is_none());
+    }
+
+    #[test]
+    fn test_daemon_delay_ms() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.daemon]]
+name = "server"
+command = "./server"
+delay_ms = 500
+
+[[group.daemon]]
+name = "worker"
+command = "./worker"
+"#;
+        let config = parse_toml(toml).unwrap();
+
+        // Daemon with delay
+        assert_eq!(config.groups[0].daemons[0].delay_ms, Some(500));
+        // Daemon without delay (default)
+        assert_eq!(config.groups[0].daemons[1].delay_ms, None);
+    }
+
+    #[test]
+    fn test_env_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.go"]
+env = { GO_ENV = "test" }
+
+[[group.task]]
+name = "build"
+command = "go build"
+env = { CGO_ENABLED = "0", GOOS = "linux" }
+
+[[group.daemon]]
+name = "server"
+command = "./server"
+env = { PORT = "8080" }
+"#;
+        let config = parse_toml(toml).unwrap();
+
+        // Group env
+        assert_eq!(
+            config.groups[0].env.get("GO_ENV"),
+            Some(&"test".to_string())
+        );
+
+        // Task env
+        assert_eq!(
+            config.groups[0].tasks[0].env.get("CGO_ENABLED"),
+            Some(&"0".to_string())
+        );
+        assert_eq!(
+            config.groups[0].tasks[0].env.get("GOOS"),
+            Some(&"linux".to_string())
+        );
+
+        // Daemon env
+        assert_eq!(
+            config.groups[0].daemons[0].env.get("PORT"),
+            Some(&"8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_env_default() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.task]]
+name = "default"
+command = "echo hello"
+
+[[group.daemon]]
+name = "srv"
+command = "./srv"
+"#;
+        let config = parse_toml(toml).unwrap();
+        // Default should be empty
+        assert!(config.groups[0].env.is_empty());
+        assert!(config.groups[0].tasks[0].env.is_empty());
+        assert!(config.groups[0].daemons[0].env.is_empty());
     }
 }
