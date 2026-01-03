@@ -446,7 +446,8 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
             let config_path = std::path::Path::new(&config_path_str);
             let socket_path = std::path::Path::new(&socket_path_str);
 
-            let mut engine = match Engine::new(config_path) {
+            // Use verbose_output=false to avoid corrupting TUI display
+            let mut engine = match Engine::with_options(config_path, false) {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to create engine");
