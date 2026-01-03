@@ -8,7 +8,9 @@ pub mod user;
 mod validate;
 
 pub use error::ConfigError;
-pub use schema::{Config, DaemonCommand, Group, LogFormat, Settings, Signal, Silence, TaskCommand};
+pub use schema::{
+    Config, DaemonCommand, Group, HumanDuration, LogFormat, Settings, Signal, Silence, TaskCommand,
+};
 pub use user::{
     load_user_config, user_config_path, ColorRule, LogColorConfig, NotificationConfig,
     TuiStylePreference, UserConfig,
@@ -145,7 +147,7 @@ no_pty = false
 "#;
         let config = parse_toml(toml).unwrap();
         assert_eq!(config.settings.shell, Some("bash".to_string()));
-        assert_eq!(config.settings.debounce_ms, 200);
+        assert_eq!(config.settings.debounce_ms(), 200);
         assert_eq!(config.settings.log_format, LogFormat::Json);
         assert_eq!(
             config.variables.get("build_dir"),
@@ -222,7 +224,7 @@ patterns = ["*.txt"]
     #[test]
     fn test_default_values() {
         let config = parse_toml("").unwrap();
-        assert_eq!(config.settings.debounce_ms, 100);
+        assert_eq!(config.settings.debounce_ms(), 100);
         assert_eq!(config.settings.log_format, LogFormat::Pretty);
         assert!(config.settings.shell.is_none());
     }
@@ -411,9 +413,9 @@ command = "./worker"
         let config = parse_toml(toml).unwrap();
 
         // Daemon with delay
-        assert_eq!(config.groups[0].daemons[0].delay_ms, Some(500));
+        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(500));
         // Daemon without delay (default)
-        assert_eq!(config.groups[0].daemons[1].delay_ms, None);
+        assert_eq!(config.groups[0].daemons[1].delay_ms(), None);
     }
 
     #[test]
@@ -457,6 +459,108 @@ env = { PORT = "8080" }
             config.groups[0].daemons[0].env.get("PORT"),
             Some(&"8080".to_string())
         );
+    }
+
+    #[test]
+    fn test_human_readable_debounce() {
+        // Test string format
+        let toml = r#"
+[settings]
+debounce = "500ms"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.settings.debounce_ms(), 500);
+
+        // Test seconds
+        let toml = r#"
+[settings]
+debounce = "2s"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.settings.debounce_ms(), 2000);
+
+        // Test complex duration
+        let toml = r#"
+[settings]
+debounce = "1s 500ms"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.settings.debounce_ms(), 1500);
+
+        // Test integer (backwards compatibility)
+        let toml = r#"
+[settings]
+debounce = 300
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.settings.debounce_ms(), 300);
+
+        // Test debounce_ms alias (backwards compatibility)
+        let toml = r#"
+[settings]
+debounce_ms = 250
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.settings.debounce_ms(), 250);
+    }
+
+    #[test]
+    fn test_human_readable_delay() {
+        // Test string format
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.daemon]]
+name = "server"
+command = "./server"
+delay = "500ms"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(500));
+
+        // Test seconds
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.daemon]]
+name = "server"
+command = "./server"
+delay = "2s"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(2000));
+
+        // Test integer (backwards compatibility)
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.daemon]]
+name = "server"
+command = "./server"
+delay = 750
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(750));
+
+        // Test delay_ms alias (backwards compatibility)
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.daemon]]
+name = "server"
+command = "./server"
+delay_ms = 600
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(600));
     }
 
     #[test]

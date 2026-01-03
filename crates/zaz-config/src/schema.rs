@@ -1,7 +1,113 @@
 //! Configuration schema types.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// A duration that can be specified as either:
+/// - A human-readable string: "500ms", "2s", "1m30s"
+/// - An integer (interpreted as milliseconds for backwards compatibility)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HumanDuration(Duration);
+
+impl HumanDuration {
+    /// Create a new HumanDuration from a Duration.
+    pub fn new(duration: Duration) -> Self {
+        Self(duration)
+    }
+
+    /// Create a new HumanDuration from milliseconds.
+    pub fn from_millis(ms: u64) -> Self {
+        Self(Duration::from_millis(ms))
+    }
+
+    /// Get the underlying Duration.
+    pub fn as_duration(&self) -> Duration {
+        self.0
+    }
+
+    /// Get the duration in milliseconds.
+    pub fn as_millis(&self) -> u64 {
+        self.0.as_millis() as u64
+    }
+}
+
+impl Default for HumanDuration {
+    fn default() -> Self {
+        Self(Duration::from_millis(100))
+    }
+}
+
+impl From<Duration> for HumanDuration {
+    fn from(d: Duration) -> Self {
+        Self(d)
+    }
+}
+
+impl From<HumanDuration> for Duration {
+    fn from(hd: HumanDuration) -> Self {
+        hd.0
+    }
+}
+
+impl Serialize for HumanDuration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Serialize as a human-readable string
+        let formatted = humantime::format_duration(self.0).to_string();
+        serializer.serialize_str(&formatted)
+    }
+}
+
+impl<'de> Deserialize<'de> for HumanDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{self, Visitor};
+
+        struct HumanDurationVisitor;
+
+        impl<'de> Visitor<'de> for HumanDurationVisitor {
+            type Value = HumanDuration;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a duration string (e.g., '500ms', '2s') or integer milliseconds")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<HumanDuration, E>
+            where
+                E: de::Error,
+            {
+                humantime::parse_duration(value)
+                    .map(HumanDuration)
+                    .map_err(|e| de::Error::custom(format!("invalid duration '{}': {}", value, e)))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<HumanDuration, E>
+            where
+                E: de::Error,
+            {
+                Ok(HumanDuration(Duration::from_millis(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<HumanDuration, E>
+            where
+                E: de::Error,
+            {
+                if value < 0 {
+                    Err(de::Error::custom("duration cannot be negative"))
+                } else {
+                    Ok(HumanDuration(Duration::from_millis(value as u64)))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(HumanDurationVisitor)
+    }
+}
 
 /// Root configuration structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,8 +131,10 @@ pub struct Settings {
     /// Shell to use for command execution (defaults to $SHELL).
     pub shell: Option<String>,
 
-    /// Debounce time in milliseconds.
-    pub debounce_ms: u64,
+    /// Debounce time for file change batching.
+    /// Accepts human-readable strings ("100ms", "1s") or integer milliseconds.
+    #[serde(alias = "debounce_ms")]
+    pub debounce: HumanDuration,
 
     /// Log output format.
     pub log_format: LogFormat,
@@ -36,9 +144,16 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             shell: None,
-            debounce_ms: 100,
+            debounce: HumanDuration::from_millis(100),
             log_format: LogFormat::Pretty,
         }
+    }
+}
+
+impl Settings {
+    /// Get debounce time in milliseconds (for backwards compatibility).
+    pub fn debounce_ms(&self) -> u64 {
+        self.debounce.as_millis()
     }
 }
 
@@ -215,10 +330,11 @@ pub struct DaemonCommand {
     #[serde(default)]
     pub working_dir: Option<String>,
 
-    /// Delay in milliseconds before starting the daemon (after tasks complete).
-    /// This is different from `debounce_ms` which controls file change batching.
-    #[serde(default)]
-    pub delay_ms: Option<u64>,
+    /// Delay before starting the daemon (after tasks complete).
+    /// Accepts human-readable strings ("500ms", "2s") or integer milliseconds.
+    /// This is different from `debounce` which controls file change batching.
+    #[serde(default, alias = "delay_ms")]
+    pub delay: Option<HumanDuration>,
 
     /// Environment variables for this daemon (merged with group env).
     #[serde(default)]
@@ -235,7 +351,7 @@ impl DaemonCommand {
             no_pty: false,
             silence: Silence::None,
             working_dir: None,
-            delay_ms: None,
+            delay: None,
             env: HashMap::new(),
         }
     }
@@ -249,7 +365,7 @@ impl DaemonCommand {
             no_pty: false,
             silence: Silence::None,
             working_dir: None,
-            delay_ms: None,
+            delay: None,
             env: HashMap::new(),
         }
     }
@@ -264,6 +380,11 @@ impl DaemonCommand {
     /// Returns true if this daemon has an explicitly set name.
     pub fn has_explicit_name(&self) -> bool {
         self.name.is_some()
+    }
+
+    /// Get delay in milliseconds (for backwards compatibility).
+    pub fn delay_ms(&self) -> Option<u64> {
+        self.delay.map(|d| d.as_millis())
     }
 }
 
