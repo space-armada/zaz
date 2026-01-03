@@ -404,11 +404,7 @@ impl MultiPaneStyle {
         // Get the process for this pane to calculate log count
         if let Some(process) = self.get_process_at_index(app, pane) {
             let logs = app.logs.filtered_logs(&process.name);
-            let visible_height = app
-                .pane_visible_height
-                .get(&pane)
-                .copied()
-                .unwrap_or(20);
+            let visible_height = app.pane_visible_height.get(&pane).copied().unwrap_or(20);
             let max_scroll = logs.len().saturating_sub(visible_height);
             let current = app.get_pane_scroll(pane);
 
@@ -483,11 +479,11 @@ impl MultiPaneStyle {
                 if app.current_page > 0 {
                     app.current_page -= 1;
                     let prev_visible = 6.min(task_count - app.current_page * 6);
-                    let rows = (prev_visible + cols - 1) / cols;
+                    let rows = prev_visible.div_ceil(cols);
                     let target_row = rows - 1;
                     (target_row * cols + local_idx).min(prev_visible - 1)
                 } else {
-                    let rows = (visible_count + cols - 1) / cols;
+                    let rows = visible_count.div_ceil(cols);
                     let target_row = rows - 1;
                     (target_row * cols + local_idx).min(visible_count - 1)
                 }

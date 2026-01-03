@@ -23,8 +23,7 @@ pub struct UserConfig {
 }
 
 /// TUI style preference for user config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TuiStylePreference {
     /// Full style with group tree and logs pane.
     #[default]
