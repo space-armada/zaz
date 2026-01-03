@@ -216,6 +216,22 @@ pub struct Engine {
 
     /// Sender for spawned tasks to signal task completion.
     task_completion_tx: mpsc::Sender<TaskCompletion>,
+
+    /// Notification configuration from user config.
+    notification_config: zaz_config::NotificationConfig,
+}
+
+/// Result of a config reload operation.
+#[derive(Debug, Clone)]
+pub enum ReloadResult {
+    /// Reload succeeded with details about what changed.
+    Success {
+        added: Vec<String>,
+        removed: Vec<String>,
+        modified: Vec<String>,
+    },
+    /// Reload failed with an error message.
+    Failed(String),
 }
 
 /// A managed watch group with its processes.
@@ -253,6 +269,10 @@ impl Engine {
         config_path: PathBuf,
         verbose_output: bool,
     ) -> Result<Self, DaemonError> {
+        // Load user config for notification settings
+        let user_config = zaz_config::load_user_config();
+        let notification_config = user_config.notifications;
+
         // Determine the config directory for variable expansion
         let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
@@ -366,6 +386,7 @@ impl Engine {
             pending_tasks: std::collections::HashSet::new(),
             task_completion_rx,
             task_completion_tx,
+            notification_config,
         })
     }
 
@@ -610,6 +631,16 @@ impl Engine {
                             group.state.tasks[idx].duration_ms = Some(duration.as_millis() as u64);
                             group.state.tasks[idx].exit_code = output.exit_code;
                         }
+
+                        // Send notification for task success
+                        crate::notify::send_notification(
+                            &self.notification_config,
+                            crate::notify::NotifyEvent::task_success(
+                                &task_name,
+                                group_name,
+                                duration.as_millis() as u64,
+                            ),
+                        );
                     } else {
                         let exit_code = output.exit_code.unwrap_or(-1);
                         // Push daemon log for task failure
@@ -631,6 +662,17 @@ impl Engine {
                             group.state.tasks[idx].exit_code = output.exit_code;
                             group.state.status = GroupStatus::Failed;
                         }
+
+                        // Send notification for task failure
+                        crate::notify::send_notification(
+                            &self.notification_config,
+                            crate::notify::NotifyEvent::task_failed(
+                                &task_name,
+                                group_name,
+                                output.exit_code,
+                            ),
+                        );
+
                         self.update_state();
                         return Err(DaemonError::TaskFailed {
                             task: task_name,
@@ -650,6 +692,13 @@ impl Engine {
                         group.state.tasks[idx].status = ProcessStatus::Failed;
                         group.state.status = GroupStatus::Failed;
                     }
+
+                    // Send notification for task failure (spawn error)
+                    crate::notify::send_notification(
+                        &self.notification_config,
+                        crate::notify::NotifyEvent::task_failed(&task_name, group_name, None),
+                    );
+
                     self.update_state();
                     return Err(DaemonError::TaskFailed {
                         task: task_name,
@@ -869,6 +918,34 @@ impl Engine {
             // Remove from running set first (needed for group status check)
             self.running_tasks.remove(&completion.task_id);
 
+            // Extract task name from task_id for notifications
+            let task_name = completion
+                .task_id
+                .split_once(':')
+                .map(|(_, name)| name.to_string())
+                .unwrap_or_else(|| completion.task_id.clone());
+
+            // Send notification for individual task completion
+            if completion.success {
+                crate::notify::send_notification(
+                    &self.notification_config,
+                    crate::notify::NotifyEvent::task_success(
+                        &task_name,
+                        &completion.group_name,
+                        completion.duration_ms.unwrap_or(0),
+                    ),
+                );
+            } else {
+                crate::notify::send_notification(
+                    &self.notification_config,
+                    crate::notify::NotifyEvent::task_failed(
+                        &task_name,
+                        &completion.group_name,
+                        completion.exit_code,
+                    ),
+                );
+            }
+
             // Update task state and recalculate group status
             if let Some(group) = self.groups.get_mut(&completion.group_name) {
                 if completion.task_index < group.state.tasks.len() {
@@ -892,11 +969,26 @@ impl Engine {
                         .iter()
                         .any(|t| t.status == ProcessStatus::Failed);
 
-                    group.state.status = if any_failed {
+                    let new_status = if any_failed {
                         GroupStatus::Failed
                     } else {
                         GroupStatus::Ready
                     };
+
+                    group.state.status = new_status;
+
+                    // Send notification for group completion
+                    if any_failed {
+                        crate::notify::send_notification(
+                            &self.notification_config,
+                            crate::notify::NotifyEvent::group_failed(&completion.group_name),
+                        );
+                    } else {
+                        crate::notify::send_notification(
+                            &self.notification_config,
+                            crate::notify::NotifyEvent::group_complete(&completion.group_name),
+                        );
+                    }
                 }
             }
 
@@ -1088,6 +1180,212 @@ impl Engine {
         Ok(())
     }
 
+    /// Reload configuration from the file.
+    ///
+    /// This:
+    /// 1. Parses and validates the new config
+    /// 2. Stops daemons in removed/modified groups
+    /// 3. Updates group configurations
+    /// 4. Starts daemons in new/modified groups
+    /// 5. Broadcasts reload status
+    pub async fn reload_config(&mut self) -> ReloadResult {
+        tracing::info!(path = %self.config_path.display(), "reloading configuration");
+
+        // 1. Parse and validate new config
+        let new_config = match zaz_config::load(&self.config_path) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to parse config");
+                return ReloadResult::Failed(format!("parse error: {}", e));
+            }
+        };
+
+        // 2. Compute changes
+        let (added, removed, modified) = self.compute_config_changes(&new_config);
+
+        // 3. Stop daemons in removed groups
+        for group_name in &removed {
+            if let Some(group) = self.groups.get_mut(group_name) {
+                for daemon in &mut group.daemons {
+                    if let Err(e) = daemon.stop() {
+                        tracing::warn!(
+                            daemon = %daemon.name(),
+                            group = %group_name,
+                            error = %e,
+                            "failed to stop daemon during reload"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 4. Stop daemons in modified groups (they'll be restarted)
+        for group_name in &modified {
+            if let Some(group) = self.groups.get_mut(group_name) {
+                for daemon in &mut group.daemons {
+                    if let Err(e) = daemon.stop() {
+                        tracing::warn!(
+                            daemon = %daemon.name(),
+                            group = %group_name,
+                            error = %e,
+                            "failed to stop daemon during reload"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 5. Compute new execution order
+        let execution_order = match topological_sort(&new_config.groups) {
+            Ok(order) => order,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to compute execution order");
+                return ReloadResult::Failed(format!("dependency error: {}", e));
+            }
+        };
+
+        // 6. Apply new configuration
+        self.config = new_config;
+        self.execution_order = execution_order;
+
+        // 7. Rebuild groups
+        if let Err(e) = self.rebuild_groups() {
+            tracing::error!(error = %e, "failed to rebuild groups");
+            return ReloadResult::Failed(format!("rebuild error: {}", e));
+        }
+
+        // 8. Run new/modified groups
+        for group_name in added.iter().chain(&modified) {
+            if let Err(e) = self.run_group(group_name, &[], false).await {
+                tracing::error!(group = %group_name, error = %e, "failed to start group after reload");
+            }
+        }
+
+        // 9. Broadcast reload complete
+        self.push_log(LogLine::daemon(
+            "zaz",
+            format!(
+                "configuration reloaded: {} added, {} removed, {} modified",
+                added.len(),
+                removed.len(),
+                modified.len()
+            ),
+        ));
+        self.update_state();
+
+        ReloadResult::Success {
+            added,
+            removed,
+            modified,
+        }
+    }
+
+    /// Compute changes between current config and new config.
+    fn compute_config_changes(
+        &self,
+        new_config: &Config,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        use std::collections::HashSet;
+
+        let old_names: HashSet<_> = self.config.groups.iter().map(|g| &g.name).collect();
+        let new_names: HashSet<_> = new_config.groups.iter().map(|g| &g.name).collect();
+
+        let added: Vec<String> = new_names
+            .difference(&old_names)
+            .map(|s| (*s).clone())
+            .collect();
+        let removed: Vec<String> = old_names
+            .difference(&new_names)
+            .map(|s| (*s).clone())
+            .collect();
+
+        // Check for modifications (compare serialized versions)
+        let mut modified = Vec::new();
+        for new_group in &new_config.groups {
+            if let Some(old_group) = self.config.groups.iter().find(|g| g.name == new_group.name) {
+                let old_json = serde_json::to_string(old_group).unwrap_or_default();
+                let new_json = serde_json::to_string(new_group).unwrap_or_default();
+                if old_json != new_json {
+                    modified.push(new_group.name.clone());
+                }
+            }
+        }
+
+        (added, removed, modified)
+    }
+
+    /// Rebuild group patterns and managed groups from current config.
+    fn rebuild_groups(&mut self) -> Result<(), DaemonError> {
+        // Clear and rebuild group patterns
+        self.group_patterns.clear();
+        let mut new_groups = IndexMap::new();
+
+        for group in &self.config.groups {
+            // Create pattern set for this group
+            let patterns =
+                PatternSet::new(&group.patterns, &group.ignore).map_err(DaemonError::Watch)?;
+            self.group_patterns.insert(group.name.clone(), patterns);
+
+            // Create executor with shell and working directory
+            let mut executor = Executor::new(self.config.settings.shell.clone());
+            if let Some(ref dir) = group.working_dir {
+                executor = executor.with_working_dir(dir.clone());
+            }
+
+            // Create daemons
+            let daemons: Vec<Daemon> = group
+                .daemons
+                .iter()
+                .map(|d| Daemon::new(d.clone(), executor.clone()))
+                .collect();
+
+            // Initialize group state
+            let state = GroupState {
+                name: group.name.clone(),
+                status: GroupStatus::Pending,
+                tasks: group
+                    .tasks
+                    .iter()
+                    .map(|t| ProcessState {
+                        name: t.name().to_string(),
+                        status: ProcessStatus::Pending,
+                        ..Default::default()
+                    })
+                    .collect(),
+                daemons: group
+                    .daemons
+                    .iter()
+                    .map(|d| ProcessState {
+                        name: d.name().to_string(),
+                        status: ProcessStatus::Pending,
+                        ..Default::default()
+                    })
+                    .collect(),
+            };
+
+            new_groups.insert(
+                group.name.clone(),
+                ManagedGroup {
+                    config: group.clone(),
+                    executor,
+                    daemons,
+                    state,
+                },
+            );
+        }
+
+        self.groups = new_groups;
+
+        // Update daemon state
+        self.state.groups = self
+            .groups
+            .iter()
+            .map(|(k, v)| (k.clone(), v.state.clone()))
+            .collect();
+
+        Ok(())
+    }
+
     /// Restart a specific process (task or daemon) within a group.
     pub async fn restart_process(
         &mut self,
@@ -1216,10 +1514,19 @@ impl Engine {
                 Ok(()) => ApiResponse::ok_with_message("restart initiated for all groups"),
                 Err(e) => ApiResponse::error(format!("failed to restart: {}", e)),
             },
-            ApiRequest::ReloadConfig => {
-                // TODO: implement config hot-reload
-                ApiResponse::error("config reload not yet implemented")
-            }
+            ApiRequest::ReloadConfig => match self.reload_config().await {
+                ReloadResult::Success {
+                    added,
+                    removed,
+                    modified,
+                } => ApiResponse::ok_with_message(format!(
+                    "config reloaded: {} added, {} removed, {} modified",
+                    added.len(),
+                    removed.len(),
+                    modified.len()
+                )),
+                ReloadResult::Failed(e) => ApiResponse::error(format!("reload failed: {}", e)),
+            },
             ApiRequest::Shutdown => {
                 // Signal handled by caller
                 ApiResponse::ok_with_message("shutting down")

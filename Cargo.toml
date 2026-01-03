@@ -58,6 +58,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Unix socket / async utilities
 tokio-util = { version = "0.7", features = ["codec"] }
 
+# Desktop notifications
+notify-rust = "4"
+
 # Internal crates
 zaz-config = { path = "crates/zaz-config" }
 zaz-daemon = { path = "crates/zaz-daemon" }

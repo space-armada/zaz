@@ -7,6 +7,7 @@ mod engine;
 mod error;
 mod log_layer;
 mod log_store;
+pub mod notify;
 mod server;
 mod state;
 
