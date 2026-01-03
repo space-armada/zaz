@@ -78,10 +78,13 @@ impl Server {
         loop {
             match self.listener.accept().await {
                 Ok((stream, _)) => {
+                    tracing::info!("client connected");
                     let command_tx = self.command_tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream, command_tx).await {
-                            tracing::debug!(error = %e, "connection closed");
+                            tracing::info!(error = %e, "client disconnected");
+                        } else {
+                            tracing::info!("client disconnected");
                         }
                     });
                 }
