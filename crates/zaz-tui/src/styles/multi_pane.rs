@@ -815,16 +815,28 @@ impl MultiPaneStyle {
         };
 
         let panes_per_page = app.panes_per_page.max(1);
-        let page_info = if task_count > panes_per_page {
-            let total_pages = task_count.div_ceil(panes_per_page);
-            format!(
-                " Page {}/{} ({} panes) |",
-                app.current_page + 1,
-                total_pages,
-                panes_per_page
-            )
+        let page_info = if task_count == 0 {
+            " No tasks |".to_string()
         } else {
-            format!(" {} panes |", panes_per_page.min(task_count))
+            let start_pane = app.current_page * panes_per_page + 1;
+            let end_pane = (start_pane + panes_per_page - 1).min(task_count);
+            let pane_range = if start_pane == end_pane {
+                format!("{}", start_pane)
+            } else {
+                format!("{}-{}", start_pane, end_pane)
+            };
+            if task_count > panes_per_page {
+                let total_pages = task_count.div_ceil(panes_per_page);
+                format!(
+                    " Page {}/{}, Panes {}/{} |",
+                    app.current_page + 1,
+                    total_pages,
+                    pane_range,
+                    task_count
+                )
+            } else {
+                format!(" Panes {}/{} |", pane_range, task_count)
+            }
         };
 
         // Show follow status for focused pane
