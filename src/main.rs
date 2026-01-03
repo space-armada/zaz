@@ -27,12 +27,12 @@ struct Cli {
     socket: Option<PathBuf>,
 
     /// Use full TUI style (split panes with group tree)
-    #[arg(long, conflicts_with = "minimal")]
+    #[arg(long, conflicts_with = "multi_pane")]
     full: bool,
 
-    /// Use minimal TUI style (one pane per task)
+    /// Use multi-pane TUI style (one pane per task)
     #[arg(long, conflicts_with = "full")]
-    minimal: bool,
+    multi_pane: bool,
 
     /// Don't auto-start daemon when running TUI
     #[arg(long)]
@@ -88,8 +88,8 @@ impl TuiOptions {
     fn from_cli_and_user_config(cli: &Cli, user_config: &UserConfig) -> Self {
         let style = if cli.full {
             TuiStylePreference::Full
-        } else if cli.minimal {
-            TuiStylePreference::Minimal
+        } else if cli.multi_pane {
+            TuiStylePreference::MultiPane
         } else {
             user_config.tui_style.unwrap_or(TuiStylePreference::Full)
         };

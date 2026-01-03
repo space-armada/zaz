@@ -15,10 +15,10 @@
 //! behavior for the same keys.
 
 mod full;
-mod minimal;
+mod multi_pane;
 
 pub use full::FullStyle;
-pub use minimal::MinimalStyle;
+pub use multi_pane::MultiPaneStyle;
 
 use crate::app::App;
 use crate::daemon::ClientCommand;
@@ -145,7 +145,7 @@ pub trait StyleRenderer: Send + Sync {
 pub fn get_renderer(style: crate::app::TuiStyle) -> Box<dyn StyleRenderer> {
     match style {
         crate::app::TuiStyle::Full => Box::new(FullStyle),
-        crate::app::TuiStyle::Minimal => Box::new(MinimalStyle),
+        crate::app::TuiStyle::MultiPane => Box::new(MultiPaneStyle),
     }
 }
 
@@ -161,9 +161,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_renderer_minimal() {
-        let renderer = get_renderer(TuiStyle::Minimal);
-        assert_eq!(renderer.name(), "Minimal");
+    fn test_get_renderer_multi_pane() {
+        let renderer = get_renderer(TuiStyle::MultiPane);
+        assert_eq!(renderer.name(), "Multi Pane");
     }
 
     #[test]

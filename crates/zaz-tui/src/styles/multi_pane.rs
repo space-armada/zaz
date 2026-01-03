@@ -1,6 +1,6 @@
-//! Minimal style implementation.
+//! Multi-pane style implementation.
 //!
-//! The minimal style shows one pane per task/daemon with adaptive layout:
+//! The multi-pane style shows one pane per task/daemon with adaptive layout:
 //! - 1 task: Single full-screen pane
 //! - 2 tasks: Horizontal or vertical split based on terminal aspect ratio
 //! - 3-4 tasks: 2x2 grid
@@ -33,10 +33,10 @@ use ratatui::{
     Frame,
 };
 
-/// Minimal style renderer with one pane per task.
-pub struct MinimalStyle;
+/// Multi-pane style renderer with one pane per task.
+pub struct MultiPaneStyle;
 
-impl StyleRenderer for MinimalStyle {
+impl StyleRenderer for MultiPaneStyle {
     fn draw(&self, frame: &mut Frame, app: &mut App) {
         let area = frame.area();
 
@@ -257,7 +257,7 @@ impl StyleRenderer for MinimalStyle {
     }
 
     fn name(&self) -> &'static str {
-        "Minimal"
+        "Multi Pane"
     }
 
     fn calculate_layout(&self, area: Rect, task_count: usize) -> Vec<PaneLayout> {
@@ -349,7 +349,7 @@ pub enum ProcessKind {
     Daemon,
 }
 
-impl MinimalStyle {
+impl MultiPaneStyle {
     /// Get all processes (tasks + daemons) as a flat list.
     fn get_processes(&self, app: &App) -> Vec<ProcessInfo> {
         let mut processes = Vec::new();
@@ -804,14 +804,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_minimal_style_name() {
-        let style = MinimalStyle;
-        assert_eq!(style.name(), "Minimal");
+    fn test_multi_pane_style_name() {
+        let style = MultiPaneStyle;
+        assert_eq!(style.name(), "Multi Pane");
     }
 
     #[test]
     fn test_layout_single() {
-        let style = MinimalStyle;
+        let style = MultiPaneStyle;
         let area = Rect::new(0, 0, 100, 50);
         let layouts = style.calculate_layout(area, 1);
 
@@ -821,7 +821,7 @@ mod tests {
 
     #[test]
     fn test_layout_two_wide() {
-        let style = MinimalStyle;
+        let style = MultiPaneStyle;
         let area = Rect::new(0, 0, 150, 50);
         let layouts = style.calculate_layout(area, 2);
 
@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn test_layout_four() {
-        let style = MinimalStyle;
+        let style = MultiPaneStyle;
         let area = Rect::new(0, 0, 100, 50);
         let layouts = style.calculate_layout(area, 4);
 
@@ -840,7 +840,7 @@ mod tests {
 
     #[test]
     fn test_layout_six() {
-        let style = MinimalStyle;
+        let style = MultiPaneStyle;
         let area = Rect::new(0, 0, 100, 50);
         let layouts = style.calculate_layout(area, 6);
 
@@ -849,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_layout_paginated() {
-        let style = MinimalStyle;
+        let style = MultiPaneStyle;
         let area = Rect::new(0, 0, 100, 50);
         let layouts = style.calculate_layout(area, 10);
 
@@ -858,7 +858,7 @@ mod tests {
 
     #[test]
     fn test_columns_for_count() {
-        let style = MinimalStyle;
+        let style = MultiPaneStyle;
         assert_eq!(style.columns_for_count(1), 1);
         assert_eq!(style.columns_for_count(2), 2);
         assert_eq!(style.columns_for_count(4), 2);
@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_hsplit() {
-        let style = MinimalStyle;
+        let style = MultiPaneStyle;
         let area = Rect::new(0, 0, 100, 50);
         let splits = style.hsplit(area, 3);
 
@@ -877,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_vsplit() {
-        let style = MinimalStyle;
+        let style = MultiPaneStyle;
         let area = Rect::new(0, 0, 100, 50);
         let splits = style.vsplit(area, 2);
 
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn test_grid() {
-        let style = MinimalStyle;
+        let style = MultiPaneStyle;
         let area = Rect::new(0, 0, 100, 50);
         let cells = style.grid(area, 2, 3);
 

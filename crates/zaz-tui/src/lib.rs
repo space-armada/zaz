@@ -17,4 +17,4 @@ pub use error::TuiError;
 pub use events::Event;
 pub use help::draw_help;
 pub use logs::{LogBuffer, StoredLog};
-pub use styles::{get_renderer, FullStyle, MinimalStyle, PaneLayout, StyleRenderer};
+pub use styles::{get_renderer, FullStyle, MultiPaneStyle, PaneLayout, StyleRenderer};

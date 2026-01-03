@@ -44,8 +44,8 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Style",
         &[
             ("F1", "Switch to Full style"),
-            ("F2", "Switch to Minimal style"),
-            ("[/]", "Previous/next page (Minimal)"),
+            ("F2", "Switch to Multi Pane style"),
+            ("[/]", "Previous/next page (Multi Pane)"),
         ],
     ),
     ("General", &[("q", "Quit"), ("?", "Toggle this help")]),

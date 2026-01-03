@@ -22,15 +22,15 @@ pub enum TuiStyle {
     /// Full style with group tree and logs pane.
     #[default]
     Full,
-    /// Minimal style with one pane per task.
-    Minimal,
+    /// Multi-pane style with one pane per task.
+    MultiPane,
 }
 
 impl From<TuiStylePreference> for TuiStyle {
     fn from(pref: TuiStylePreference) -> Self {
         match pref {
             TuiStylePreference::Full => TuiStyle::Full,
-            TuiStylePreference::Minimal => TuiStyle::Minimal,
+            TuiStylePreference::MultiPane => TuiStyle::MultiPane,
         }
     }
 }
@@ -57,7 +57,7 @@ pub enum Focus {
     Groups,
     /// Logs pane.
     Logs,
-    /// Task pane (minimal style).
+    /// Task pane (multipane style).
     Pane(usize),
 }
 
@@ -88,11 +88,11 @@ pub struct App {
     pub log_scroll: usize,
     /// Visible height of log pane (updated during render) for Full style.
     pub log_visible_height: usize,
-    /// Per-pane scroll offsets (for Minimal style).
+    /// Per-pane scroll offsets (for Multi Pane style).
     pub pane_scroll: HashMap<usize, usize>,
-    /// Per-pane follow mode (for Minimal style).
+    /// Per-pane follow mode (for Multi Pane style).
     pub pane_follow: HashMap<usize, bool>,
-    /// Per-pane visible height (for Minimal style, updated during render).
+    /// Per-pane visible height (for Multi Pane style, updated during render).
     pub pane_visible_height: HashMap<usize, usize>,
     /// Whether to show full timestamps (vs compact time-only).
     pub show_full_timestamp: bool,
@@ -266,13 +266,13 @@ impl App {
     /// Toggle the display style.
     pub fn toggle_style(&mut self) {
         self.style = match self.style {
-            TuiStyle::Full => TuiStyle::Minimal,
-            TuiStyle::Minimal => TuiStyle::Full,
+            TuiStyle::Full => TuiStyle::MultiPane,
+            TuiStyle::MultiPane => TuiStyle::Full,
         };
         // Reset focus based on new style
         self.focus = match self.style {
             TuiStyle::Full => Focus::Groups,
-            TuiStyle::Minimal => Focus::Pane(0),
+            TuiStyle::MultiPane => Focus::Pane(0),
         };
     }
 
@@ -359,7 +359,7 @@ impl App {
                     return;
                 }
                 KeyCode::F(2) => {
-                    self.style = TuiStyle::Minimal;
+                    self.style = TuiStyle::MultiPane;
                     let renderer = get_renderer(self.style);
                     renderer.on_activate(self);
                     return;
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(app.style, TuiStyle::Full);
 
         app.toggle_style();
-        assert_eq!(app.style, TuiStyle::Minimal);
+        assert_eq!(app.style, TuiStyle::MultiPane);
         assert!(matches!(app.focus, Focus::Pane(0)));
 
         app.toggle_style();
@@ -664,8 +664,8 @@ mod tests {
     fn test_tui_style_from_preference() {
         assert_eq!(TuiStyle::from(TuiStylePreference::Full), TuiStyle::Full);
         assert_eq!(
-            TuiStyle::from(TuiStylePreference::Minimal),
-            TuiStyle::Minimal
+            TuiStyle::from(TuiStylePreference::MultiPane),
+            TuiStyle::MultiPane
         );
     }
 }
