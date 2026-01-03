@@ -95,12 +95,22 @@ impl StyleRenderer for MinimalStyle {
         let task_count = app.task_count();
 
         match key {
-            // Grid navigation
-            KeyCode::Char('j') | KeyCode::Down => {
+            // Log scrolling (j/k scroll the focused pane)
+            KeyCode::Char('j') => {
+                self.scroll_pane(app, 1);
+                KeyResult::Handled
+            }
+            KeyCode::Char('k') => {
+                self.scroll_pane(app, -1);
+                KeyResult::Handled
+            }
+
+            // Grid/pane navigation (arrows, h/l, Tab)
+            KeyCode::Down => {
                 self.navigate_vertical(app, 1);
                 KeyResult::Handled
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 self.navigate_vertical(app, -1);
                 KeyResult::Handled
             }
@@ -115,6 +125,19 @@ impl StyleRenderer for MinimalStyle {
             KeyCode::Tab => {
                 if task_count > 0 {
                     app.selected_pane = (app.selected_pane + 1) % task_count;
+                    app.current_page = app.selected_pane / 6;
+                    app.focus = Focus::Pane(app.selected_pane);
+                }
+                KeyResult::Handled
+            }
+            KeyCode::BackTab => {
+                // Shift+Tab: cycle panes in reverse
+                if task_count > 0 {
+                    app.selected_pane = if app.selected_pane == 0 {
+                        task_count - 1
+                    } else {
+                        app.selected_pane - 1
+                    };
                     app.current_page = app.selected_pane / 6;
                     app.focus = Focus::Pane(app.selected_pane);
                 }
@@ -374,6 +397,36 @@ impl MinimalStyle {
         self.get_processes(app).into_iter().nth(index)
     }
 
+    /// Scroll the focused pane by the given amount (positive = down, negative = up).
+    fn scroll_pane(&self, app: &mut App, direction: i32) {
+        let pane = app.selected_pane;
+
+        // Get the process for this pane to calculate log count
+        if let Some(process) = self.get_process_at_index(app, pane) {
+            let logs = app.logs.filtered_logs(&process.name);
+            let visible_height = app
+                .pane_visible_height
+                .get(&pane)
+                .copied()
+                .unwrap_or(20);
+            let max_scroll = logs.len().saturating_sub(visible_height);
+            let current = app.get_pane_scroll(pane);
+
+            let new_scroll = if direction > 0 {
+                (current + 1).min(max_scroll)
+            } else {
+                current.saturating_sub(1)
+            };
+
+            app.set_pane_scroll(pane, new_scroll);
+
+            // Disable follow mode when manually scrolling
+            if new_scroll < max_scroll {
+                app.pane_follow.insert(pane, false);
+            }
+        }
+    }
+
     /// Get the number of columns in the current grid layout.
     fn columns_for_count(&self, count: usize) -> usize {
         match count {
@@ -571,7 +624,23 @@ impl MinimalStyle {
             ProcessStatus::Failed => Color::Red,
         };
 
-        // Format title according to plan
+        // Get logs for this process first (needed for title)
+        use crate::logs::timestamp_to_day;
+
+        let logs = app.logs.filtered_logs(&process.name);
+        let visible_height = area.height.saturating_sub(2) as usize;
+        let total_lines = logs.len();
+
+        // Per-pane scroll handling
+        let is_following = app.pane_follow.get(&pane_index).copied().unwrap_or(true);
+        let scroll_offset = if is_following {
+            total_lines.saturating_sub(visible_height)
+        } else {
+            let stored = app.get_pane_scroll(pane_index);
+            stored.min(total_lines.saturating_sub(visible_height))
+        };
+
+        // Format title with process info
         let info = match process.kind {
             ProcessKind::Task => {
                 if let Some(ms) = process.duration_ms {
@@ -589,31 +658,30 @@ impl MinimalStyle {
             }
         };
 
-        let title = format!(" [{}] {} {} ", status_icon, process.name, info)
-            .trim_end()
-            .to_string()
+        // Add asterisk for focused pane
+        let focus_indicator = if focused { "*" } else { "" };
+
+        // Add line range (e.g., "1-20/100")
+        let line_range = if total_lines > 0 {
+            let start = scroll_offset + 1;
+            let end = (scroll_offset + visible_height).min(total_lines);
+            format!(" ({}-{}/{})", start, end, total_lines)
+        } else {
+            " (empty)".to_string()
+        };
+
+        let title = format!(
+            " [{}] {}{} {}{}",
+            status_icon, process.name, focus_indicator, info, line_range
+        )
+        .trim_end()
+        .to_string()
             + " ";
 
         let border_style = if focused {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default()
-        };
-
-        // Get logs for this process
-        use crate::logs::timestamp_to_day;
-
-        let logs = app.logs.filtered_logs(&process.name);
-        let visible_height = area.height.saturating_sub(2) as usize;
-        let total_lines = logs.len();
-
-        // Per-pane scroll handling
-        let is_following = app.pane_follow.get(&pane_index).copied().unwrap_or(true);
-        let scroll_offset = if is_following {
-            total_lines.saturating_sub(visible_height)
-        } else {
-            let stored = app.get_pane_scroll(pane_index);
-            stored.min(total_lines.saturating_sub(visible_height))
         };
 
         let reference_day = logs
@@ -682,34 +750,33 @@ impl MinimalStyle {
         };
 
         // Show follow status for focused pane
-        let follow_status = {
-            let is_following = app
-                .pane_follow
-                .get(&app.selected_pane)
-                .copied()
-                .unwrap_or(true);
-            if is_following {
-                "Follow:ON"
-            } else {
-                "Follow:OFF"
-            }
+        let is_following = app
+            .pane_follow
+            .get(&app.selected_pane)
+            .copied()
+            .unwrap_or(true);
+
+        let follow_icon = if is_following { "✓" } else { "○" };
+        let follow_style = if is_following {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
         };
 
         let filter_status = if app.logs.has_filter() {
-            format!(" [filter: {}]", app.logs.filter_pattern().unwrap_or(""))
+            format!(" │ filter: {}", app.logs.filter_pattern().unwrap_or(""))
         } else {
             String::new()
         };
 
-        let status = format!(
-            " F2:Mini* |{} {} |{} [q]uit [r]estart [?]help",
-            page_info, follow_status, filter_status
-        );
-
         let mut lines = vec![Line::from(vec![
             Span::raw(" "),
             connection_status,
-            Span::raw(status),
+            Span::raw(page_info),
+            Span::raw(" │ Follow "),
+            Span::styled(follow_icon, follow_style),
+            Span::raw(&filter_status),
+            Span::raw(" │ [q]uit [r]estart [?]help"),
         ])];
 
         if let Some(msg) = app.active_transient_message() {
