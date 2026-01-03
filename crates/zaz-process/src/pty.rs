@@ -2,6 +2,7 @@
 
 use crate::ProcessError;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,16 @@ impl ManagedChild {
         command: &str,
         working_dir: Option<&str>,
     ) -> Result<Self, ProcessError> {
+        Self::spawn_pty_with_env(shell, command, working_dir, &HashMap::new())
+    }
+
+    /// Spawn a command in a PTY with custom environment variables.
+    pub fn spawn_pty_with_env(
+        shell: &str,
+        command: &str,
+        working_dir: Option<&str>,
+        env: &HashMap<String, String>,
+    ) -> Result<Self, ProcessError> {
         let pty_system = native_pty_system();
 
         // Create PTY with reasonable default size
@@ -49,6 +60,11 @@ impl ManagedChild {
 
         if let Some(dir) = working_dir {
             cmd.cwd(dir);
+        }
+
+        // Add environment variables
+        for (key, value) in env {
+            cmd.env(key, value);
         }
 
         // Spawn in the PTY

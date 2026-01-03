@@ -183,6 +183,12 @@ impl Daemon {
         self.restart_delay
     }
 
+    /// Get the startup delay configured for this daemon.
+    /// Returns None if no delay is configured.
+    pub fn startup_delay(&self) -> Option<Duration> {
+        self.config.delay_ms.map(Duration::from_millis)
+    }
+
     /// Get a reader for PTY output, if available.
     ///
     /// Returns None if:

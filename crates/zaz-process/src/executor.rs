@@ -2,6 +2,7 @@
 
 use crate::pty::ManagedChild;
 use crate::ProcessError;
+use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -25,6 +26,7 @@ pub struct CommandOutput {
 pub struct Executor {
     shell: String,
     working_dir: Option<String>,
+    env: HashMap<String, String>,
 }
 
 const SHELL_ENV_VAR: &str = "SHELL";
@@ -40,12 +42,27 @@ impl Executor {
         Self {
             shell,
             working_dir: None,
+            env: HashMap::new(),
         }
     }
 
     /// Set the working directory for commands.
     pub fn with_working_dir(mut self, dir: String) -> Self {
         self.working_dir = Some(dir);
+        self
+    }
+
+    /// Set environment variables for commands.
+    /// These are added to the inherited process environment.
+    pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Extend the environment variables for commands.
+    /// New vars override existing ones with the same key.
+    pub fn extend_env(mut self, env: HashMap<String, String>) -> Self {
+        self.env.extend(env);
         self
     }
 
@@ -63,7 +80,12 @@ impl Executor {
 
     /// Spawn a command in a PTY.
     fn spawn_pty(&self, command: &str) -> Result<ManagedChild, ProcessError> {
-        ManagedChild::spawn_pty(&self.shell, command, self.working_dir.as_deref())
+        ManagedChild::spawn_pty_with_env(
+            &self.shell,
+            command,
+            self.working_dir.as_deref(),
+            &self.env,
+        )
     }
 
     /// Spawn a regular (non-PTY) command.
@@ -73,6 +95,11 @@ impl Executor {
 
         if let Some(dir) = &self.working_dir {
             cmd.current_dir(dir);
+        }
+
+        // Add environment variables (extend inherited env)
+        for (key, value) in &self.env {
+            cmd.env(key, value);
         }
 
         // Create new process group
