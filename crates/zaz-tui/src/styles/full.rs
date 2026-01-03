@@ -70,15 +70,29 @@ impl StyleRenderer for FullStyle {
                     let half_page = app.log_visible_height / 2;
                     let total = app.logs.all_logs_combined().len();
                     let max_scroll = total.saturating_sub(app.log_visible_height);
-                    app.log_scroll = (app.log_scroll + half_page).min(max_scroll);
+
+                    // Sync scroll position from follow mode before disabling
+                    if app.logs.is_following() {
+                        app.log_scroll = max_scroll;
+                    }
                     app.logs.disable_follow();
+
+                    app.log_scroll = (app.log_scroll + half_page).min(max_scroll);
                     return KeyResult::Handled;
                 }
                 KeyCode::Char('u') => {
                     // Half page up
                     let half_page = app.log_visible_height / 2;
-                    app.log_scroll = app.log_scroll.saturating_sub(half_page);
+                    let total = app.logs.all_logs_combined().len();
+                    let max_scroll = total.saturating_sub(app.log_visible_height);
+
+                    // Sync scroll position from follow mode before disabling
+                    if app.logs.is_following() {
+                        app.log_scroll = max_scroll;
+                    }
                     app.logs.disable_follow();
+
+                    app.log_scroll = app.log_scroll.saturating_sub(half_page);
                     return KeyResult::Handled;
                 }
                 _ => {}
@@ -117,13 +131,28 @@ impl StyleRenderer for FullStyle {
                 KeyResult::Handled
             }
             KeyCode::PageUp => {
+                let total = app.logs.all_logs_combined().len();
+                let max_scroll = total.saturating_sub(app.log_visible_height);
+
+                // Sync scroll position from follow mode before disabling
+                if app.logs.is_following() {
+                    app.log_scroll = max_scroll;
+                }
                 app.logs.disable_follow();
+
                 app.log_scroll = app.log_scroll.saturating_sub(app.log_visible_height);
                 KeyResult::Handled
             }
             KeyCode::PageDown => {
                 let total = app.logs.all_logs_combined().len();
                 let max_scroll = total.saturating_sub(app.log_visible_height);
+
+                // Sync scroll position from follow mode before disabling
+                if app.logs.is_following() {
+                    app.log_scroll = max_scroll;
+                }
+                app.logs.disable_follow();
+
                 app.log_scroll = (app.log_scroll + app.log_visible_height).min(max_scroll);
                 KeyResult::Handled
             }
@@ -285,9 +314,15 @@ impl FullStyle {
                 }
             }
             Focus::Logs => {
-                app.logs.disable_follow();
                 let total = app.logs.all_logs_combined().len();
                 let max_scroll = total.saturating_sub(app.log_visible_height);
+
+                // Sync scroll position from follow mode before disabling
+                if app.logs.is_following() {
+                    app.log_scroll = max_scroll;
+                }
+                app.logs.disable_follow();
+
                 if app.log_scroll < max_scroll {
                     app.log_scroll += 1;
                 }
@@ -308,7 +343,14 @@ impl FullStyle {
                 }
             }
             Focus::Logs => {
+                // Sync scroll position from follow mode before disabling
+                if app.logs.is_following() {
+                    let total = app.logs.all_logs_combined().len();
+                    let max_scroll = total.saturating_sub(app.log_visible_height);
+                    app.log_scroll = max_scroll;
+                }
                 app.logs.disable_follow();
+
                 if app.log_scroll > 0 {
                     app.log_scroll -= 1;
                 }

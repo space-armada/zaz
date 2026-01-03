@@ -108,34 +108,47 @@ impl StyleRenderer for MultiPaneStyle {
                 KeyCode::Char('d') => {
                     // Half page down in focused pane
                     if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
+                        let pane = app.selected_pane;
                         let logs = app.logs.filtered_logs(&process.name);
-                        let visible_height = app
-                            .pane_visible_height
-                            .get(&app.selected_pane)
-                            .copied()
-                            .unwrap_or(20);
+                        let visible_height =
+                            app.pane_visible_height.get(&pane).copied().unwrap_or(20);
                         let half_page = visible_height / 2;
                         let max_scroll = logs.len().saturating_sub(visible_height);
-                        let current = app.get_pane_scroll(app.selected_pane);
-                        app.set_pane_scroll(
-                            app.selected_pane,
-                            (current + half_page).min(max_scroll),
-                        );
-                        app.pane_follow.insert(app.selected_pane, false);
+
+                        // Sync scroll position from follow mode before disabling
+                        let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
+                        let current = if is_following {
+                            max_scroll
+                        } else {
+                            app.get_pane_scroll(pane)
+                        };
+                        app.pane_follow.insert(pane, false);
+
+                        app.set_pane_scroll(pane, (current + half_page).min(max_scroll));
                     }
                     return KeyResult::Handled;
                 }
                 KeyCode::Char('u') => {
                     // Half page up in focused pane
-                    let visible_height = app
-                        .pane_visible_height
-                        .get(&app.selected_pane)
-                        .copied()
-                        .unwrap_or(20);
-                    let half_page = visible_height / 2;
-                    let current = app.get_pane_scroll(app.selected_pane);
-                    app.set_pane_scroll(app.selected_pane, current.saturating_sub(half_page));
-                    app.pane_follow.insert(app.selected_pane, false);
+                    if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
+                        let pane = app.selected_pane;
+                        let logs = app.logs.filtered_logs(&process.name);
+                        let visible_height =
+                            app.pane_visible_height.get(&pane).copied().unwrap_or(20);
+                        let half_page = visible_height / 2;
+                        let max_scroll = logs.len().saturating_sub(visible_height);
+
+                        // Sync scroll position from follow mode before disabling
+                        let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
+                        let current = if is_following {
+                            max_scroll
+                        } else {
+                            app.get_pane_scroll(pane)
+                        };
+                        app.pane_follow.insert(pane, false);
+
+                        app.set_pane_scroll(pane, current.saturating_sub(half_page));
+                    }
                     return KeyResult::Handled;
                 }
                 _ => {}
@@ -255,30 +268,42 @@ impl StyleRenderer for MultiPaneStyle {
                 KeyResult::Handled
             }
             KeyCode::PageUp => {
-                let visible_height = app
-                    .pane_visible_height
-                    .get(&app.selected_pane)
-                    .copied()
-                    .unwrap_or(20);
-                let current = app.get_pane_scroll(app.selected_pane);
-                app.set_pane_scroll(app.selected_pane, current.saturating_sub(visible_height));
-                app.pane_follow.insert(app.selected_pane, false);
+                if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
+                    let pane = app.selected_pane;
+                    let logs = app.logs.filtered_logs(&process.name);
+                    let visible_height = app.pane_visible_height.get(&pane).copied().unwrap_or(20);
+                    let max_scroll = logs.len().saturating_sub(visible_height);
+
+                    // Sync scroll position from follow mode before disabling
+                    let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
+                    let current = if is_following {
+                        max_scroll
+                    } else {
+                        app.get_pane_scroll(pane)
+                    };
+                    app.pane_follow.insert(pane, false);
+
+                    app.set_pane_scroll(pane, current.saturating_sub(visible_height));
+                }
                 KeyResult::Handled
             }
             KeyCode::PageDown => {
                 if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
+                    let pane = app.selected_pane;
                     let logs = app.logs.filtered_logs(&process.name);
-                    let visible_height = app
-                        .pane_visible_height
-                        .get(&app.selected_pane)
-                        .copied()
-                        .unwrap_or(20);
+                    let visible_height = app.pane_visible_height.get(&pane).copied().unwrap_or(20);
                     let max_scroll = logs.len().saturating_sub(visible_height);
-                    let current = app.get_pane_scroll(app.selected_pane);
-                    app.set_pane_scroll(
-                        app.selected_pane,
-                        (current + visible_height).min(max_scroll),
-                    );
+
+                    // Sync scroll position from follow mode before disabling
+                    let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
+                    let current = if is_following {
+                        max_scroll
+                    } else {
+                        app.get_pane_scroll(pane)
+                    };
+                    app.pane_follow.insert(pane, false);
+
+                    app.set_pane_scroll(pane, (current + visible_height).min(max_scroll));
                 }
                 KeyResult::Handled
             }
@@ -476,7 +501,14 @@ impl MultiPaneStyle {
             let logs = app.logs.filtered_logs(&process.name);
             let visible_height = app.pane_visible_height.get(&pane).copied().unwrap_or(20);
             let max_scroll = logs.len().saturating_sub(visible_height);
-            let current = app.get_pane_scroll(pane);
+
+            // Sync scroll position from follow mode before disabling
+            let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
+            let current = if is_following {
+                max_scroll
+            } else {
+                app.get_pane_scroll(pane)
+            };
 
             let new_scroll = if direction > 0 {
                 (current + 1).min(max_scroll)
