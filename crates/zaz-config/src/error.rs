@@ -41,7 +41,7 @@ pub enum ConfigError {
 }
 
 /// Location in source file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     /// Line number (1-indexed).
     pub line: usize,
@@ -52,6 +52,28 @@ pub struct Span {
 impl Span {
     /// Create a new span.
     pub fn new(line: usize, column: usize) -> Self {
+        Self { line, column }
+    }
+
+    /// Convert a byte offset to a Span (line/column position).
+    ///
+    /// Both line and column are 1-indexed.
+    pub fn from_byte_offset(source: &str, byte_offset: usize) -> Self {
+        let mut line = 1;
+        let mut column = 1;
+
+        for (i, ch) in source.char_indices() {
+            if i >= byte_offset {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+
         Self { line, column }
     }
 }

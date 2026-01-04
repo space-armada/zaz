@@ -4,6 +4,7 @@
 
 mod error;
 mod schema;
+mod toml_spanned;
 pub mod user;
 mod validate;
 
@@ -11,6 +12,7 @@ pub use error::{ConfigError, Span, ValidationError, ValidationErrorKind, Validat
 pub use schema::{
     Config, DaemonCommand, Group, HumanDuration, LogFormat, Settings, Signal, Silence, TaskCommand,
 };
+pub use toml_spanned::SpanInfo;
 pub use user::{
     load_user_config, user_config_path, ColorRule, LogColorConfig, NotificationConfig,
     TuiStylePreference, UserConfig,
@@ -57,20 +59,23 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
         source: e,
     })?;
 
-    let config = match path.extension().and_then(|e| e.to_str()) {
-        Some("toml") => parse_toml(&contents)?,
-        Some("json") => parse_json(&contents)?,
-        _ => {
-            return Err(ConfigError::UnknownFormat {
-                path: path.to_path_buf(),
-            })
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("toml") => {
+            // Use spanned parser for TOML to get line/column info
+            let (config, span_info) = toml_spanned::parse_toml_with_spans(&contents)?;
+            validate::validate_with_spans(&config, &contents, Some(&span_info))?;
+            Ok(config)
         }
-    };
-
-    // Validate the config
-    validate(&config)?;
-
-    Ok(config)
+        Some("json") => {
+            let config = parse_json(&contents)?;
+            // No span info for JSON
+            validate::validate_with_spans(&config, &contents, None)?;
+            Ok(config)
+        }
+        _ => Err(ConfigError::UnknownFormat {
+            path: path.to_path_buf(),
+        }),
+    }
 }
 
 /// Load configuration without validation (for testing).

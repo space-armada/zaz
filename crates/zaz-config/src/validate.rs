@@ -1,6 +1,7 @@
 //! Configuration validation.
 
 use crate::error::{ValidationError, ValidationErrorKind, ValidationErrors};
+use crate::toml_spanned::SpanInfo;
 use crate::Config;
 use std::collections::{HashMap, HashSet};
 use strsim::levenshtein;
@@ -43,10 +44,19 @@ fn format_available_hint(available: &[&str]) -> String {
 
 /// Validate a configuration and return detailed errors.
 pub fn validate(config: &Config) -> Result<(), ValidationErrors> {
+    validate_with_spans(config, "", None)
+}
+
+/// Validate a configuration with optional span information for line numbers.
+pub fn validate_with_spans(
+    config: &Config,
+    source: &str,
+    span_info: Option<&SpanInfo>,
+) -> Result<(), ValidationErrors> {
     let mut errors = ValidationErrors::new();
 
-    validate_groups(config, &mut errors);
-    validate_dependencies(config, &mut errors);
+    validate_groups(config, source, span_info, &mut errors);
+    validate_dependencies(config, source, span_info, &mut errors);
     validate_patterns(config, &mut errors);
     validate_commands(config, &mut errors);
 
@@ -54,52 +64,81 @@ pub fn validate(config: &Config) -> Result<(), ValidationErrors> {
 }
 
 /// Validate group definitions.
-fn validate_groups(config: &Config, errors: &mut ValidationErrors) {
+fn validate_groups(
+    config: &Config,
+    source: &str,
+    span_info: Option<&SpanInfo>,
+    errors: &mut ValidationErrors,
+) {
     let mut seen_names: HashMap<&str, usize> = HashMap::new();
 
     for (index, group) in config.groups.iter().enumerate() {
+        // Get span for this group's name if available
+        let name_span = span_info.and_then(|si| si.group_name_span(source, index));
+
         // Check for empty group names
         if group.name.is_empty() {
-            errors.push(ValidationError::new(ValidationErrorKind::EmptyGroupName {
-                index,
-            }));
+            let mut error = ValidationError::new(ValidationErrorKind::EmptyGroupName { index });
+            if let Some(span) = name_span {
+                error = error.with_span(span);
+            }
+            errors.push(error);
         }
 
         // Check for duplicate group names
         if let Some(&first_index) = seen_names.get(group.name.as_str()) {
-            errors.push(ValidationError::new(
-                ValidationErrorKind::DuplicateGroupName {
-                    name: group.name.clone(),
-                    first_index,
-                    second_index: index,
-                },
-            ));
+            let mut error = ValidationError::new(ValidationErrorKind::DuplicateGroupName {
+                name: group.name.clone(),
+                first_index,
+                second_index: index,
+            });
+            if let Some(span) = name_span {
+                error = error.with_span(span);
+            }
+            errors.push(error);
         } else {
             seen_names.insert(&group.name, index);
         }
 
         // Check for empty patterns (warning-worthy but not an error)
         if group.patterns.is_empty() && group.tasks.is_empty() && group.daemons.is_empty() {
-            errors.push(ValidationError::new(ValidationErrorKind::EmptyGroup {
+            let mut error = ValidationError::new(ValidationErrorKind::EmptyGroup {
                 name: group.name.clone(),
-            }));
+            });
+            if let Some(span) = name_span {
+                error = error.with_span(span);
+            }
+            errors.push(error);
         }
     }
 }
 
 /// Validate dependency references and detect cycles.
-fn validate_dependencies(config: &Config, errors: &mut ValidationErrors) {
+fn validate_dependencies(
+    config: &Config,
+    source: &str,
+    span_info: Option<&SpanInfo>,
+    errors: &mut ValidationErrors,
+) {
     let group_names: HashSet<&str> = config.groups.iter().map(|g| g.name.as_str()).collect();
     let group_names_vec: Vec<&str> = group_names.iter().copied().collect();
 
     // Check that all depends_on references exist
-    for group in &config.groups {
-        for dep in &group.depends_on {
+    for (group_idx, group) in config.groups.iter().enumerate() {
+        for (dep_idx, dep) in group.depends_on.iter().enumerate() {
+            // Get span for this dependency if available
+            let dep_span = span_info.and_then(|si| si.dependency_span(source, group_idx, dep_idx));
+
             if !group_names.contains(dep.as_str()) {
                 let mut error = ValidationError::new(ValidationErrorKind::UnknownDependency {
                     group: group.name.clone(),
                     dependency: dep.clone(),
                 });
+
+                // Add span if available
+                if let Some(span) = dep_span.clone() {
+                    error = error.with_span(span);
+                }
 
                 // Add hint with suggestion or available groups
                 if let Some(suggestion) = suggest_similar(dep, &group_names_vec) {
@@ -113,9 +152,13 @@ fn validate_dependencies(config: &Config, errors: &mut ValidationErrors) {
 
             // Check for self-dependency
             if dep == &group.name {
-                errors.push(ValidationError::new(ValidationErrorKind::SelfDependency {
+                let mut error = ValidationError::new(ValidationErrorKind::SelfDependency {
                     group: group.name.clone(),
-                }));
+                });
+                if let Some(span) = dep_span {
+                    error = error.with_span(span);
+                }
+                errors.push(error);
             }
         }
     }
