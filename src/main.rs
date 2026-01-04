@@ -531,11 +531,14 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                 return Ok(());
             }
 
-            println!("{}: OK", config_path.display());
+            use yansi::Paint;
+            println!("{}: {}", config_path.display(), "OK".green().bold());
             Ok(())
         }
 
         Err(ConfigError::Validation(ref validation_errors)) => {
+            use yansi::Paint;
+
             let error_count = validation_errors.len();
 
             if json_output {
@@ -549,33 +552,41 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                 std::process::exit(1);
             }
 
-            // Pretty print each error
+            // Pretty print each error with colors
             for error in validation_errors.iter() {
-                // Format: "path:line:column: message" or "path: message"
+                // Format: "path:line:column: error: message" or "path: error: message"
                 if let Some(span) = &error.span {
-                    eprint!("{}:{}:{}: ", config_path.display(), span.line, span.column);
+                    eprint!(
+                        "{}:{}:{}: ",
+                        config_path.display().bold(),
+                        span.line.cyan(),
+                        span.column.cyan()
+                    );
                 } else {
-                    eprint!("{}: ", config_path.display());
+                    eprint!("{}: ", config_path.display().bold());
                 }
-                eprintln!("{}", error.kind);
+                eprintln!("{}: {}", "error".red().bold(), error.kind);
 
                 if let Some(hint) = &error.hint {
-                    eprintln!("               hint: {}", hint);
+                    eprintln!("               {}: {}", "hint".cyan().bold(), hint);
                 }
                 eprintln!();
             }
 
             let plural = if error_count == 1 { "error" } else { "errors" };
             eprintln!(
-                "Found {} {} in {}",
-                error_count,
-                plural,
-                config_path.display()
+                "{} {} {} in {}",
+                "Found".red().bold(),
+                error_count.red().bold(),
+                plural.red().bold(),
+                config_path.display().bold()
             );
             std::process::exit(1);
         }
 
         Err(e) => {
+            use yansi::Paint;
+
             // Non-validation errors (parse errors, IO errors, etc.)
             if json_output {
                 let result = CheckResult {
@@ -594,8 +605,17 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                 std::process::exit(1);
             }
 
-            eprintln!("{}: {}", config_path.display(), e);
-            eprintln!("\nFound 1 error in {}", config_path.display());
+            eprintln!(
+                "{}: {}: {}",
+                config_path.display().bold(),
+                "error".red().bold(),
+                e
+            );
+            eprintln!(
+                "\n{} in {}",
+                "Found 1 error".red().bold(),
+                config_path.display().bold()
+            );
             std::process::exit(1);
         }
     }
