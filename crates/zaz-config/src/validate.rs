@@ -1,39 +1,78 @@
 //! Configuration validation.
 
-use crate::{Config, ConfigError};
+use crate::error::{ValidationError, ValidationErrorKind, ValidationErrors};
+use crate::Config;
 use std::collections::{HashMap, HashSet};
+use strsim::levenshtein;
+
+/// Maximum Levenshtein distance to consider a suggestion.
+const MAX_SUGGESTION_DISTANCE: usize = 2;
+
+/// Suggest a similar name from a list of valid options.
+fn suggest_similar<'a>(unknown: &str, valid: &[&'a str]) -> Option<&'a str> {
+    valid
+        .iter()
+        .filter(|&&v| {
+            let dist = levenshtein(unknown, v);
+            dist <= MAX_SUGGESTION_DISTANCE && dist > 0
+        })
+        .min_by_key(|&&v| levenshtein(unknown, v))
+        .copied()
+}
+
+/// Format available options as a hint.
+fn format_available_hint(available: &[&str]) -> String {
+    // Filter out empty names
+    let available: Vec<&str> = available
+        .iter()
+        .copied()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if available.is_empty() {
+        "no groups are defined".to_string()
+    } else if available.len() <= 5 {
+        format!("available groups are: {}", available.join(", "))
+    } else {
+        format!(
+            "available groups are: {}, and {} more",
+            available[..4].join(", "),
+            available.len() - 4
+        )
+    }
+}
 
 /// Validate a configuration and return detailed errors.
-pub fn validate(config: &Config) -> Result<(), ConfigError> {
-    let mut errors = Vec::new();
+pub fn validate(config: &Config) -> Result<(), ValidationErrors> {
+    let mut errors = ValidationErrors::new();
 
     validate_groups(config, &mut errors);
     validate_dependencies(config, &mut errors);
     validate_patterns(config, &mut errors);
     validate_commands(config, &mut errors);
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(ConfigError::Validation(errors.join("\n")))
-    }
+    errors.into_result()
 }
 
 /// Validate group definitions.
-fn validate_groups(config: &Config, errors: &mut Vec<String>) {
+fn validate_groups(config: &Config, errors: &mut ValidationErrors) {
     let mut seen_names: HashMap<&str, usize> = HashMap::new();
 
     for (index, group) in config.groups.iter().enumerate() {
         // Check for empty group names
         if group.name.is_empty() {
-            errors.push(format!("group[{}]: name cannot be empty", index));
+            errors.push(ValidationError::new(ValidationErrorKind::EmptyGroupName {
+                index,
+            }));
         }
 
         // Check for duplicate group names
         if let Some(&first_index) = seen_names.get(group.name.as_str()) {
-            errors.push(format!(
-                "group[{}]: duplicate name '{}' (first defined at group[{}])",
-                index, group.name, first_index
+            errors.push(ValidationError::new(
+                ValidationErrorKind::DuplicateGroupName {
+                    name: group.name.clone(),
+                    first_index,
+                    second_index: index,
+                },
             ));
         } else {
             seen_names.insert(&group.name, index);
@@ -41,38 +80,53 @@ fn validate_groups(config: &Config, errors: &mut Vec<String>) {
 
         // Check for empty patterns (warning-worthy but not an error)
         if group.patterns.is_empty() && group.tasks.is_empty() && group.daemons.is_empty() {
-            errors.push(format!(
-                "group '{}': has no patterns and no commands",
-                group.name
-            ));
+            errors.push(ValidationError::new(ValidationErrorKind::EmptyGroup {
+                name: group.name.clone(),
+            }));
         }
     }
 }
 
 /// Validate dependency references and detect cycles.
-fn validate_dependencies(config: &Config, errors: &mut Vec<String>) {
+fn validate_dependencies(config: &Config, errors: &mut ValidationErrors) {
     let group_names: HashSet<&str> = config.groups.iter().map(|g| g.name.as_str()).collect();
+    let group_names_vec: Vec<&str> = group_names.iter().copied().collect();
 
     // Check that all depends_on references exist
     for group in &config.groups {
         for dep in &group.depends_on {
             if !group_names.contains(dep.as_str()) {
-                errors.push(format!(
-                    "group '{}': depends_on references unknown group '{}'",
-                    group.name, dep
-                ));
+                let mut error = ValidationError::new(ValidationErrorKind::UnknownDependency {
+                    group: group.name.clone(),
+                    dependency: dep.clone(),
+                });
+
+                // Add hint with suggestion or available groups
+                if let Some(suggestion) = suggest_similar(dep, &group_names_vec) {
+                    error = error.with_hint(format!("did you mean '{}'?", suggestion));
+                } else {
+                    error = error.with_hint(format_available_hint(&group_names_vec));
+                }
+
+                errors.push(error);
             }
 
             // Check for self-dependency
             if dep == &group.name {
-                errors.push(format!("group '{}': cannot depend on itself", group.name));
+                errors.push(ValidationError::new(ValidationErrorKind::SelfDependency {
+                    group: group.name.clone(),
+                }));
             }
         }
     }
 
     // Check for dependency cycles
     if let Some(cycle) = detect_cycle(config) {
-        errors.push(format!("dependency cycle detected: {}", cycle.join(" -> ")));
+        let cycle_str = cycle.join(" -> ");
+        errors.push(
+            ValidationError::new(ValidationErrorKind::DependencyCycle { cycle })
+                .with_hint(format!("cycle: {}", cycle_str)),
+        );
     }
 }
 
@@ -143,22 +197,26 @@ fn dfs_cycle<'a>(
 }
 
 /// Validate glob patterns.
-fn validate_patterns(config: &Config, errors: &mut Vec<String>) {
+fn validate_patterns(config: &Config, errors: &mut ValidationErrors) {
     for group in &config.groups {
         for pattern in &group.patterns {
             if let Err(e) = globset::Glob::new(pattern) {
-                errors.push(format!(
-                    "group '{}': invalid pattern '{}': {}",
-                    group.name, pattern, e
-                ));
+                errors.push(ValidationError::new(ValidationErrorKind::InvalidPattern {
+                    group: group.name.clone(),
+                    pattern: pattern.clone(),
+                    error: e.to_string(),
+                }));
             }
         }
 
         for pattern in &group.ignore {
             if let Err(e) = globset::Glob::new(pattern) {
-                errors.push(format!(
-                    "group '{}': invalid ignore pattern '{}': {}",
-                    group.name, pattern, e
+                errors.push(ValidationError::new(
+                    ValidationErrorKind::InvalidIgnorePattern {
+                        group: group.name.clone(),
+                        pattern: pattern.clone(),
+                        error: e.to_string(),
+                    },
                 ));
             }
         }
@@ -166,29 +224,27 @@ fn validate_patterns(config: &Config, errors: &mut Vec<String>) {
 }
 
 /// Validate command definitions.
-fn validate_commands(config: &Config, errors: &mut Vec<String>) {
+fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
     for group in &config.groups {
         // Check task commands
         let mut task_names: HashSet<&str> = HashSet::new();
         for task in &group.tasks {
             let name = task.name();
             if task.command.is_empty() {
-                errors.push(format!(
-                    "group '{}': task '{}' has empty command",
-                    group.name, name
+                errors.push(ValidationError::new(
+                    ValidationErrorKind::EmptyTaskCommand {
+                        group: group.name.clone(),
+                        task: name.to_string(),
+                    },
                 ));
             }
             if task_names.contains(name) {
-                // Check if the name was derived (no explicit name set)
-                let has_explicit_name = task.has_explicit_name();
-                let hint = if has_explicit_name {
-                    String::new()
-                } else {
-                    " (use explicit 'name' field to disambiguate)".to_string()
-                };
-                errors.push(format!(
-                    "group '{}': duplicate task name '{}'{}",
-                    group.name, name, hint
+                errors.push(ValidationError::new(
+                    ValidationErrorKind::DuplicateTaskName {
+                        group: group.name.clone(),
+                        name: name.to_string(),
+                        is_explicit: task.has_explicit_name(),
+                    },
                 ));
             }
             task_names.insert(name);
@@ -199,21 +255,20 @@ fn validate_commands(config: &Config, errors: &mut Vec<String>) {
         for daemon in &group.daemons {
             let name = daemon.name();
             if daemon.command.is_empty() {
-                errors.push(format!(
-                    "group '{}': daemon '{}' has empty command",
-                    group.name, name
+                errors.push(ValidationError::new(
+                    ValidationErrorKind::EmptyDaemonCommand {
+                        group: group.name.clone(),
+                        daemon: name.to_string(),
+                    },
                 ));
             }
             if daemon_names.contains(name) {
-                let has_explicit_name = daemon.has_explicit_name();
-                let hint = if has_explicit_name {
-                    String::new()
-                } else {
-                    " (use explicit 'name' field to disambiguate)".to_string()
-                };
-                errors.push(format!(
-                    "group '{}': duplicate daemon name '{}'{}",
-                    group.name, name, hint
+                errors.push(ValidationError::new(
+                    ValidationErrorKind::DuplicateDaemonName {
+                        group: group.name.clone(),
+                        name: name.to_string(),
+                        is_explicit: daemon.has_explicit_name(),
+                    },
                 ));
             }
             daemon_names.insert(name);
@@ -429,5 +484,80 @@ mod tests {
         assert!(msg.contains("duplicate task name 'cargo'"));
         // The derived one should get the hint
         assert!(msg.contains("use explicit 'name' field to disambiguate"));
+    }
+
+    #[test]
+    fn test_suggest_similar_basic() {
+        // Test the suggest_similar helper function
+        let valid = vec!["backend", "frontend", "protobuf"];
+        assert_eq!(suggest_similar("bacend", &valid), Some("backend")); // 1 char diff
+        assert_eq!(suggest_similar("frontent", &valid), Some("frontend")); // 1 char diff
+        assert_eq!(suggest_similar("protobufs", &valid), Some("protobuf")); // 1 char diff
+        assert_eq!(suggest_similar("totally_different", &valid), None); // too different
+    }
+
+    #[test]
+    fn test_unknown_dependency_with_typo_hint() {
+        // Typo in dependency name should suggest the correct name
+        let mut frontend = make_group("frontend");
+        frontend.depends_on = vec!["bacend".to_string()]; // typo: should be "backend"
+        let config = Config {
+            groups: vec![make_group("backend"), frontend],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown group 'bacend'"));
+        assert!(msg.contains("did you mean 'backend'?"));
+    }
+
+    #[test]
+    fn test_unknown_dependency_lists_available() {
+        // No close match should list available groups
+        let mut frontend = make_group("frontend");
+        frontend.depends_on = vec!["totally_different".to_string()];
+        let config = Config {
+            groups: vec![make_group("backend"), make_group("protobuf"), frontend],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown group 'totally_different'"));
+        assert!(msg.contains("available groups are:"));
+        assert!(msg.contains("backend"));
+        assert!(msg.contains("protobuf"));
+    }
+
+    #[test]
+    fn test_dependency_cycle_hint() {
+        // Cycle detection should include the cycle path in hint
+        let mut a = make_group("a");
+        a.depends_on = vec!["b".to_string()];
+        let mut b = make_group("b");
+        b.depends_on = vec!["c".to_string()];
+        let mut c = make_group("c");
+        c.depends_on = vec!["a".to_string()];
+
+        let config = Config {
+            groups: vec![a, b, c],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cycle detected"));
+        assert!(msg.contains("hint: cycle:"));
+    }
+
+    #[test]
+    fn test_format_available_hint() {
+        assert_eq!(format_available_hint(&[]), "no groups are defined");
+        assert_eq!(
+            format_available_hint(&["a", "b"]),
+            "available groups are: a, b"
+        );
+        assert_eq!(
+            format_available_hint(&["a", "b", "c", "d", "e", "f"]),
+            "available groups are: a, b, c, d, and 2 more"
+        );
     }
 }

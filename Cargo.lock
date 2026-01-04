@@ -2370,6 +2370,7 @@ dependencies = [
  "humantime",
  "serde",
  "serde_json",
+ "strsim",
  "thiserror 2.0.17",
  "toml",
  "tracing",

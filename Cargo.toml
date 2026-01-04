@@ -45,6 +45,9 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 
+# String similarity (for typo detection)
+strsim = "0.11"
+
 # Regex
 regex = "1"
 

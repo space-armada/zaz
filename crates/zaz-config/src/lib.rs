@@ -7,7 +7,7 @@ mod schema;
 pub mod user;
 mod validate;
 
-pub use error::ConfigError;
+pub use error::{ConfigError, Span, ValidationError, ValidationErrorKind, ValidationErrors};
 pub use schema::{
     Config, DaemonCommand, Group, HumanDuration, LogFormat, Settings, Signal, Silence, TaskCommand,
 };

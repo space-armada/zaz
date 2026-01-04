@@ -74,7 +74,8 @@ impl<'de> Deserialize<'de> for HumanDuration {
             type Value = HumanDuration;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a duration string (e.g., '500ms', '2s') or integer milliseconds")
+                formatter
+                    .write_str("a duration string (e.g., '500ms', '2s') or integer milliseconds")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<HumanDuration, E>
