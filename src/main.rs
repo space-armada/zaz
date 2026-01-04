@@ -482,12 +482,39 @@ async fn reload_config(socket_path: &Path) -> Result<()> {
 
 fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
     use serde::Serialize;
+    use zaz_config::{ConfigError, ValidationErrors};
 
     #[derive(Serialize)]
     struct CheckResult {
         valid: bool,
         path: String,
-        errors: Vec<String>,
+        errors: Vec<CheckError>,
+    }
+
+    #[derive(Serialize)]
+    struct CheckError {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column: Option<usize>,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+        code: String,
+    }
+
+    // Helper to convert validation errors to CheckErrors
+    fn validation_errors_to_check_errors(errors: &ValidationErrors) -> Vec<CheckError> {
+        errors
+            .iter()
+            .map(|e| CheckError {
+                line: e.span.as_ref().map(|s| s.line),
+                column: e.span.as_ref().map(|s| s.column),
+                message: e.kind.to_string(),
+                hint: e.hint.clone(),
+                code: e.code().to_string(),
+            })
+            .collect()
     }
 
     let result = zaz_config::load(config_path);
@@ -508,12 +535,59 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
             Ok(())
         }
 
-        Err(e) => {
+        Err(ConfigError::Validation(ref validation_errors)) => {
+            let error_count = validation_errors.len();
+
             if json_output {
                 let result = CheckResult {
                     valid: false,
                     path: config_path.display().to_string(),
-                    errors: vec![e.to_string()],
+                    errors: validation_errors_to_check_errors(validation_errors),
+                };
+
+                println!("{}", serde_json::to_string(&result)?);
+                std::process::exit(1);
+            }
+
+            // Pretty print each error
+            for error in validation_errors.iter() {
+                // Format: "path:line:column: message" or "path: message"
+                if let Some(span) = &error.span {
+                    eprint!("{}:{}:{}: ", config_path.display(), span.line, span.column);
+                } else {
+                    eprint!("{}: ", config_path.display());
+                }
+                eprintln!("{}", error.kind);
+
+                if let Some(hint) = &error.hint {
+                    eprintln!("               hint: {}", hint);
+                }
+                eprintln!();
+            }
+
+            let plural = if error_count == 1 { "error" } else { "errors" };
+            eprintln!(
+                "Found {} {} in {}",
+                error_count,
+                plural,
+                config_path.display()
+            );
+            std::process::exit(1);
+        }
+
+        Err(e) => {
+            // Non-validation errors (parse errors, IO errors, etc.)
+            if json_output {
+                let result = CheckResult {
+                    valid: false,
+                    path: config_path.display().to_string(),
+                    errors: vec![CheckError {
+                        line: None,
+                        column: None,
+                        message: e.to_string(),
+                        hint: None,
+                        code: "parse_error".to_string(),
+                    }],
                 };
 
                 println!("{}", serde_json::to_string(&result)?);
