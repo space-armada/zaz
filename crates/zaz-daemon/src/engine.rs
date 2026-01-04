@@ -304,7 +304,7 @@ impl Engine {
         // Create watcher configuration
         let watcher_config = WatcherConfig {
             root: config_dir.clone(),
-            debounce: Duration::from_millis(config.settings.debounce_ms),
+            debounce: config.settings.debounce.as_duration(),
             ..Default::default()
         };
 
