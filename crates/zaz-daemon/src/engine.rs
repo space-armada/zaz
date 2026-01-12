@@ -272,6 +272,10 @@ struct ManagedGroup {
 
     /// Current group state.
     state: GroupState,
+
+    /// Whether daemons have been started at least once.
+    /// Used to determine if we should start daemons (first time) or signal them (subsequent).
+    daemons_started: bool,
 }
 
 impl Engine {
@@ -377,6 +381,7 @@ impl Engine {
                     executor,
                     daemons,
                     state,
+                    daemons_started: false,
                 },
             );
         }
@@ -518,7 +523,10 @@ impl Engine {
     /// Run the initial startup sequence.
     ///
     /// This runs all tasks (respecting on_change_only) and starts all daemons.
-    pub fn startup(&mut self) -> Result<(), DaemonError> {
+    /// Groups with no tasks (or only on_change_only tasks) will have their daemons
+    /// started immediately. Groups with tasks will have daemons started after
+    /// all tasks complete successfully.
+    pub async fn startup(&mut self) -> Result<(), DaemonError> {
         tracing::info!("starting initial run");
         self.state.status = DaemonStatus::Running;
 
@@ -528,8 +536,40 @@ impl Engine {
             .with_variables(self.config.variables.clone())
             .with_root(config_dir.to_path_buf());
 
+        // Track groups that need immediate daemon startup (no runnable tasks at startup)
+        let mut groups_needing_daemon_start: Vec<String> = Vec::new();
+
         for group_name in &self.execution_order.clone() {
-            self.spawn_group_tasks(group_name, &context, false);
+            // Check if this group has any tasks that will run during startup
+            // (i.e., tasks that are not on_change_only)
+            let has_startup_tasks = self
+                .groups
+                .get(group_name)
+                .map(|g| g.config.tasks.iter().any(|t| !t.on_change_only))
+                .unwrap_or(false);
+
+            if has_startup_tasks {
+                // Group has tasks - spawn them and daemons will start when tasks complete
+                self.spawn_group_tasks(group_name, &context, false);
+            } else {
+                // Group has no startup tasks - queue daemon startup
+                let has_daemons = self
+                    .groups
+                    .get(group_name)
+                    .map(|g| !g.daemons.is_empty())
+                    .unwrap_or(false);
+
+                if has_daemons {
+                    groups_needing_daemon_start.push(group_name.clone());
+                }
+            }
+        }
+
+        // Start daemons for groups with no tasks
+        for group_name in groups_needing_daemon_start {
+            if let Err(e) = self.handle_daemon_action(&group_name, true).await {
+                tracing::error!(group = %group_name, error = %e, "failed to start daemons");
+            }
         }
 
         Ok(())
@@ -976,7 +1016,14 @@ impl Engine {
     }
 
     /// Process completed task executions and handle pending re-runs.
-    pub fn process_task_completions(&mut self) {
+    ///
+    /// When all tasks in a group complete successfully:
+    /// - If daemons haven't been started yet, start them
+    /// - If daemons are already running, signal them to restart
+    pub async fn process_task_completions(&mut self) {
+        // Collect groups that need daemon action (group_name, should_start_not_signal)
+        let mut daemon_actions: Vec<(String, bool)> = Vec::new();
+
         while let Ok(completion) = self.task_completion_rx.try_recv() {
             tracing::info!(
                 task_id = %completion.task_id,
@@ -1057,6 +1104,12 @@ impl Engine {
                             &self.notification_config,
                             crate::notify::NotifyEvent::group_complete(&completion.group_name),
                         );
+
+                        // Queue daemon action: start if not yet started, signal if already running
+                        if !group.daemons.is_empty() {
+                            let should_start = !group.daemons_started;
+                            daemon_actions.push((completion.group_name.clone(), should_start));
+                        }
                     }
                 }
             }
@@ -1106,6 +1159,94 @@ impl Engine {
 
             self.update_state();
         }
+
+        // Process daemon actions after releasing borrows from the loop
+        for (group_name, should_start) in daemon_actions {
+            if let Err(e) = self.handle_daemon_action(&group_name, should_start).await {
+                tracing::error!(group = %group_name, error = %e, "failed to handle daemon action");
+            }
+        }
+    }
+
+    /// Handle daemon startup or signal for a group after successful task completion.
+    ///
+    /// - If `should_start` is true, starts daemons (first time)
+    /// - If `should_start` is false, signals daemons to restart (subsequent times)
+    async fn handle_daemon_action(
+        &mut self,
+        group_name: &str,
+        should_start: bool,
+    ) -> Result<(), DaemonError> {
+        // Collect daemon names for logging
+        let daemon_names: Vec<String> = self
+            .groups
+            .get(group_name)
+            .map(|g| g.daemons.iter().map(|d| d.name().to_string()).collect())
+            .unwrap_or_default();
+
+        // Log what we're about to do
+        for daemon_name in &daemon_names {
+            if should_start {
+                self.push_log(
+                    LogLine::daemon(daemon_name, "starting").with_group(group_name.to_string()),
+                );
+            } else {
+                self.push_log(
+                    LogLine::daemon(daemon_name, "restarting").with_group(group_name.to_string()),
+                );
+            }
+        }
+
+        // Collect PTY readers for newly started daemons
+        let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
+            Vec::new();
+
+        if let Some(group) = self.groups.get_mut(group_name) {
+            for (idx, daemon) in group.daemons.iter_mut().enumerate() {
+                if should_start {
+                    // Apply startup delay if configured
+                    if let Some(delay) = daemon.startup_delay() {
+                        tracing::info!(
+                            daemon = %daemon.name(),
+                            delay_ms = delay.as_millis(),
+                            "waiting before starting daemon"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+
+                    // Start daemon for the first time
+                    tracing::info!(daemon = %daemon.name(), "starting daemon");
+                    daemon.start().map_err(DaemonError::Process)?;
+
+                    // Get PTY reader for streaming output
+                    if let Some(reader) = daemon.try_clone_reader() {
+                        pty_readers.push((
+                            daemon.name().to_string(),
+                            Some(group_name.to_string()),
+                            reader,
+                        ));
+                    }
+                } else {
+                    // Signal existing daemon to restart
+                    tracing::info!(daemon = %daemon.name(), "signaling daemon restart");
+                    daemon.signal_restart().map_err(DaemonError::Process)?;
+                }
+
+                group.state.daemons[idx].status = ProcessStatus::Running;
+                group.state.daemons[idx].pid = daemon.pid();
+            }
+
+            // Mark daemons as started
+            group.daemons_started = true;
+        }
+
+        // Spawn PTY reader tasks (outside the mutable borrow)
+        for (process, group, reader) in pty_readers {
+            self.spawn_pty_reader(process, group, reader);
+        }
+
+        self.update_state();
+        Ok(())
     }
 
     /// Wait for all running tasks to complete.
@@ -1113,20 +1254,20 @@ impl Engine {
     /// This polls for task completions until no tasks are running.
     pub async fn wait_for_tasks(&mut self) {
         while !self.running_tasks.is_empty() {
-            self.process_task_completions();
+            self.process_task_completions().await;
             if self.running_tasks.is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         // Final drain of any remaining completions
-        self.process_task_completions();
+        self.process_task_completions().await;
     }
 
     /// Poll for file changes and process them.
     pub async fn poll(&mut self) -> Result<bool, DaemonError> {
         // Process any completed tasks first
-        self.process_task_completions();
+        self.process_task_completions().await;
 
         // Create a combined pattern set for polling
         let combined = self.combined_patterns()?;
@@ -1475,6 +1616,7 @@ impl Engine {
                     executor,
                     daemons,
                     state,
+                    daemons_started: false,
                 },
             );
         }

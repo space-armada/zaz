@@ -222,7 +222,7 @@ async fn run_tasks(config_path: &Path) -> Result<()> {
     tracing::info!(config = %config_path.display(), "running task commands");
 
     let mut engine = Engine::new(config_path)?;
-    engine.startup()?;
+    engine.startup().await?;
     engine.wait_for_tasks().await;
 
     // Shutdown daemons since we're in task-only mode
@@ -285,7 +285,7 @@ async fn run_daemon(
     });
 
     // Run initial startup, but don't exit on failure
-    if let Err(e) = engine.startup() {
+    if let Err(e) = engine.startup().await {
         tracing::error!(error = %e, "initial startup failed, waiting for file changes to retry");
     }
 
@@ -700,7 +700,7 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
             });
 
             // Run startup (non-blocking, tasks run in background)
-            if let Err(e) = engine.startup() {
+            if let Err(e) = engine.startup().await {
                 tracing::error!(error = %e, "startup failed");
             }
 
