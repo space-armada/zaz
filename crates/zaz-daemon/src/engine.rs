@@ -343,10 +343,13 @@ impl Engine {
             group_patterns.insert(group.name.clone(), patterns);
 
             // Create executor with shell, working directory, and group env
+            // Default to config directory if no explicit working_dir is set
             let mut executor = Executor::new(config.settings.shell.clone());
-            if let Some(ref dir) = group.working_dir {
-                executor = executor.with_working_dir(dir.clone());
-            }
+            let working_dir = group
+                .working_dir
+                .clone()
+                .unwrap_or_else(|| config_dir.to_string_lossy().to_string());
+            executor = executor.with_working_dir(working_dir);
             if !group.env.is_empty() {
                 executor = executor.with_env(group.env.clone());
             }
@@ -1572,6 +1575,9 @@ impl Engine {
         self.group_patterns.clear();
         let mut new_groups = IndexMap::new();
 
+        // Get config directory for default working directory
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+
         for group in &self.config.groups {
             // Create pattern set for this group
             let patterns =
@@ -1579,10 +1585,13 @@ impl Engine {
             self.group_patterns.insert(group.name.clone(), patterns);
 
             // Create executor with shell, working directory, and group env
+            // Default to config directory if no explicit working_dir is set
             let mut executor = Executor::new(self.config.settings.shell.clone());
-            if let Some(ref dir) = group.working_dir {
-                executor = executor.with_working_dir(dir.clone());
-            }
+            let working_dir = group
+                .working_dir
+                .clone()
+                .unwrap_or_else(|| config_dir.to_string_lossy().to_string());
+            executor = executor.with_working_dir(working_dir);
             if !group.env.is_empty() {
                 executor = executor.with_env(group.env.clone());
             }
