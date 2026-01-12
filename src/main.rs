@@ -273,7 +273,7 @@ async fn run_daemon(
 
     tracing::info!(config = %config_path.display(), "starting daemon");
 
-    let mut engine = Engine::with_options(config_path, !quiet)?;
+    let mut engine = Engine::with_options(config_path, !quiet, false)?;
     let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
 
     // Start API server
@@ -673,8 +673,8 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
             let config_path = std::path::Path::new(&config_path_str);
             let socket_path = std::path::Path::new(&socket_path_str);
 
-            // Use verbose_output=false to avoid corrupting TUI display
-            let mut engine = match Engine::with_options(config_path, false) {
+            // Use embedded mode to prevent remote shutdown
+            let mut engine = match Engine::new_embedded(config_path) {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to create engine");
