@@ -40,23 +40,13 @@ impl SpanInfo {
 }
 
 /// Internal TOML config with spanned group definitions.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct SpannedConfig {
     settings: Settings,
     variables: HashMap<String, String>,
     #[serde(alias = "group")]
     groups: Vec<SpannedGroup>,
-}
-
-impl Default for SpannedConfig {
-    fn default() -> Self {
-        Self {
-            settings: Settings::default(),
-            variables: HashMap::new(),
-            groups: Vec::new(),
-        }
-    }
 }
 
 /// Internal group type with spanned name and dependencies.

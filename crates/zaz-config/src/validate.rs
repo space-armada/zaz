@@ -136,7 +136,7 @@ fn validate_dependencies(
                 });
 
                 // Add span if available
-                if let Some(span) = dep_span.clone() {
+                if let Some(span) = dep_span {
                     error = error.with_span(span);
                 }
 
