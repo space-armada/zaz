@@ -10,11 +10,21 @@ use crate::daemon::{LogLine, LogSource};
 
 /// Regex to match ANSI escape sequences that are NOT color/style codes.
 /// Keeps: `\x1b[...m` (color/style)
-/// Strips: cursor movement (A,B,C,D,E,F,G,H,f), clear (J,K), scroll (S,T), etc.
+/// Strips: cursor movement, clear, scroll, and other control sequences.
 static STRIP_ANSI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    // Match ESC[ followed by params and a non-'m' command letter
-    // Also match other ESC sequences like ESC(B for character set
-    Regex::new(r"\x1b\[[0-9;]*[ABCDEFGHJKSTfsu]|\x1b\([A-Z0-9]|\x1b[78]").unwrap()
+    // Match CSI sequences (ESC[) that are NOT color codes (ending in 'm')
+    // This includes:
+    // - Cursor movement: A,B,C,D,E,F,G,H,f (up, down, forward, back, etc.)
+    // - Erase: J,K (display, line)
+    // - Scroll: S,T (up, down)
+    // - Line operations: L,M (insert, delete lines)
+    // - Character operations: P,X,@ (delete, erase, insert chars)
+    // - Mode: h,l (set/reset mode, including ?25h/?25l for cursor)
+    // - Scrolling region: r
+    // - Cursor save/restore: s,u
+    // - Also match ESC(X for character set and ESC7/8 for cursor save/restore
+    // - Also match sequences with ? prefix like ESC[?25l
+    Regex::new(r"\x1b\[\??[0-9;]*[ABCDEFGHJKLMPSTXfhlrsu@]|\x1b\([A-Z0-9]|\x1b[78]").unwrap()
 });
 
 /// Sanitize a log line by stripping terminal control sequences that would
@@ -24,8 +34,8 @@ fn sanitize_log_content(content: &str) -> String {
     // Strip problematic escape sequences
     let sanitized = STRIP_ANSI_REGEX.replace_all(content, "");
 
-    // Also strip carriage returns which can cause display issues
-    sanitized.replace('\r', "")
+    // Strip carriage returns and backspaces which can cause display issues
+    sanitized.replace(['\r', '\x08'], "")
 }
 
 /// A stored log entry with source info.
@@ -806,6 +816,31 @@ mod tests {
         let input = "\x1b[2K\x1b[1G\x1b[32mDone\x1b[0m\r";
         let sanitized = sanitize_log_content(input);
         assert_eq!(sanitized, "\x1b[32mDone\x1b[0m");
+
+        // Hide/show cursor should be stripped
+        let input = "\x1b[?25lBuilding...\x1b[?25h";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Building...");
+
+        // Delete/insert characters should be stripped
+        let input = "Test\x1b[2P\x1b[3@output";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Testoutput");
+
+        // Backspaces should be stripped
+        let input = "abc\x08\x08xy";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "abcxy");
+
+        // Insert/delete lines should be stripped
+        let input = "\x1b[2L\x1b[1MContent";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // Scrolling region should be stripped
+        let input = "\x1b[1;24rScrolled content";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Scrolled content");
     }
 
     #[test]
