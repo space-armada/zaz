@@ -1224,7 +1224,20 @@ impl Engine {
 
         if let Some(group) = self.groups.get_mut(group_name) {
             for (idx, daemon) in group.daemons.iter_mut().enumerate() {
-                if should_start {
+                // Check if daemon is actually running before deciding what to do
+                let is_running = daemon.is_running();
+
+                if should_start || !is_running {
+                    // Start daemon if:
+                    // - This is the first time (should_start=true), OR
+                    // - The daemon is not running (crashed before file change)
+                    if !should_start && !is_running {
+                        tracing::info!(
+                            daemon = %daemon.name(),
+                            "daemon not running, starting instead of signaling"
+                        );
+                    }
+
                     // Apply startup delay if configured
                     if let Some(delay) = daemon.startup_delay() {
                         tracing::info!(
@@ -1235,7 +1248,7 @@ impl Engine {
                         tokio::time::sleep(delay).await;
                     }
 
-                    // Start daemon for the first time
+                    // Start daemon
                     tracing::info!(daemon = %daemon.name(), "starting daemon");
                     daemon.start().map_err(DaemonError::Process)?;
 

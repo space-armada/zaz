@@ -39,6 +39,10 @@ struct Cli {
     #[arg(long)]
     no_autostart: bool,
 
+    /// Write debug logs to a file (works in both TUI and daemon modes)
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -117,25 +121,70 @@ impl TuiOptions {
     }
 }
 
+/// Initialize tracing with optional file logging.
+///
+/// Returns a guard that must be kept alive for the duration of the program
+/// when file logging is enabled (to ensure logs are flushed).
+fn init_tracing(
+    debug: bool,
+    is_tui_mode: bool,
+    log_file: Option<&Path>,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::prelude::*;
+
+    let filter = if debug { "debug,globset=info" } else { "info" };
+    let env_filter = tracing_subscriber::EnvFilter::new(filter);
+
+    match (is_tui_mode, log_file) {
+        // TUI mode with file logging: log to file only
+        (true, Some(path)) => {
+            let file = std::fs::File::create(path).expect("Failed to create log file");
+            let (non_blocking, guard) = tracing_appender::non_blocking(file);
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .init();
+            Some(guard)
+        }
+        // Non-TUI mode with file logging: log to both console and file
+        (false, Some(path)) => {
+            let file = std::fs::File::create(path).expect("Failed to create log file");
+            let (non_blocking, guard) = tracing_appender::non_blocking(file);
+
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false);
+
+            let console_layer = tracing_subscriber::fmt::layer().with_target(false);
+
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(console_layer)
+                .with(file_layer)
+                .init();
+            Some(guard)
+        }
+        // Non-TUI mode without file logging: console only
+        (false, None) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_target(false)
+                .init();
+            None
+        }
+        // Otherwise, no logging
+        (true, None) => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Determine if we're running in TUI mode (default command with no subcommand)
     let is_tui_mode = cli.command.is_none();
-
-    // Initialize logging - suppress for TUI mode to avoid corrupting display
-    if !is_tui_mode {
-        let filter = if cli.debug {
-            "debug,globset=info"
-        } else {
-            "info"
-        };
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .init();
-    }
+    let _log_guard = init_tracing(cli.debug, is_tui_mode, cli.log_file.as_deref());
 
     // Helper to get socket path: CLI override, or config-specific path
     let get_socket_path = |config_path: &Path| -> PathBuf {
