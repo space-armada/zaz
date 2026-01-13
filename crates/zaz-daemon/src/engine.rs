@@ -603,8 +603,7 @@ impl Engine {
                     "group waiting for dependencies"
                 );
                 self.set_group_status(group_name, GroupStatus::Waiting);
-                self.waiting_groups
-                    .insert(group_name.clone(), unready_deps);
+                self.waiting_groups.insert(group_name.clone(), unready_deps);
                 continue;
             }
 
@@ -1442,7 +1441,8 @@ impl Engine {
     /// for later rather than sleeping. This allows the main loop to remain responsive
     /// to API commands while waiting for restart delays.
     pub async fn check_daemons(&mut self) -> Result<(), DaemonError> {
-        let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> = Vec::new();
+        let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
+            Vec::new();
 
         let now = Instant::now();
         for (group_name, group) in self.groups.iter_mut() {
@@ -1497,8 +1497,7 @@ impl Engine {
                         .log_store
                         .sender()
                         .send(
-                            LogLine::daemon(daemon.name(), log_msg)
-                                .with_group(group_name.clone()),
+                            LogLine::daemon(daemon.name(), log_msg).with_group(group_name.clone()),
                         )
                         .await;
 
