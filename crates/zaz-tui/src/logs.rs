@@ -9,32 +9,48 @@ use std::sync::LazyLock;
 use crate::daemon::{LogLine, LogSource};
 
 /// Regex to match ANSI escape sequences that are NOT color/style codes.
-/// Keeps: `\x1b[...m` (color/style)
-/// Strips: cursor movement, clear, scroll, and other control sequences.
+/// Keeps: `\x1b[...m` (SGR color/style codes)
+/// Strips: everything else that could corrupt TUI display.
 static STRIP_ANSI_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    // Match CSI sequences (ESC[) that are NOT color codes (ending in 'm')
-    // This includes:
-    // - Cursor movement: A,B,C,D,E,F,G,H,f (up, down, forward, back, etc.)
-    // - Erase: J,K (display, line)
-    // - Scroll: S,T (up, down)
-    // - Line operations: L,M (insert, delete lines)
-    // - Character operations: P,X,@ (delete, erase, insert chars)
-    // - Mode: h,l (set/reset mode, including ?25h/?25l for cursor)
-    // - Scrolling region: r
-    // - Cursor save/restore: s,u
-    // - Also match ESC(X for character set and ESC7/8 for cursor save/restore
-    // - Also match sequences with ? prefix like ESC[?25l
-    Regex::new(r"\x1b\[\??[0-9;]*[ABCDEFGHJKLMPSTXfhlrsu@]|\x1b\([A-Z0-9]|\x1b[78]").unwrap()
+    Regex::new(concat!(
+        // CSI: ESC[ or 0x9B, with optional params/intermediates, final byte NOT 'm'
+        // Parameter bytes: 0x30-0x3F, Intermediate bytes: 0x20-0x2F, Final: 0x40-0x7E (not m)
+        r"\x1b\[[\x20-\x3f]*[\x40-\x6c\x6e-\x7e]",
+        r"|\x9b[\x20-\x3f]*[\x40-\x6c\x6e-\x7e]",
+        // Character set: ESC with ( ) * + - . / and designator
+        r"|\x1b[()*.+\-./].",
+        // nF sequences: ESC + SP ! " # $ % & followed by char (0x20-0x26)
+        r"|\x1b[\x20-\x26].",
+        // Fe escapes (ESC + 0x40-0x5F) - all except [ ] P X ^ _ (multi-char introducers)
+        r"|\x1b[@A-OQ-WYZ\x5c]",
+        // Fs escapes (ESC + 0x60-0x7E) - all lowercase except m (0x6D)
+        r"|\x1b[\x60-\x6c\x6e-\x7e]",
+        // Fp escapes (ESC + 0x30-0x3F) - private use, includes 7,8,=,>,etc
+        r"|\x1b[\x30-\x3f]",
+        // OSC: ESC] or 0x9D, terminated by BEL (0x07) or ST (ESC\ or 0x9C)
+        r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?",
+        r"|\x9d[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?",
+        // DCS, SOS, APC, PM: ESC P/X/_/^ or C1 equivalents, terminated by ST
+        r"|\x1b[PX_^][^\x1b]*(?:\x1b\\)?",
+        r"|[\x90\x98\x9e\x9f][^\x1b\x9c]*(?:\x1b\\|\x9c)?",
+        // Other 8-bit C1 controls (0x80-0x9F)
+        r"|[\x80-\x9a\x9c]",
+        // C0 controls (except TAB 0x09, LF 0x0A, ESC 0x1B) and DEL
+        r"|[\x00-\x08\x0b-\x0c\x0e-\x1a\x1c-\x1f\x7f]",
+        // Unicode control characters that affect display
+        // U+200B-U+200F: zero-width/formatting, U+2028-U+2029: line/para sep
+        // U+202A-U+202E: bidi controls, U+2060-U+206F: word joiner etc, U+FEFF: BOM
+        r"|[\u{200B}-\u{200F}\u{2028}-\u{2029}\u{202A}-\u{202E}\u{2060}-\u{206F}\u{FEFF}]",
+    ))
+    .unwrap()
 });
 
 /// Sanitize a log line by stripping terminal control sequences that would
-/// corrupt the TUI display (cursor movement, screen clearing, etc.)
-/// while preserving ANSI color codes.
+/// corrupt the TUI display while preserving ANSI SGR color codes.
 fn sanitize_log_content(content: &str) -> String {
-    // Strip problematic escape sequences
+    // Strip escape sequences and control characters
     let sanitized = STRIP_ANSI_REGEX.replace_all(content, "");
-
-    // Strip carriage returns and backspaces which can cause display issues
+    // Also strip carriage returns (progress overwrites) and backspaces
     sanitized.replace(['\r', '\x08'], "")
 }
 
@@ -841,6 +857,153 @@ mod tests {
         let input = "\x1b[1;24rScrolled content";
         let sanitized = sanitize_log_content(input);
         assert_eq!(sanitized, "Scrolled content");
+
+        // OSC sequences with BEL terminator should be stripped
+        let input = "\x1b]0;Window Title\x07Some content";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Some content");
+
+        // OSC sequences with ST terminator should be stripped
+        let input = "\x1b]0;Window Title\x1b\\Some content";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Some content");
+
+        // Hyperlink OSC sequences should be stripped
+        let input = "\x1b]8;;https://example.com\x07Link Text\x1b]8;;\x07 more text";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Link Text more text");
+
+        // ESC SP sequences are stripped (7/8-bit control mode switches)
+        let input = "\x1b Psome device control\x1b\\Content";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "some device controlContent");
+
+        // Actual DCS sequence
+        let input = "\x1bPsome;data\x1b\\Content";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // APC sequences should be stripped
+        let input = "\x1b_application program command\x1b\\Content";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // PM sequences should be stripped
+        let input = "\x1b^privacy message\x1b\\Content";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // Mix of OSC and color codes - colors preserved
+        let input = "\x1b]8;;url\x07\x1b[31mRed Link\x1b[0m\x1b]8;;\x07";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "\x1b[31mRed Link\x1b[0m");
+
+        // VPA (line position absolute) - \x1b[nd
+        let input = "Start\x1b[5dMiddle";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "StartMiddle");
+
+        // HPR (character position relative) - \x1b[na
+        let input = "Start\x1b[10aMiddle";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "StartMiddle");
+
+        // REP (repeat previous character) - \x1b[nb
+        let input = "X\x1b[5bY";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "XY");
+
+        // CHA (cursor horizontal absolute) - \x1b[nG
+        let input = "Start\x1b[20GEnd";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "StartEnd");
+
+        // Non-CSI escape sequences: IND, NEL, RI, HTS
+        let input = "Line1\x1bDLine2"; // IND (index)
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Line1Line2");
+
+        let input = "Line1\x1bELine2"; // NEL (next line)
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Line1Line2");
+
+        let input = "Line1\x1bMLine2"; // RI (reverse index)
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Line1Line2");
+
+        let input = "Tab\x1bHhere"; // HTS (horizontal tab set)
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Tabhere");
+
+        // CBT (cursor backward tabulation) - \x1b[nZ
+        let input = "Start\x1b[2ZEnd";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "StartEnd");
+
+        // CHT (cursor forward tabulation) - \x1b[nI
+        let input = "Start\x1b[3IEnd";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "StartEnd");
+
+        // Window manipulation - \x1b[nt
+        let input = "\x1b[22tContent\x1b[23t";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // Keypad modes - \x1b= and \x1b>
+        let input = "\x1b=Content\x1b>";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // RIS (full reset) - \x1bc
+        let input = "\x1bcContent";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // C0 controls (NUL, etc.) should be stripped
+        let input = "A\x00\x01\x02B";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "AB");
+
+        // DEL (0x7F) should be stripped
+        let input = "A\x7fB";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "AB");
+
+        // Tab (0x09) should be preserved
+        let input = "A\tB";
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "A\tB");
+
+        // Character set designation variants
+        let input = "\x1b)0\x1b*B\x1b+AContent"; // G1, G2, G3 sets
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // Hash sequences (DECALN, etc.)
+        let input = "\x1b#8Content"; // DECALN screen alignment test
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // Percent sequences (character set switching)
+        let input = "\x1b%@Content\x1b%G"; // Switch to/from UTF-8
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // CSI with intermediate bytes
+        let input = "Start\x1b[0$xEnd"; // DECSCA with $ intermediate
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "StartEnd");
+
+        // Fe escapes (ESC + uppercase)
+        let input = "\x1b@\x1bA\x1bBContent"; // Various Fe sequences
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
+
+        // Fp escapes (ESC + digits/symbols 0x30-0x3F)
+        let input = "\x1b0\x1b1\x1b<Content"; // Private use escapes
+        let sanitized = sanitize_log_content(input);
+        assert_eq!(sanitized, "Content");
     }
 
     #[test]
