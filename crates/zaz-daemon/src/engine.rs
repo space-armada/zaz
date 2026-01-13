@@ -1275,8 +1275,8 @@ impl Engine {
                 group.state.daemons[idx].pid = daemon.pid();
             }
 
-            // Mark daemons as started
             group.daemons_started = true;
+            group.state.status = GroupStatus::Ready;
         }
 
         // Spawn PTY reader tasks (outside the mutable borrow)
