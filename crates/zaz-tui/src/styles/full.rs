@@ -385,6 +385,7 @@ impl FullStyle {
         for group in app.state.groups.values() {
             let status_icon = match group.status {
                 zaz_daemon::GroupStatus::Pending => "○",
+                zaz_daemon::GroupStatus::Waiting => "◌",
                 zaz_daemon::GroupStatus::Running => {
                     if app.blink_on() {
                         "●"
@@ -394,13 +395,16 @@ impl FullStyle {
                 }
                 zaz_daemon::GroupStatus::Ready => "✓",
                 zaz_daemon::GroupStatus::Failed => "✗",
+                zaz_daemon::GroupStatus::Skipped => "⊘",
             };
 
             let status_color = match group.status {
                 zaz_daemon::GroupStatus::Pending => Color::White,
+                zaz_daemon::GroupStatus::Waiting => Color::Cyan,
                 zaz_daemon::GroupStatus::Running => Color::Yellow,
                 zaz_daemon::GroupStatus::Ready => Color::Green,
                 zaz_daemon::GroupStatus::Failed => Color::Red,
+                zaz_daemon::GroupStatus::Skipped => Color::DarkGray,
             };
 
             let is_selected = flat_idx == app.selected_item;
@@ -416,9 +420,11 @@ impl FullStyle {
 
             let group_status_text = match group.status {
                 zaz_daemon::GroupStatus::Pending => "pending",
+                zaz_daemon::GroupStatus::Waiting => "waiting",
                 zaz_daemon::GroupStatus::Running => "running",
                 zaz_daemon::GroupStatus::Ready => "ready",
                 zaz_daemon::GroupStatus::Failed => "failed",
+                zaz_daemon::GroupStatus::Skipped => "skipped",
             };
 
             items.push(ListItem::new(Line::from(vec![
