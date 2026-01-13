@@ -9,7 +9,7 @@ mod pty;
 mod signal;
 mod task;
 
-pub use daemon::{Daemon, DaemonState};
+pub use daemon::{Daemon, DaemonExitInfo, DaemonState};
 pub use error::ProcessError;
 pub use executor::{CommandOutput, Executor, OutputLine};
 pub use pty::ManagedChild;

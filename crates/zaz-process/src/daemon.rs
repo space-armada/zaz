@@ -15,6 +15,15 @@ const MAX_RESTART_DELAY: Duration = Duration::from_secs(8);
 /// Multiplier for exponential backoff.
 const BACKOFF_MULTIPLIER: u32 = 2;
 
+/// Information about a daemon that has exited.
+#[derive(Debug)]
+pub struct DaemonExitInfo {
+    /// How long the daemon was running before it exited.
+    pub duration: Duration,
+    /// The exit code, if available.
+    pub exit_code: Option<i32>,
+}
+
 /// State of a daemon process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonState {
@@ -141,17 +150,20 @@ impl Daemon {
     }
 
     /// Check if the daemon has exited and handle restart logic.
-    pub async fn check(&mut self) -> Result<bool, ProcessError> {
+    ///
+    /// Returns `Some(DaemonExitInfo)` if the daemon has exited, `None` if still running.
+    pub async fn check(&mut self) -> Result<Option<DaemonExitInfo>, ProcessError> {
         let Some(child) = &mut self.child else {
-            return Ok(false);
+            return Ok(None);
         };
 
         match child.try_wait() {
             Ok(Some(status)) => {
-                let ran_long = self
+                let duration = self
                     .last_start
-                    .map(|t| t.elapsed() > MAX_RESTART_DELAY)
-                    .unwrap_or(false);
+                    .map(|t| t.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                let ran_long = duration > MAX_RESTART_DELAY;
 
                 if ran_long || status.success() {
                     // Reset backoff on long run or clean exit
@@ -171,9 +183,12 @@ impl Daemon {
 
                 self.child = None;
                 self.state = DaemonState::Stopped;
-                Ok(true)
+                Ok(Some(DaemonExitInfo {
+                    duration,
+                    exit_code: status.code(),
+                }))
             }
-            Ok(None) => Ok(false), // Still running
+            Ok(None) => Ok(None), // Still running
             Err(e) => Err(ProcessError::Spawn(e)),
         }
     }
