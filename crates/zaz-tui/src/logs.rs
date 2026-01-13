@@ -51,7 +51,10 @@ fn sanitize_log_content(content: &str) -> String {
     // Strip escape sequences and control characters
     let sanitized = STRIP_ANSI_REGEX.replace_all(content, "");
     // Also strip carriage returns (progress overwrites) and backspaces
-    sanitized.replace(['\r', '\x08'], "")
+    let sanitized = sanitized.replace(['\r', '\x08'], "");
+    // Convert tabs to spaces to avoid terminal tab expansion misalignment
+    // Use 4 spaces per tab as a reasonable default for code output
+    sanitized.replace('\t', "    ")
 }
 
 /// A stored log entry with source info.
@@ -970,10 +973,10 @@ mod tests {
         let sanitized = sanitize_log_content(input);
         assert_eq!(sanitized, "AB");
 
-        // Tab (0x09) should be preserved
+        // Tab (0x09) should be converted to spaces
         let input = "A\tB";
         let sanitized = sanitize_log_content(input);
-        assert_eq!(sanitized, "A\tB");
+        assert_eq!(sanitized, "A    B");
 
         // Character set designation variants
         let input = "\x1b)0\x1b*B\x1b+AContent"; // G1, G2, G3 sets
