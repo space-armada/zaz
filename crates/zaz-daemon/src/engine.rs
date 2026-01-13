@@ -967,17 +967,7 @@ impl Engine {
 
         // Dedupe affected groups to only root groups, because dependents get
         // triggered through cascade
-        let affected_set: std::collections::HashSet<&String> = affected_groups.iter().collect();
-        let roots: Vec<String> = affected_groups
-            .iter()
-            .filter(|g| {
-                let deps = self.get_group_dependencies(g);
-                // Keep this group only if none of its dependencies are also affected
-                // TODO(ripta): Is this the right call?
-                !deps.iter().any(|dep| affected_set.contains(dep))
-            })
-            .cloned()
-            .collect();
+        let roots = filter_affected_to_roots(&affected_groups, |g| self.get_group_dependencies(g));
 
         tracing::info!(
             files = changed_paths.len(),
@@ -2238,6 +2228,29 @@ impl Engine {
     }
 }
 
+/// Filter affected groups to only root groups (groups with no affected dependencies).
+///
+/// When multiple groups are affected by file changes, we only want to trigger the "root"
+/// groups - those whose dependencies are NOT also affected. Dependents will be triggered
+/// through the cascade mechanism when their dependencies complete.
+fn filter_affected_to_roots<F>(affected_groups: &[String], get_dependencies: F) -> Vec<String>
+where
+    F: Fn(&str) -> Vec<String>,
+{
+    use std::collections::HashSet;
+
+    let affected_set: HashSet<&String> = affected_groups.iter().collect();
+    affected_groups
+        .iter()
+        .filter(|g| {
+            let deps = get_dependencies(g);
+            // Keep this group only if none of its dependencies are also affected
+            !deps.iter().any(|dep| affected_set.contains(dep))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Calculate group status from task states.
 ///
 /// Returns `None` if there are still tasks running, otherwise returns the final status.
@@ -2841,5 +2854,117 @@ mod tests {
 
         let result = calculate_group_status_from_tasks(&tasks, false);
         assert_eq!(result, Some(GroupStatus::Ready));
+    }
+
+    // =========================================================================
+    // filter_affected_to_roots() tests
+    // =========================================================================
+
+    #[test]
+    fn test_filter_roots_single_group_no_deps() {
+        let affected = vec!["a".to_string()];
+        let get_deps = |_: &str| Vec::new();
+
+        let roots = filter_affected_to_roots(&affected, get_deps);
+        assert_eq!(roots, vec!["a"]);
+    }
+
+    #[test]
+    fn test_filter_roots_independent_groups() {
+        let affected = vec!["a".to_string(), "b".to_string()];
+        let get_deps = |_: &str| Vec::new();
+
+        let roots = filter_affected_to_roots(&affected, get_deps);
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains(&"a".to_string()));
+        assert!(roots.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_filter_roots_dependent_filtered_out() {
+        // a depends on b, both affected -> only b is root
+        let affected = vec!["a".to_string(), "b".to_string()];
+        let get_deps = |g: &str| {
+            if g == "a" {
+                vec!["b".to_string()]
+            } else {
+                vec![]
+            }
+        };
+
+        let roots = filter_affected_to_roots(&affected, get_deps);
+        assert_eq!(roots, vec!["b"]);
+    }
+
+    #[test]
+    fn test_filter_roots_chain_only_first() {
+        // a -> b -> c, all affected -> only c is root
+        let affected = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let get_deps = |g: &str| match g {
+            "a" => vec!["b".to_string()],
+            "b" => vec!["c".to_string()],
+            _ => vec![],
+        };
+
+        let roots = filter_affected_to_roots(&affected, get_deps);
+        assert_eq!(roots, vec!["c"]);
+    }
+
+    #[test]
+    fn test_filter_roots_diamond_both_middle() {
+        // Diamond: a -> b,c -> d. If b,c,d affected, only d is root
+        let affected = vec!["b".to_string(), "c".to_string(), "d".to_string()];
+        let get_deps = |g: &str| match g {
+            "a" => vec!["b".to_string(), "c".to_string()],
+            "b" => vec!["d".to_string()],
+            "c" => vec!["d".to_string()],
+            _ => vec![],
+        };
+
+        let roots = filter_affected_to_roots(&affected, get_deps);
+        assert_eq!(roots, vec!["d"]);
+    }
+
+    #[test]
+    fn test_filter_roots_partial_chain() {
+        // a -> b -> c, only a and c affected -> both are roots (b not affected)
+        let affected = vec!["a".to_string(), "c".to_string()];
+        let get_deps = |g: &str| match g {
+            "a" => vec!["b".to_string()],
+            "b" => vec!["c".to_string()],
+            _ => vec![],
+        };
+
+        let roots = filter_affected_to_roots(&affected, get_deps);
+        // a's dependency (b) is not affected, so a is a root
+        // c has no dependencies, so c is a root
+        assert_eq!(roots.len(), 2);
+        assert!(roots.contains(&"a".to_string()));
+        assert!(roots.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_filter_roots_unaffected_dependency() {
+        // a depends on b, but only a is affected -> a is root
+        let affected = vec!["a".to_string()];
+        let get_deps = |g: &str| {
+            if g == "a" {
+                vec!["b".to_string()]
+            } else {
+                vec![]
+            }
+        };
+
+        let roots = filter_affected_to_roots(&affected, get_deps);
+        assert_eq!(roots, vec!["a"]);
+    }
+
+    #[test]
+    fn test_filter_roots_empty_affected() {
+        let affected: Vec<String> = vec![];
+        let get_deps = |_: &str| Vec::new();
+
+        let roots = filter_affected_to_roots(&affected, get_deps);
+        assert!(roots.is_empty());
     }
 }
