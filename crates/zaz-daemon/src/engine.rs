@@ -2179,14 +2179,21 @@ impl Engine {
         }
     }
 
-    /// Cascade daemon restart signals to dependents.
+    /// Cascade restart to dependent groups.
     ///
-    /// When a group's daemons are signaled to restart, this propagates
-    /// the restart signal to all dependent groups' daemons (transitively).
+    /// When a group is restarted, this propagates the restart to all dependent
+    /// groups (transitively). For each dependent:
+    /// - If it has startup tasks: spawn those tasks (cascade continues when they complete)
+    /// - If it has no tasks but has daemons: signal daemons directly and continue cascade
     async fn cascade_daemon_restart(&mut self, source_group: &str) -> Result<(), DaemonError> {
         let Some(dependents) = self.dependents.get(source_group).cloned() else {
             return Ok(());
         };
+
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        let context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir.to_path_buf());
 
         for dependent in dependents {
             // Only cascade if the dependent has daemons that are already running
@@ -2197,23 +2204,42 @@ impl Engine {
                 .unwrap_or(false);
 
             if should_cascade {
-                tracing::info!(
-                    from = %source_group,
-                    to = %dependent,
-                    "cascading daemon restart signal"
-                );
+                // Check if dependent has startup tasks that need to run first
+                let has_startup_tasks = self
+                    .groups
+                    .get(&dependent)
+                    .map(|g| g.config.tasks.iter().any(|t| !t.on_change_only))
+                    .unwrap_or(false);
 
-                // Signal the daemons to restart
-                if let Err(e) = self.signal_group_daemons(&dependent) {
-                    tracing::error!(
-                        group = %dependent,
-                        error = %e,
-                        "failed to cascade daemon restart"
+                if has_startup_tasks {
+                    tracing::info!(
+                        from = %source_group,
+                        to = %dependent,
+                        "cascading restart: spawning tasks for dependent group"
                     );
-                }
 
-                // Recursively cascade to further dependents
-                Box::pin(self.cascade_daemon_restart(&dependent)).await?;
+                    // Spawn tasks - when they complete, daemons will be signaled
+                    // and cascade will continue through process_task_completions
+                    self.spawn_group_tasks(&dependent, &context, false);
+                } else {
+                    tracing::info!(
+                        from = %source_group,
+                        to = %dependent,
+                        "cascading restart: signaling daemons directly (no tasks)"
+                    );
+
+                    // No tasks - signal daemons directly
+                    if let Err(e) = self.signal_group_daemons(&dependent) {
+                        tracing::error!(
+                            group = %dependent,
+                            error = %e,
+                            "failed to cascade daemon restart"
+                        );
+                    }
+
+                    // Recursively cascade to further dependents
+                    Box::pin(self.cascade_daemon_restart(&dependent)).await?;
+                }
             }
         }
 
