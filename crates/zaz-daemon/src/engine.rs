@@ -1355,8 +1355,8 @@ impl Engine {
                 }
 
                 // If daemon exited, update the state and schedule restart
-                let exited = daemon.check().await.map_err(DaemonError::Process)?;
-                if exited {
+                let exit_info = daemon.check().await.map_err(DaemonError::Process)?;
+                if let Some(exit_info) = exit_info {
                     group.state.daemons[idx].status = ProcessStatus::Backoff;
                     group.state.daemons[idx].pid = None;
 
@@ -1366,6 +1366,25 @@ impl Engine {
                         delay_ms = delay.as_millis(),
                         "daemon exited, scheduling restart"
                     );
+
+                    // Log the daemon exit with duration and exit code
+                    let exit_code_str = exit_info
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let log_msg = format!(
+                        "exited after {:.2}s (exit code: {})",
+                        exit_info.duration.as_secs_f64(),
+                        exit_code_str
+                    );
+                    let _ = self
+                        .log_store
+                        .sender()
+                        .send(
+                            LogLine::daemon(daemon.name(), log_msg)
+                                .with_group(group_name.clone()),
+                        )
+                        .await;
 
                     group.pending_restarts[idx] = Some(now + delay);
                 }
