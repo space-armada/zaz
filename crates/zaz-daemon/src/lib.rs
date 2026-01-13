@@ -3,6 +3,7 @@
 //! Provides a Unix socket API for controlling zaz and querying state.
 
 mod api;
+mod dependency;
 mod engine;
 mod error;
 mod log_layer;

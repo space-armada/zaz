@@ -62,13 +62,6 @@ impl LogStore {
         }
     }
 
-    /// Set maximum lines to keep per process.
-    #[allow(dead_code)]
-    pub fn with_max_lines(mut self, max_lines: usize) -> Self {
-        self.max_lines = max_lines;
-        self
-    }
-
     /// Set a callback for verbose output.
     pub fn with_verbose_callback<F>(mut self, callback: F) -> Self
     where
@@ -180,17 +173,21 @@ impl LogStore {
             })
             .unwrap_or_default()
     }
-
-    /// Clear all logs.
-    #[cfg(test)]
-    pub fn clear(&mut self) {
-        self.buffers.clear();
-    }
 }
 
 impl Default for LogStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Test-only methods for LogStore.
+#[cfg(test)]
+impl LogStore {
+    /// Set maximum lines to keep per process.
+    pub fn with_max_lines(mut self, max_lines: usize) -> Self {
+        self.max_lines = max_lines;
+        self
     }
 }
 
