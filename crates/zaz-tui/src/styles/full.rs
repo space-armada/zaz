@@ -44,9 +44,13 @@ impl StyleRenderer for FullStyle {
             .constraints([Constraint::Min(0), Constraint::Length(status_bar_height)])
             .split(area);
 
-        // Calculate the width needed for the groups pane based on content
+        // Calculate the width needed for the groups pane based on content.
+        // Uses a high-water mark so the sidebar only grows, never shrinks (prevents jarring resizes).
+        // Max width is 1/3 of terminal to prioritize log visibility.
         let groups_width = self.calculate_groups_width(app);
-        let left_width = (groups_width + 4).min(area.width / 2).max(20);
+        let calculated_width = (groups_width + 4).min(area.width / 3).max(20);
+        let left_width = calculated_width.max(app.sidebar_min_width);
+        app.sidebar_min_width = left_width;
 
         // Split main content: groups on left + logs on right
         let horizontal_chunks = Layout::default()

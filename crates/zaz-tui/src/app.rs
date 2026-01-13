@@ -104,6 +104,8 @@ pub struct App {
     pub log_scroll: usize,
     /// Visible height of log pane (updated during render) for Full style.
     pub log_visible_height: usize,
+    /// Sidebar width high-water mark (only grows, never shrinks) for Full style.
+    pub sidebar_min_width: u16,
     /// Per-pane scroll offsets (for Multi Pane style).
     pub pane_scroll: HashMap<usize, usize>,
     /// Per-pane follow mode (for Multi Pane style).
@@ -206,6 +208,7 @@ impl App {
             panes_per_page: 0, // 0 = auto (2 narrow, 3 wide), set during first render
             log_scroll: 0,
             log_visible_height: 20, // Default, updated during render
+            sidebar_min_width: 0,   // High-water mark, grows but never shrinks
             pane_scroll: HashMap::new(),
             pane_follow: HashMap::new(),
             pane_visible_height: HashMap::new(),
