@@ -2326,7 +2326,39 @@ fn topological_sort(groups: &[Group]) -> Result<Vec<String>, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zaz_config::Group;
+    use zaz_config::{Group, Silence};
+
+    // =========================================================================
+    // should_suppress() tests
+    // =========================================================================
+
+    #[test]
+    fn test_should_suppress_none_allows_all() {
+        assert!(!should_suppress(Silence::None, false)); // stdout allowed
+        assert!(!should_suppress(Silence::None, true)); // stderr allowed
+    }
+
+    #[test]
+    fn test_should_suppress_all_blocks_all() {
+        assert!(should_suppress(Silence::All, false)); // stdout blocked
+        assert!(should_suppress(Silence::All, true)); // stderr blocked
+    }
+
+    #[test]
+    fn test_should_suppress_stdout_only() {
+        assert!(should_suppress(Silence::Stdout, false)); // stdout blocked
+        assert!(!should_suppress(Silence::Stdout, true)); // stderr allowed
+    }
+
+    #[test]
+    fn test_should_suppress_stderr_only() {
+        assert!(!should_suppress(Silence::Stderr, false)); // stdout allowed
+        assert!(should_suppress(Silence::Stderr, true)); // stderr blocked
+    }
+
+    // =========================================================================
+    // topological_sort() tests
+    // =========================================================================
 
     #[test]
     fn test_topological_sort_simple() {
@@ -2363,5 +2395,149 @@ mod tests {
         assert_eq!(order.len(), 2);
         assert!(order.contains(&"a".to_string()));
         assert!(order.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_topological_sort_cyclic_dependency() {
+        let groups = vec![
+            Group {
+                name: "a".to_string(),
+                depends_on: vec!["b".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "b".to_string(),
+                depends_on: vec!["a".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let result = topological_sort(&groups);
+        assert!(matches!(result, Err(DaemonError::CyclicDependency(_))));
+    }
+
+    #[test]
+    fn test_topological_sort_self_dependency() {
+        let groups = vec![Group {
+            name: "a".to_string(),
+            depends_on: vec!["a".to_string()],
+            ..Default::default()
+        }];
+
+        let result = topological_sort(&groups);
+        assert!(matches!(result, Err(DaemonError::CyclicDependency(_))));
+    }
+
+    #[test]
+    fn test_topological_sort_diamond_dependency() {
+        // Diamond: a depends on b,c; b,c depend on d
+        let groups = vec![
+            Group {
+                name: "a".to_string(),
+                depends_on: vec!["b".to_string(), "c".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "b".to_string(),
+                depends_on: vec!["d".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "c".to_string(),
+                depends_on: vec!["d".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "d".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let order = topological_sort(&groups).unwrap();
+
+        // d must come before b and c, which must come before a
+        let pos_a = order.iter().position(|x| x == "a").unwrap();
+        let pos_b = order.iter().position(|x| x == "b").unwrap();
+        let pos_c = order.iter().position(|x| x == "c").unwrap();
+        let pos_d = order.iter().position(|x| x == "d").unwrap();
+
+        assert!(pos_d < pos_b, "d must come before b");
+        assert!(pos_d < pos_c, "d must come before c");
+        assert!(pos_b < pos_a, "b must come before a");
+        assert!(pos_c < pos_a, "c must come before a");
+    }
+
+    #[test]
+    fn test_topological_sort_deep_chain() {
+        // Linear chain: a -> b -> c -> d -> e
+        let groups = vec![
+            Group {
+                name: "a".to_string(),
+                depends_on: vec!["b".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "b".to_string(),
+                depends_on: vec!["c".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "c".to_string(),
+                depends_on: vec!["d".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "d".to_string(),
+                depends_on: vec!["e".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "e".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let order = topological_sort(&groups).unwrap();
+        assert_eq!(order, vec!["e", "d", "c", "b", "a"]);
+    }
+
+    #[test]
+    fn test_topological_sort_missing_dependency() {
+        // Group depends on non-existent group - function visits it and includes
+        // it in the result (graceful handling, doesn't error)
+        let groups = vec![Group {
+            name: "a".to_string(),
+            depends_on: vec!["nonexistent".to_string()],
+            ..Default::default()
+        }];
+
+        let order = topological_sort(&groups).unwrap();
+        // The missing dependency is visited and added to result before "a"
+        assert_eq!(order, vec!["nonexistent", "a"]);
+    }
+
+    #[test]
+    fn test_topological_sort_complex_cycle() {
+        // a -> b -> c -> a (3-node cycle)
+        let groups = vec![
+            Group {
+                name: "a".to_string(),
+                depends_on: vec!["b".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "b".to_string(),
+                depends_on: vec!["c".to_string()],
+                ..Default::default()
+            },
+            Group {
+                name: "c".to_string(),
+                depends_on: vec!["a".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let result = topological_sort(&groups);
+        assert!(matches!(result, Err(DaemonError::CyclicDependency(_))));
     }
 }
