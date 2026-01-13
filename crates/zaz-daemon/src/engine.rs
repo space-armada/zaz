@@ -236,6 +236,14 @@ pub struct Engine {
     /// Maximum 1 pending per task (HashSet deduplicates).
     pending_tasks: std::collections::HashSet<String>,
 
+    /// Reverse dependency map: group_name -> groups that depend on it.
+    /// Used to efficiently find dependents when a group completes.
+    dependents: HashMap<String, Vec<String>>,
+
+    /// Groups waiting for dependencies: group_name -> deps still waiting for.
+    /// When all deps complete, the group can start.
+    waiting_groups: HashMap<String, std::collections::HashSet<String>>,
+
     /// Channel for receiving task completion signals from spawned tasks.
     task_completion_rx: mpsc::Receiver<TaskCompletion>,
 
@@ -414,6 +422,17 @@ impl Engine {
         // Compute execution order based on dependencies
         let execution_order = topological_sort(&config.groups)?;
 
+        // Build reverse dependency map (dependents)
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+        for group in &config.groups {
+            for dep in &group.depends_on {
+                dependents
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(group.name.clone());
+            }
+        }
+
         let state = DaemonState {
             status: DaemonStatus::Starting,
             groups: groups
@@ -451,6 +470,8 @@ impl Engine {
             log_store,
             running_tasks: std::collections::HashSet::new(),
             pending_tasks: std::collections::HashSet::new(),
+            dependents,
+            waiting_groups: HashMap::new(),
             task_completion_rx,
             task_completion_tx,
             notification_config,
@@ -556,18 +577,38 @@ impl Engine {
         tracing::info!("starting initial run");
         self.state.status = DaemonStatus::Running;
 
-        // Spawn all group tasks (non-blocking, same as restart_all)
         let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
         let context = Context::new()
             .with_variables(self.config.variables.clone())
             .with_root(config_dir.to_path_buf());
 
-        // Track groups that need immediate daemon startup (no runnable tasks at startup)
+        // Track groups that need immediate daemon startup (no runnable tasks at startup
+        // AND all dependencies satisfied)
         let mut groups_needing_daemon_start: Vec<String> = Vec::new();
 
         for group_name in &self.execution_order.clone() {
-            // Check if this group has any tasks that will run during startup
-            // (i.e., tasks that are not on_change_only)
+            let deps = self.get_group_dependencies(group_name);
+
+            // Find dependencies that are not yet Ready
+            let unready_deps: std::collections::HashSet<String> = deps
+                .into_iter()
+                .filter(|d| !self.is_group_ready(d))
+                .collect();
+
+            // Has unready dependencies - mark as Waiting and track what we're waiting for
+            if !unready_deps.is_empty() {
+                tracing::debug!(
+                    group = %group_name,
+                    waiting_for = ?unready_deps,
+                    "group waiting for dependencies"
+                );
+                self.set_group_status(group_name, GroupStatus::Waiting);
+                self.waiting_groups
+                    .insert(group_name.clone(), unready_deps);
+                continue;
+            }
+
+            // Can start group when all dependencies are Ready or no dependencies
             let has_startup_tasks = self
                 .groups
                 .get(group_name)
@@ -575,10 +616,10 @@ impl Engine {
                 .unwrap_or(false);
 
             if has_startup_tasks {
-                // Group has tasks - spawn them and daemons will start when tasks complete
+                // Spawn tasks; daemons will start when tasks complete
                 self.spawn_group_tasks(group_name, &context, false);
             } else {
-                // Group has no startup tasks - queue daemon startup
+                // Group has no tasks: queue daemon startup
                 let has_daemons = self
                     .groups
                     .get(group_name)
@@ -587,17 +628,26 @@ impl Engine {
 
                 if has_daemons {
                     groups_needing_daemon_start.push(group_name.clone());
+                } else {
+                    // No tasks and no daemons - mark as Ready immediately
+                    // This is important for groups that only serve as dependency markers
+                    self.set_group_status(group_name, GroupStatus::Ready);
                 }
             }
         }
 
-        // Start daemons for groups with no tasks
+        // Start daemons for groups with no tasks (and trigger their dependents)
         for group_name in groups_needing_daemon_start {
             if let Err(e) = self.handle_daemon_action(&group_name, true).await {
                 tracing::error!(group = %group_name, error = %e, "failed to start daemons");
             }
+
+            // trigger_dependents will be called after daemon action completes
+            // via process_task_completions or here for groups without tasks
+            self.trigger_dependents(&group_name);
         }
 
+        self.update_state();
         Ok(())
     }
 
@@ -916,7 +966,26 @@ impl Engine {
             return Ok(());
         }
 
-        tracing::info!(files = changed_paths.len(), groups = ?affected_groups, "processing file changes");
+        // Dedupe affected groups to only root groups, because dependents get
+        // triggered through cascade
+        let affected_set: std::collections::HashSet<&String> = affected_groups.iter().collect();
+        let roots: Vec<String> = affected_groups
+            .iter()
+            .filter(|g| {
+                let deps = self.get_group_dependencies(g);
+                // Keep this group only if none of its dependencies are also affected
+                // TODO(ripta): Is this the right call?
+                !deps.iter().any(|dep| affected_set.contains(dep))
+            })
+            .cloned()
+            .collect();
+
+        tracing::info!(
+            files = changed_paths.len(),
+            affected = ?affected_groups,
+            roots = ?roots,
+            "processing file changes (dependents will cascade)"
+        );
 
         // Build variable context for command expansion
         let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
@@ -925,8 +994,7 @@ impl Engine {
             .with_files(changed_paths)
             .with_root(config_dir.to_path_buf());
 
-        // Spawn each task in affected groups (all tasks run in parallel)
-        for group_name in affected_groups {
+        for group_name in roots {
             self.spawn_group_tasks(&group_name, &context, true);
         }
 
@@ -1049,8 +1117,20 @@ impl Engine {
     pub async fn process_task_completions(&mut self) {
         // Collect groups that need daemon action (group_name, should_start_not_signal)
         let mut daemon_actions: Vec<(String, bool)> = Vec::new();
+        // Collect groups that failed (for cascade_skip)
+        let mut failed_groups: Vec<String> = Vec::new();
 
         while let Ok(completion) = self.task_completion_rx.try_recv() {
+            // Handle special __daemon_start__ task for groups without tasks
+            if completion.task_id == "__daemon_start__" {
+                tracing::debug!(
+                    group = %completion.group_name,
+                    "processing daemon start request for group without tasks"
+                );
+                daemon_actions.push((completion.group_name.clone(), true));
+                continue;
+            }
+
             tracing::info!(
                 task_id = %completion.task_id,
                 success = %completion.success,
@@ -1125,6 +1205,8 @@ impl Engine {
                             &self.notification_config,
                             crate::notify::NotifyEvent::group_failed(&completion.group_name),
                         );
+                        // Queue cascade_skip for this failed group
+                        failed_groups.push(completion.group_name.clone());
                     } else {
                         crate::notify::send_notification(
                             &self.notification_config,
@@ -1135,6 +1217,10 @@ impl Engine {
                         if !group.daemons.is_empty() {
                             let should_start = !group.daemons_started;
                             daemon_actions.push((completion.group_name.clone(), should_start));
+                        } else {
+                            // No daemons - group is ready, daemon_actions will trigger dependents
+                            // We still need to add to daemon_actions for trigger_dependents call
+                            daemon_actions.push((completion.group_name.clone(), true));
                         }
                     }
                 }
@@ -1186,12 +1272,31 @@ impl Engine {
             self.update_state();
         }
 
+        // Process cascade_skip for failed groups
+        for group_name in failed_groups {
+            self.cascade_skip(&group_name);
+        }
+
         // Process daemon actions after releasing borrows from the loop
         for (group_name, should_start) in daemon_actions {
-            if let Err(e) = self.handle_daemon_action(&group_name, should_start).await {
-                tracing::error!(group = %group_name, error = %e, "failed to handle daemon action");
+            // Check if this group has daemons to start/signal
+            let has_daemons = self
+                .groups
+                .get(&group_name)
+                .map(|g| !g.daemons.is_empty())
+                .unwrap_or(false);
+
+            if has_daemons {
+                if let Err(e) = self.handle_daemon_action(&group_name, should_start).await {
+                    tracing::error!(group = %group_name, error = %e, "failed to handle daemon action");
+                }
             }
+
+            // Trigger dependents after group completes (with or without daemons)
+            self.trigger_dependents(&group_name);
         }
+
+        self.update_state();
     }
 
     /// Handle daemon startup or signal for a group after successful task completion.
@@ -1282,6 +1387,17 @@ impl Engine {
         // Spawn PTY reader tasks (outside the mutable borrow)
         for (process, group, reader) in pty_readers {
             self.spawn_pty_reader(process, group, reader);
+        }
+
+        // Cascade daemon restart to dependents (only for restarts, not first start)
+        if !should_start {
+            if let Err(e) = self.cascade_daemon_restart(group_name).await {
+                tracing::error!(
+                    group = %group_name,
+                    error = %e,
+                    "failed to cascade daemon restart"
+                );
+            }
         }
 
         self.update_state();
@@ -1550,6 +1666,20 @@ impl Engine {
         // 6. Apply new configuration
         self.config = new_config;
         self.execution_order = execution_order;
+
+        // 6b. Rebuild reverse dependency map
+        self.dependents.clear();
+        for group in &self.config.groups {
+            for dep in &group.depends_on {
+                self.dependents
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(group.name.clone());
+            }
+        }
+
+        // 6c. Clear waiting groups (will be repopulated on next startup/run)
+        self.waiting_groups.clear();
 
         // 7. Rebuild groups
         if let Err(e) = self.rebuild_groups() {
@@ -1890,6 +2020,217 @@ impl Engine {
         }
 
         PatternSet::new(&includes, &ignores).map_err(DaemonError::Watch)
+    }
+
+    // =========================================================================
+    // Dependency helper methods
+    // =========================================================================
+
+    /// Get the dependencies for a group.
+    fn get_group_dependencies(&self, group_name: &str) -> Vec<String> {
+        self.groups
+            .get(group_name)
+            .map(|g| g.config.depends_on.clone())
+            .unwrap_or_default()
+    }
+
+    /// Check if a group has reached Ready status.
+    fn is_group_ready(&self, group_name: &str) -> bool {
+        self.groups
+            .get(group_name)
+            .map(|g| g.state.status == GroupStatus::Ready)
+            .unwrap_or(false)
+    }
+
+    /// Check if a group has failed or been skipped.
+    fn is_group_failed_or_skipped(&self, group_name: &str) -> bool {
+        self.groups
+            .get(group_name)
+            .map(|g| {
+                g.state.status == GroupStatus::Failed || g.state.status == GroupStatus::Skipped
+            })
+            .unwrap_or(false)
+    }
+
+    /// Set a group's status.
+    fn set_group_status(&mut self, group_name: &str, status: GroupStatus) {
+        if let Some(group) = self.groups.get_mut(group_name) {
+            group.state.status = status;
+        }
+    }
+
+    /// Check if any dependency of a group has failed or been skipped.
+    fn any_dependency_failed(&self, group_name: &str) -> bool {
+        let deps = self.get_group_dependencies(group_name);
+        deps.iter().any(|dep| self.is_group_failed_or_skipped(dep))
+    }
+
+    /// Trigger dependents of a completed group.
+    ///
+    /// Called when a group successfully completes (reaches Ready status).
+    /// This checks all groups that depend on the completed group and starts
+    /// them if all their dependencies are now satisfied.
+    fn trigger_dependents(&mut self, completed_group: &str) {
+        let Some(dependents) = self.dependents.get(completed_group).cloned() else {
+            return;
+        };
+
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        let context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir.to_path_buf());
+
+        for dependent in dependents {
+            // Check if this dependent is in waiting_groups (waiting for dependencies)
+            if let Some(waiting_for) = self.waiting_groups.get_mut(&dependent) {
+                waiting_for.remove(completed_group);
+
+                if waiting_for.is_empty() {
+                    // All dependencies now satisfied - remove from waiting
+                    self.waiting_groups.remove(&dependent);
+
+                    // Check if any dependency failed
+                    if self.any_dependency_failed(&dependent) {
+                        tracing::info!(
+                            group = %dependent,
+                            "skipping group due to failed dependency"
+                        );
+                        self.cascade_skip(&dependent);
+                    } else {
+                        // Start the group
+                        tracing::info!(
+                            group = %dependent,
+                            triggered_by = %completed_group,
+                            "starting group after dependency completed"
+                        );
+                        self.start_waiting_group(&dependent, &context);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start a group that was waiting for dependencies.
+    fn start_waiting_group(&mut self, group_name: &str, context: &Context) {
+        let has_startup_tasks = self
+            .groups
+            .get(group_name)
+            .map(|g| g.config.tasks.iter().any(|t| !t.on_change_only))
+            .unwrap_or(false);
+
+        if has_startup_tasks {
+            self.spawn_group_tasks(group_name, context, false);
+        } else {
+            // No tasks - mark as ready immediately or start daemons
+            let has_daemons = self
+                .groups
+                .get(group_name)
+                .map(|g| !g.daemons.is_empty())
+                .unwrap_or(false);
+
+            if has_daemons {
+                // Queue daemon start - this will be handled asynchronously
+                // We need to spawn a task to handle this since we can't await here
+                let group_name = group_name.to_string();
+                let task_completion_tx = self.task_completion_tx.clone();
+                tokio::spawn(async move {
+                    // Signal that this group needs daemon startup
+                    // We use a special task completion to trigger daemon startup
+                    let _ = task_completion_tx
+                        .send(TaskCompletion {
+                            group_name,
+                            task_id: "__daemon_start__".to_string(),
+                            task_index: 0,
+                            success: true,
+                            status: ProcessStatus::Success,
+                            duration_ms: None,
+                            exit_code: None,
+                        })
+                        .await;
+                });
+            } else {
+                // No tasks and no daemons - mark as Ready and trigger dependents
+                self.set_group_status(group_name, GroupStatus::Ready);
+                self.trigger_dependents(group_name);
+            }
+        }
+    }
+
+    /// Cascade skip status to dependents when a group fails.
+    ///
+    /// Marks the group as Skipped and recursively skips all dependents
+    /// that were waiting for it.
+    fn cascade_skip(&mut self, group_name: &str) {
+        self.set_group_status(group_name, GroupStatus::Skipped);
+
+        let Some(dependents) = self.dependents.get(group_name).cloned() else {
+            return;
+        };
+
+        for dependent in dependents {
+            if let Some(waiting_for) = self.waiting_groups.get_mut(&dependent) {
+                waiting_for.remove(group_name);
+
+                if waiting_for.is_empty() {
+                    self.waiting_groups.remove(&dependent);
+                    // Recursively skip this dependent
+                    self.cascade_skip(&dependent);
+                }
+            }
+        }
+    }
+
+    /// Cascade daemon restart signals to dependents.
+    ///
+    /// When a group's daemons are signaled to restart, this propagates
+    /// the restart signal to all dependent groups' daemons (transitively).
+    async fn cascade_daemon_restart(&mut self, source_group: &str) -> Result<(), DaemonError> {
+        let Some(dependents) = self.dependents.get(source_group).cloned() else {
+            return Ok(());
+        };
+
+        for dependent in dependents {
+            // Only cascade if the dependent has daemons that are already running
+            let should_cascade = self
+                .groups
+                .get(&dependent)
+                .map(|g| g.daemons_started && !g.daemons.is_empty())
+                .unwrap_or(false);
+
+            if should_cascade {
+                tracing::info!(
+                    from = %source_group,
+                    to = %dependent,
+                    "cascading daemon restart signal"
+                );
+
+                // Signal the daemons to restart
+                if let Err(e) = self.signal_group_daemons(&dependent) {
+                    tracing::error!(
+                        group = %dependent,
+                        error = %e,
+                        "failed to cascade daemon restart"
+                    );
+                }
+
+                // Recursively cascade to further dependents
+                Box::pin(self.cascade_daemon_restart(&dependent)).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Signal all daemons in a group to restart.
+    fn signal_group_daemons(&mut self, group_name: &str) -> Result<(), DaemonError> {
+        if let Some(group) = self.groups.get_mut(group_name) {
+            for daemon in &mut group.daemons {
+                if daemon.is_running() {
+                    daemon.signal_restart().map_err(DaemonError::Process)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Update the internal state from group states and broadcast to subscribers.

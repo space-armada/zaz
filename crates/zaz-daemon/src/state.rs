@@ -58,6 +58,9 @@ pub enum GroupStatus {
     #[default]
     Pending,
 
+    /// Waiting for dependencies to complete.
+    Waiting,
+
     /// Tasks are running.
     Running,
 
@@ -66,6 +69,9 @@ pub enum GroupStatus {
 
     /// A task failed.
     Failed,
+
+    /// Skipped due to dependency failure.
+    Skipped,
 }
 
 /// State of a single process (task or daemon).
