@@ -1182,21 +1182,12 @@ impl Engine {
                     .iter()
                     .any(|id| id.starts_with(&group_prefix));
 
-                if !has_running_tasks {
-                    // No tasks running - update group status based on task results
-                    let any_failed = group
-                        .state
-                        .tasks
-                        .iter()
-                        .any(|t| t.status == ProcessStatus::Failed);
-
-                    let new_status = if any_failed {
-                        GroupStatus::Failed
-                    } else {
-                        GroupStatus::Ready
-                    };
-
+                if let Some(new_status) =
+                    calculate_group_status_from_tasks(&group.state.tasks, has_running_tasks)
+                {
+                    // All tasks complete - update group status
                     group.state.status = new_status;
+                    let any_failed = new_status == GroupStatus::Failed;
 
                     // Send notification for group completion
                     if any_failed {
@@ -2247,6 +2238,28 @@ impl Engine {
     }
 }
 
+/// Calculate group status from task states.
+///
+/// Returns `None` if there are still tasks running, otherwise returns the final status.
+fn calculate_group_status_from_tasks(
+    task_states: &[ProcessState],
+    has_running_tasks: bool,
+) -> Option<GroupStatus> {
+    if has_running_tasks {
+        return None;
+    }
+
+    let any_failed = task_states
+        .iter()
+        .any(|t| t.status == ProcessStatus::Failed);
+
+    Some(if any_failed {
+        GroupStatus::Failed
+    } else {
+        GroupStatus::Ready
+    })
+}
+
 /// Compute changes between old and new group configurations.
 ///
 /// Returns (added, removed, modified) group names.
@@ -2739,5 +2752,94 @@ mod tests {
         assert!(removed.contains(&"a".to_string()));
         assert!(removed.contains(&"b".to_string()));
         assert!(modified.is_empty());
+    }
+
+    // =========================================================================
+    // calculate_group_status_from_tasks() tests
+    // =========================================================================
+
+    #[test]
+    fn test_calculate_group_status_returns_none_when_tasks_running() {
+        let tasks = vec![
+            ProcessState {
+                name: "task1".to_string(),
+                status: ProcessStatus::Success,
+                ..Default::default()
+            },
+            ProcessState {
+                name: "task2".to_string(),
+                status: ProcessStatus::Running,
+                ..Default::default()
+            },
+        ];
+
+        let result = calculate_group_status_from_tasks(&tasks, true);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_calculate_group_status_ready_when_all_success() {
+        let tasks = vec![
+            ProcessState {
+                name: "task1".to_string(),
+                status: ProcessStatus::Success,
+                ..Default::default()
+            },
+            ProcessState {
+                name: "task2".to_string(),
+                status: ProcessStatus::Success,
+                ..Default::default()
+            },
+        ];
+
+        let result = calculate_group_status_from_tasks(&tasks, false);
+        assert_eq!(result, Some(GroupStatus::Ready));
+    }
+
+    #[test]
+    fn test_calculate_group_status_failed_when_any_failed() {
+        let tasks = vec![
+            ProcessState {
+                name: "task1".to_string(),
+                status: ProcessStatus::Success,
+                ..Default::default()
+            },
+            ProcessState {
+                name: "task2".to_string(),
+                status: ProcessStatus::Failed,
+                ..Default::default()
+            },
+        ];
+
+        let result = calculate_group_status_from_tasks(&tasks, false);
+        assert_eq!(result, Some(GroupStatus::Failed));
+    }
+
+    #[test]
+    fn test_calculate_group_status_ready_with_empty_tasks() {
+        let tasks: Vec<ProcessState> = vec![];
+
+        let result = calculate_group_status_from_tasks(&tasks, false);
+        assert_eq!(result, Some(GroupStatus::Ready));
+    }
+
+    #[test]
+    fn test_calculate_group_status_ready_with_pending_and_success() {
+        // Pending tasks don't count as failed
+        let tasks = vec![
+            ProcessState {
+                name: "task1".to_string(),
+                status: ProcessStatus::Success,
+                ..Default::default()
+            },
+            ProcessState {
+                name: "task2".to_string(),
+                status: ProcessStatus::Pending,
+                ..Default::default()
+            },
+        ];
+
+        let result = calculate_group_status_from_tasks(&tasks, false);
+        assert_eq!(result, Some(GroupStatus::Ready));
     }
 }
