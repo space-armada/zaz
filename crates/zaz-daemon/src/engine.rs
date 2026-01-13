@@ -10,7 +10,7 @@ use crate::{ApiResponse, DaemonError};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group};
 use zaz_process::{Daemon, Executor, OutputLine, TaskRunner};
@@ -280,6 +280,9 @@ struct ManagedGroup {
     /// Whether daemons have been started at least once.
     /// Used to determine if we should start daemons (first time) or signal them (subsequent).
     daemons_started: bool,
+
+    /// Pending restart times for daemons
+    pending_restarts: Vec<Option<Instant>>,
 }
 
 impl Engine {
@@ -394,6 +397,7 @@ impl Engine {
                     .collect(),
             };
 
+            let daemon_count = daemons.len();
             groups.insert(
                 group.name.clone(),
                 ManagedGroup {
@@ -402,6 +406,7 @@ impl Engine {
                     daemons,
                     state,
                     daemons_started: false,
+                    pending_restarts: vec![None; daemon_count],
                 },
             );
         }
@@ -603,7 +608,7 @@ impl Engine {
         changed_files: &[PathBuf],
         is_change_triggered: bool,
     ) -> Result<(), DaemonError> {
-        // First, extract what we need from the group to avoid borrow issues
+        // Extract to avoid borrow issues
         let (executor, tasks, group_exists) = {
             let Some(group) = self.groups.get_mut(group_name) else {
                 return Err(DaemonError::GroupNotFound(group_name.to_string()));
@@ -1292,6 +1297,7 @@ impl Engine {
             if self.running_tasks.is_empty() {
                 break;
             }
+
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         // Final drain of any remaining completions
@@ -1315,47 +1321,57 @@ impl Engine {
     }
 
     /// Check daemon processes and handle restarts.
+    ///
+    /// This function is non-blocking: when a daemon exits, it schedules a restart
+    /// for later rather than sleeping. This allows the main loop to remain responsive
+    /// to API commands while waiting for restart delays.
     pub async fn check_daemons(&mut self) -> Result<(), DaemonError> {
-        // Collect PTY readers for restarted daemons
-        let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
-            Vec::new();
+        let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> = Vec::new();
 
+        let now = Instant::now();
         for (group_name, group) in self.groups.iter_mut() {
             for (idx, daemon) in group.daemons.iter_mut().enumerate() {
-                let exited = daemon.check().await.map_err(DaemonError::Process)?;
+                // First, check if there's a pending restart that's ready
+                if let Some(restart_at) = group.pending_restarts[idx] {
+                    if now >= restart_at {
+                        tracing::info!(daemon = %daemon.name(), "restarting daemon");
+                        daemon.start().map_err(DaemonError::Process)?;
 
+                        if let Some(reader) = daemon.try_clone_reader() {
+                            pty_readers.push((
+                                daemon.name().to_string(),
+                                Some(group_name.clone()),
+                                reader,
+                            ));
+                        }
+
+                        group.state.daemons[idx].status = ProcessStatus::Running;
+                        group.state.daemons[idx].pid = daemon.pid();
+                        group.pending_restarts[idx] = None;
+                    }
+
+                    // Skip any daemons whose time hasn't come
+                    continue;
+                }
+
+                // If daemon exited, update the state and schedule restart
+                let exited = daemon.check().await.map_err(DaemonError::Process)?;
                 if exited {
-                    // Daemon exited, update state
                     group.state.daemons[idx].status = ProcessStatus::Backoff;
                     group.state.daemons[idx].pid = None;
 
-                    // Auto-restart after delay
                     let delay = daemon.restart_delay();
                     tracing::info!(
                         daemon = %daemon.name(),
                         delay_ms = delay.as_millis(),
-                        "daemon exited, will restart"
+                        "daemon exited, scheduling restart"
                     );
 
-                    tokio::time::sleep(delay).await;
-                    daemon.start().map_err(DaemonError::Process)?;
-
-                    // Get PTY reader for streaming output
-                    if let Some(reader) = daemon.try_clone_reader() {
-                        pty_readers.push((
-                            daemon.name().to_string(),
-                            Some(group_name.clone()),
-                            reader,
-                        ));
-                    }
-
-                    group.state.daemons[idx].status = ProcessStatus::Running;
-                    group.state.daemons[idx].pid = daemon.pid();
+                    group.pending_restarts[idx] = Some(now + delay);
                 }
             }
         }
 
-        // Spawn PTY reader tasks (outside the mutable borrow)
         for (process, group, reader) in pty_readers {
             self.spawn_pty_reader(process, group, reader);
         }
@@ -1649,6 +1665,7 @@ impl Engine {
                     .collect(),
             };
 
+            let daemon_count = daemons.len();
             new_groups.insert(
                 group.name.clone(),
                 ManagedGroup {
@@ -1657,6 +1674,7 @@ impl Engine {
                     daemons,
                     state,
                     daemons_started: false,
+                    pending_restarts: vec![None; daemon_count],
                 },
             );
         }
