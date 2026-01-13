@@ -1619,7 +1619,7 @@ impl Engine {
         };
 
         // 2. Compute changes
-        let (added, removed, modified) = self.compute_config_changes(&new_config);
+        let (added, removed, modified) = self.get_config_changes(&new_config);
 
         // 3. Stop daemons in removed groups
         for group_name in &removed {
@@ -1713,37 +1713,11 @@ impl Engine {
     }
 
     /// Compute changes between current config and new config.
-    fn compute_config_changes(
+    fn get_config_changes(
         &self,
         new_config: &Config,
     ) -> (Vec<String>, Vec<String>, Vec<String>) {
-        use std::collections::HashSet;
-
-        let old_names: HashSet<_> = self.config.groups.iter().map(|g| &g.name).collect();
-        let new_names: HashSet<_> = new_config.groups.iter().map(|g| &g.name).collect();
-
-        let added: Vec<String> = new_names
-            .difference(&old_names)
-            .map(|s| (*s).clone())
-            .collect();
-        let removed: Vec<String> = old_names
-            .difference(&new_names)
-            .map(|s| (*s).clone())
-            .collect();
-
-        // Check for modifications (compare serialized versions)
-        let mut modified = Vec::new();
-        for new_group in &new_config.groups {
-            if let Some(old_group) = self.config.groups.iter().find(|g| g.name == new_group.name) {
-                let old_json = serde_json::to_string(old_group).unwrap_or_default();
-                let new_json = serde_json::to_string(new_group).unwrap_or_default();
-                if old_json != new_json {
-                    modified.push(new_group.name.clone());
-                }
-            }
-        }
-
-        (added, removed, modified)
+        compute_config_changes(&self.config.groups, &new_config.groups)
     }
 
     /// Rebuild group patterns and managed groups from current config.
@@ -2273,6 +2247,42 @@ impl Engine {
     }
 }
 
+/// Compute changes between old and new group configurations.
+///
+/// Returns (added, removed, modified) group names.
+fn compute_config_changes(
+    old_groups: &[Group],
+    new_groups: &[Group],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    use std::collections::HashSet;
+
+    let old_names: HashSet<_> = old_groups.iter().map(|g| &g.name).collect();
+    let new_names: HashSet<_> = new_groups.iter().map(|g| &g.name).collect();
+
+    let added: Vec<String> = new_names
+        .difference(&old_names)
+        .map(|s| (*s).clone())
+        .collect();
+    let removed: Vec<String> = old_names
+        .difference(&new_names)
+        .map(|s| (*s).clone())
+        .collect();
+
+    // Check for modifications (compare serialized versions)
+    let mut modified = Vec::new();
+    for new_group in new_groups {
+        if let Some(old_group) = old_groups.iter().find(|g| g.name == new_group.name) {
+            let old_json = serde_json::to_string(old_group).unwrap_or_default();
+            let new_json = serde_json::to_string(new_group).unwrap_or_default();
+            if old_json != new_json {
+                modified.push(new_group.name.clone());
+            }
+        }
+    }
+
+    (added, removed, modified)
+}
+
 /// Topologically sort groups based on dependencies.
 fn topological_sort(groups: &[Group]) -> Result<Vec<String>, DaemonError> {
     let mut result = Vec::new();
@@ -2539,5 +2549,195 @@ mod tests {
 
         let result = topological_sort(&groups);
         assert!(matches!(result, Err(DaemonError::CyclicDependency(_))));
+    }
+
+    // =========================================================================
+    // compute_config_changes() tests
+    // =========================================================================
+
+    #[test]
+    fn test_compute_config_changes_no_changes() {
+        let groups = vec![
+            Group {
+                name: "a".to_string(),
+                ..Default::default()
+            },
+            Group {
+                name: "b".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let (added, removed, modified) = compute_config_changes(&groups, &groups);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+        assert!(modified.is_empty());
+    }
+
+    #[test]
+    fn test_compute_config_changes_added_groups() {
+        let old = vec![Group {
+            name: "a".to_string(),
+            ..Default::default()
+        }];
+        let new = vec![
+            Group {
+                name: "a".to_string(),
+                ..Default::default()
+            },
+            Group {
+                name: "b".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let (added, removed, modified) = compute_config_changes(&old, &new);
+        assert_eq!(added, vec!["b"]);
+        assert!(removed.is_empty());
+        assert!(modified.is_empty());
+    }
+
+    #[test]
+    fn test_compute_config_changes_removed_groups() {
+        let old = vec![
+            Group {
+                name: "a".to_string(),
+                ..Default::default()
+            },
+            Group {
+                name: "b".to_string(),
+                ..Default::default()
+            },
+        ];
+        let new = vec![Group {
+            name: "a".to_string(),
+            ..Default::default()
+        }];
+
+        let (added, removed, modified) = compute_config_changes(&old, &new);
+        assert!(added.is_empty());
+        assert_eq!(removed, vec!["b"]);
+        assert!(modified.is_empty());
+    }
+
+    #[test]
+    fn test_compute_config_changes_modified_patterns() {
+        let old = vec![Group {
+            name: "a".to_string(),
+            patterns: vec!["*.rs".to_string()],
+            ..Default::default()
+        }];
+        let new = vec![Group {
+            name: "a".to_string(),
+            patterns: vec!["*.go".to_string()],
+            ..Default::default()
+        }];
+
+        let (added, removed, modified) = compute_config_changes(&old, &new);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+        assert_eq!(modified, vec!["a"]);
+    }
+
+    #[test]
+    fn test_compute_config_changes_modified_depends_on() {
+        let old = vec![Group {
+            name: "a".to_string(),
+            depends_on: vec!["b".to_string()],
+            ..Default::default()
+        }];
+        let new = vec![Group {
+            name: "a".to_string(),
+            depends_on: vec!["c".to_string()],
+            ..Default::default()
+        }];
+
+        let (added, removed, modified) = compute_config_changes(&old, &new);
+        assert!(added.is_empty());
+        assert!(removed.is_empty());
+        assert_eq!(modified, vec!["a"]);
+    }
+
+    #[test]
+    fn test_compute_config_changes_all_operations() {
+        let old = vec![
+            Group {
+                name: "keep".to_string(),
+                ..Default::default()
+            },
+            Group {
+                name: "remove".to_string(),
+                ..Default::default()
+            },
+            Group {
+                name: "modify".to_string(),
+                patterns: vec!["old".to_string()],
+                ..Default::default()
+            },
+        ];
+        let new = vec![
+            Group {
+                name: "keep".to_string(),
+                ..Default::default()
+            },
+            Group {
+                name: "add".to_string(),
+                ..Default::default()
+            },
+            Group {
+                name: "modify".to_string(),
+                patterns: vec!["new".to_string()],
+                ..Default::default()
+            },
+        ];
+
+        let (added, removed, modified) = compute_config_changes(&old, &new);
+        assert_eq!(added, vec!["add"]);
+        assert_eq!(removed, vec!["remove"]);
+        assert_eq!(modified, vec!["modify"]);
+    }
+
+    #[test]
+    fn test_compute_config_changes_empty_to_groups() {
+        let old: Vec<Group> = vec![];
+        let new = vec![
+            Group {
+                name: "a".to_string(),
+                ..Default::default()
+            },
+            Group {
+                name: "b".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let (added, removed, modified) = compute_config_changes(&old, &new);
+        assert_eq!(added.len(), 2);
+        assert!(added.contains(&"a".to_string()));
+        assert!(added.contains(&"b".to_string()));
+        assert!(removed.is_empty());
+        assert!(modified.is_empty());
+    }
+
+    #[test]
+    fn test_compute_config_changes_groups_to_empty() {
+        let old = vec![
+            Group {
+                name: "a".to_string(),
+                ..Default::default()
+            },
+            Group {
+                name: "b".to_string(),
+                ..Default::default()
+            },
+        ];
+        let new: Vec<Group> = vec![];
+
+        let (added, removed, modified) = compute_config_changes(&old, &new);
+        assert!(added.is_empty());
+        assert_eq!(removed.len(), 2);
+        assert!(removed.contains(&"a".to_string()));
+        assert!(removed.contains(&"b".to_string()));
+        assert!(modified.is_empty());
     }
 }
