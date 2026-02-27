@@ -820,6 +820,7 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
         tui_style: Some(options.style),
         log_colors: zaz_config::LogColorConfig::default(),
         notifications: zaz_config::NotificationConfig::default(),
+        log_storage: zaz_config::LogStorageConfig::default(),
     };
 
     let config_name = config_path

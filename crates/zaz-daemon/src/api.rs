@@ -132,10 +132,21 @@ pub enum ApiRequest {
 
     /// Get logs for a process.
     GetLogs {
-        /// Process name.
+        /// Process name ("*" for all processes).
         name: String,
         /// Number of lines to return (None = all).
+        /// Deprecated: use `limit` instead. Kept for backward compatibility.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         lines: Option<usize>,
+        /// Number of results to skip (for pagination).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<usize>,
+        /// Maximum number of results to return (pagination).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        /// Text search pattern (case-insensitive substring match).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search: Option<String>,
     },
 
     /// Subscribe to logs for a process (streaming).
@@ -190,7 +201,20 @@ pub enum ApiResponse {
     StatusUpdate { state: DaemonState },
 
     /// Log lines (one-shot).
-    Logs { name: String, lines: Vec<LogLine> },
+    Logs {
+        name: String,
+        lines: Vec<LogLine>,
+        /// Total number of matching logs (before pagination).
+        /// Only present when pagination is used.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_count: Option<usize>,
+        /// Whether there are more results after this page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        has_more: Option<bool>,
+        /// The offset used for this query.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<usize>,
+    },
 
     /// Log line (streaming).
     Log(LogLine),
@@ -256,12 +280,30 @@ mod tests {
             _ => panic!("expected RestartGroup"),
         }
 
+        // Legacy format (lines only) still works
         let json = r#"{"type":"get_logs","name":"server","lines":100}"#;
         let req: ApiRequest = serde_json::from_str(json).unwrap();
         match req {
-            ApiRequest::GetLogs { name, lines } => {
+            ApiRequest::GetLogs { name, lines, offset, limit, search } => {
                 assert_eq!(name, "server");
                 assert_eq!(lines, Some(100));
+                assert_eq!(offset, None);
+                assert_eq!(limit, None);
+                assert_eq!(search, None);
+            }
+            _ => panic!("expected GetLogs"),
+        }
+
+        // New pagination format
+        let json = r#"{"type":"get_logs","name":"*","offset":50,"limit":25,"search":"error"}"#;
+        let req: ApiRequest = serde_json::from_str(json).unwrap();
+        match req {
+            ApiRequest::GetLogs { name, lines, offset, limit, search } => {
+                assert_eq!(name, "*");
+                assert_eq!(lines, None);
+                assert_eq!(offset, Some(50));
+                assert_eq!(limit, Some(25));
+                assert_eq!(search, Some("error".to_string()));
             }
             _ => panic!("expected GetLogs"),
         }
@@ -310,6 +352,9 @@ mod tests {
             ApiRequest::GetLogs {
                 name: "test".to_string(),
                 lines: None,
+                offset: None,
+                limit: None,
+                search: None,
             },
             ApiRequest::SubscribeLogs {
                 name: "test".to_string(),

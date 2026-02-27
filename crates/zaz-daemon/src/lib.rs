@@ -7,12 +7,14 @@ mod dependency;
 mod engine;
 mod error;
 mod log_layer;
+mod log_storage;
 mod log_store;
 pub mod notify;
 mod server;
 mod state;
 
 pub use api::{ApiRequest, ApiResponse, EngineCommand, LogLine, LogSource, OutputKind};
+pub use log_storage::{LogQuery, LogQueryResult, LogStorage, LogStorageStats};
 pub use engine::Engine;
 pub use error::DaemonError;
 pub use log_layer::DaemonLogLayer;

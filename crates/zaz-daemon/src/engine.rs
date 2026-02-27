@@ -4,6 +4,7 @@
 
 use crate::api::LogLine;
 use crate::dependency::DependencyResolver;
+use crate::log_storage::{LogQuery, LogQueryResult, LogStorage};
 use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
 };
@@ -557,13 +558,19 @@ impl Engine {
         // Create broadcast channel for status updates (capacity 16)
         let (status_tx, _) = broadcast::channel(16);
 
-        // Create log store with verbose callback if enabled
-        let log_store = if verbose_output {
-            crate::log_store::LogStore::new().with_verbose_callback(|log| {
-                println!("[{}] {}", log.process, log.content);
-            })
-        } else {
-            crate::log_store::LogStore::new()
+        // Create log store with user config settings
+        let log_store = {
+            let mut store = crate::log_store::LogStore::new()
+                .with_memory_limit(user_config.log_storage.memory_limit_bytes())
+                .with_max_lines_per_process(user_config.log_storage.max_lines_per_process);
+
+            if verbose_output {
+                store = store.with_verbose_callback(|log| {
+                    println!("[{}] {}", log.process, log.content);
+                });
+            }
+
+            store
         };
 
         // Create mpsc channel for task completion signals
@@ -619,6 +626,13 @@ impl Engine {
     /// If `name` is "*", returns logs from all processes sorted by timestamp.
     pub fn get_logs(&self, name: &str, limit: Option<usize>) -> Vec<LogLine> {
         self.log_store.get(name, limit)
+    }
+
+    /// Query logs with pagination and filtering support.
+    ///
+    /// This is the new API for log retrieval that supports pagination.
+    pub fn query_logs(&self, query: LogQuery) -> LogQueryResult {
+        self.log_store.query(query)
     }
 
     /// Spawn a background task to read PTY output and push to logs.
@@ -2038,14 +2052,67 @@ impl Engine {
                     state: self.state.clone(),
                 }
             }
-            ApiRequest::GetLogs { name, lines } => {
-                let logs = self.get_logs(&name, lines);
-                ApiResponse::Logs { name, lines: logs }
+            ApiRequest::GetLogs {
+                name,
+                lines,
+                offset,
+                limit,
+                search,
+            } => {
+                // Use new pagination if any pagination param is set, otherwise use legacy
+                let use_pagination = offset.is_some() || limit.is_some() || search.is_some();
+
+                if use_pagination {
+                    // Build query from request parameters
+                    let mut query = if name == "*" {
+                        LogQuery::all()
+                    } else {
+                        LogQuery::process(&name)
+                    };
+
+                    if let Some(off) = offset {
+                        query = query.with_offset(off);
+                    }
+                    if let Some(lim) = limit {
+                        query = query.with_limit(lim);
+                    } else if let Some(lines_limit) = lines {
+                        // Fall back to legacy `lines` parameter
+                        query = query.with_limit(lines_limit);
+                    }
+                    if let Some(ref pattern) = search {
+                        query = query.with_search(pattern);
+                    }
+
+                    let result = self.query_logs(query);
+                    ApiResponse::Logs {
+                        name,
+                        lines: result.logs,
+                        total_count: Some(result.total_count),
+                        has_more: Some(result.has_more),
+                        offset: Some(result.offset),
+                    }
+                } else {
+                    // Legacy behavior: just return logs with optional limit
+                    let logs = self.get_logs(&name, lines);
+                    ApiResponse::Logs {
+                        name,
+                        lines: logs,
+                        total_count: None,
+                        has_more: None,
+                        offset: None,
+                    }
+                }
             }
             ApiRequest::SubscribeLogs { name } => {
                 // Return current logs; caller should use subscribe_logs() for streaming
                 let logs = self.get_logs(&name, Some(100));
-                ApiResponse::Logs { name, lines: logs }
+                ApiResponse::Logs {
+                    name,
+                    lines: logs,
+                    total_count: None,
+                    has_more: None,
+                    offset: None,
+                }
             }
             ApiRequest::RestartGroup { name } => match self.restart_group(&name) {
                 Ok(()) => {
