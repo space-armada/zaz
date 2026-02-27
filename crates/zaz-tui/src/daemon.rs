@@ -257,7 +257,10 @@ async fn background_task(
                     // Poll logs (get all logs, filter by timestamp)
                     match c.request(&ApiRequest::GetLogs {
                         name: "*".to_string(),
-                        lines: Some(500),
+                        lines: None, // Deprecated, use limit instead
+                        offset: None,
+                        limit: Some(500),
+                        search: None,
                     }).await {
                         Ok(ApiResponse::Logs { lines, .. }) => {
                             // Find max timestamp first, then send all new logs
