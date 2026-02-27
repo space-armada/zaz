@@ -26,6 +26,91 @@ pub struct UserConfig {
 
     /// Notification settings.
     pub notifications: NotificationConfig,
+
+    /// Log storage settings.
+    pub log_storage: LogStorageConfig,
+}
+
+/// Log storage configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogStorageConfig {
+    /// Maximum memory budget for log storage in bytes.
+    /// When approached, oldest logs are evicted.
+    /// Default: 100MB (104857600 bytes).
+    /// Use human-readable formats: "100MB", "1GB", etc.
+    #[serde(default = "default_memory_limit")]
+    pub memory_limit: String,
+
+    /// Maximum log lines to keep per process.
+    /// Default: 100000.
+    #[serde(default = "default_max_lines_per_process")]
+    pub max_lines_per_process: usize,
+}
+
+fn default_memory_limit() -> String {
+    "100MB".to_string()
+}
+
+fn default_max_lines_per_process() -> usize {
+    100_000
+}
+
+impl Default for LogStorageConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit: default_memory_limit(),
+            max_lines_per_process: default_max_lines_per_process(),
+        }
+    }
+}
+
+impl LogStorageConfig {
+    /// Parse the memory limit string and return bytes.
+    /// Supports formats like "100MB", "1GB", "500KB", or plain number (bytes).
+    pub fn memory_limit_bytes(&self) -> usize {
+        parse_byte_size(&self.memory_limit).unwrap_or(100 * 1024 * 1024)
+    }
+}
+
+/// Parse a human-readable byte size string.
+/// Supports: B, KB, MB, GB (case-insensitive).
+/// Returns None if parsing fails.
+fn parse_byte_size(s: &str) -> Option<usize> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Try plain number first
+    if let Ok(n) = s.parse::<usize>() {
+        return Some(n);
+    }
+
+    // Find where the number ends and suffix begins
+    let s_upper = s.to_uppercase();
+    let (num_part, suffix) = if s_upper.ends_with("GB") {
+        (&s[..s.len() - 2], "GB")
+    } else if s_upper.ends_with("MB") {
+        (&s[..s.len() - 2], "MB")
+    } else if s_upper.ends_with("KB") {
+        (&s[..s.len() - 2], "KB")
+    } else if s_upper.ends_with('B') {
+        (&s[..s.len() - 1], "B")
+    } else {
+        return None;
+    };
+
+    let num: f64 = num_part.trim().parse().ok()?;
+    let multiplier = match suffix {
+        "GB" => 1024 * 1024 * 1024,
+        "MB" => 1024 * 1024,
+        "KB" => 1024,
+        "B" => 1,
+        _ => return None,
+    };
+
+    Some((num * multiplier as f64) as usize)
 }
 
 /// Log colorization configuration.
@@ -247,5 +332,77 @@ tui_style = "full"
         let config = load_user_config_from(&path);
         // Should return defaults, not error
         assert!(!config.no_autostart);
+    }
+
+    #[test]
+    fn test_parse_byte_size() {
+        // Plain numbers
+        assert_eq!(parse_byte_size("1024"), Some(1024));
+        assert_eq!(parse_byte_size("0"), Some(0));
+
+        // Bytes
+        assert_eq!(parse_byte_size("100B"), Some(100));
+        assert_eq!(parse_byte_size("100b"), Some(100));
+
+        // Kilobytes
+        assert_eq!(parse_byte_size("1KB"), Some(1024));
+        assert_eq!(parse_byte_size("1kb"), Some(1024));
+        assert_eq!(parse_byte_size("10KB"), Some(10 * 1024));
+
+        // Megabytes
+        assert_eq!(parse_byte_size("1MB"), Some(1024 * 1024));
+        assert_eq!(parse_byte_size("100MB"), Some(100 * 1024 * 1024));
+        assert_eq!(parse_byte_size("100mb"), Some(100 * 1024 * 1024));
+
+        // Gigabytes
+        assert_eq!(parse_byte_size("1GB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size("2GB"), Some(2 * 1024 * 1024 * 1024));
+
+        // Fractional values
+        assert_eq!(parse_byte_size("1.5MB"), Some((1.5 * 1024.0 * 1024.0) as usize));
+        assert_eq!(parse_byte_size("0.5GB"), Some((0.5 * 1024.0 * 1024.0 * 1024.0) as usize));
+
+        // With whitespace
+        assert_eq!(parse_byte_size("  100MB  "), Some(100 * 1024 * 1024));
+        assert_eq!(parse_byte_size("100 MB"), Some(100 * 1024 * 1024));
+
+        // Invalid
+        assert_eq!(parse_byte_size(""), None);
+        assert_eq!(parse_byte_size("invalid"), None);
+        assert_eq!(parse_byte_size("100TB"), None); // TB not supported
+    }
+
+    #[test]
+    fn test_log_storage_config_default() {
+        let config = LogStorageConfig::default();
+        assert_eq!(config.memory_limit, "100MB");
+        assert_eq!(config.max_lines_per_process, 100_000);
+        assert_eq!(config.memory_limit_bytes(), 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_log_storage_config() {
+        let toml = r#"
+[log_storage]
+memory_limit = "200MB"
+max_lines_per_process = 50000
+"#;
+        let config: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.log_storage.memory_limit, "200MB");
+        assert_eq!(config.log_storage.max_lines_per_process, 50000);
+        assert_eq!(config.log_storage.memory_limit_bytes(), 200 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_log_storage_config_partial() {
+        // Only memory_limit set
+        let toml = r#"
+[log_storage]
+memory_limit = "1GB"
+"#;
+        let config: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.log_storage.memory_limit, "1GB");
+        assert_eq!(config.log_storage.max_lines_per_process, 100_000); // default
+        assert_eq!(config.log_storage.memory_limit_bytes(), 1024 * 1024 * 1024);
     }
 }
