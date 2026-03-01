@@ -110,11 +110,11 @@ impl StyleRenderer for MultiPaneStyle {
                     // Half page down in focused pane
                     if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
                         let pane = app.selected_pane;
-                        let logs = app.logs.filtered_logs(&process.name);
+                        let total = app.logs.total_count(&process.name);
                         let visible_height =
                             app.pane_visible_height.get(&pane).copied().unwrap_or(20);
                         let half_page = visible_height / 2;
-                        let max_scroll = logs.len().saturating_sub(visible_height);
+                        let max_scroll = total.saturating_sub(visible_height);
 
                         // Sync scroll position from follow mode before disabling
                         let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
@@ -133,11 +133,11 @@ impl StyleRenderer for MultiPaneStyle {
                     // Half page up in focused pane
                     if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
                         let pane = app.selected_pane;
-                        let logs = app.logs.filtered_logs(&process.name);
+                        let total = app.logs.total_count(&process.name);
                         let visible_height =
                             app.pane_visible_height.get(&pane).copied().unwrap_or(20);
                         let half_page = visible_height / 2;
-                        let max_scroll = logs.len().saturating_sub(visible_height);
+                        let max_scroll = total.saturating_sub(visible_height);
 
                         // Sync scroll position from follow mode before disabling
                         let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
@@ -256,13 +256,13 @@ impl StyleRenderer for MultiPaneStyle {
             KeyCode::Char('G') => {
                 // Scroll to bottom of focused pane
                 if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
-                    let logs = app.logs.filtered_logs(&process.name);
+                    let total = app.logs.total_count(&process.name);
                     let visible_height = app
                         .pane_visible_height
                         .get(&app.selected_pane)
                         .copied()
                         .unwrap_or(20);
-                    let max_scroll = logs.len().saturating_sub(visible_height);
+                    let max_scroll = total.saturating_sub(visible_height);
                     app.set_pane_scroll(app.selected_pane, max_scroll);
                     app.pane_follow.insert(app.selected_pane, true);
                 }
@@ -271,9 +271,9 @@ impl StyleRenderer for MultiPaneStyle {
             KeyCode::PageUp => {
                 if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
                     let pane = app.selected_pane;
-                    let logs = app.logs.filtered_logs(&process.name);
+                    let total = app.logs.total_count(&process.name);
                     let visible_height = app.pane_visible_height.get(&pane).copied().unwrap_or(20);
-                    let max_scroll = logs.len().saturating_sub(visible_height);
+                    let max_scroll = total.saturating_sub(visible_height);
 
                     // Sync scroll position from follow mode before disabling
                     let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
@@ -291,9 +291,9 @@ impl StyleRenderer for MultiPaneStyle {
             KeyCode::PageDown => {
                 if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
                     let pane = app.selected_pane;
-                    let logs = app.logs.filtered_logs(&process.name);
+                    let total = app.logs.total_count(&process.name);
                     let visible_height = app.pane_visible_height.get(&pane).copied().unwrap_or(20);
-                    let max_scroll = logs.len().saturating_sub(visible_height);
+                    let max_scroll = total.saturating_sub(visible_height);
 
                     // Sync scroll position from follow mode before disabling
                     let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
@@ -407,13 +407,13 @@ impl StyleRenderer for MultiPaneStyle {
 
     fn log_dimensions(&self, app: &App) -> (usize, usize) {
         if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
-            let logs = app.logs.filtered_logs(&process.name);
+            let total = app.logs.total_count(&process.name);
             let visible_height = app
                 .pane_visible_height
                 .get(&app.selected_pane)
                 .copied()
                 .unwrap_or(20);
-            (visible_height, logs.len())
+            (visible_height, total)
         } else {
             (20, 0)
         }
@@ -499,9 +499,9 @@ impl MultiPaneStyle {
 
         // Get the process for this pane to calculate log count
         if let Some(process) = self.get_process_at_index(app, pane) {
-            let logs = app.logs.filtered_logs(&process.name);
+            let total = app.logs.total_count(&process.name);
             let visible_height = app.pane_visible_height.get(&pane).copied().unwrap_or(20);
-            let max_scroll = logs.len().saturating_sub(visible_height);
+            let max_scroll = total.saturating_sub(visible_height);
 
             // Sync scroll position from follow mode before disabling
             let is_following = app.pane_follow.get(&pane).copied().unwrap_or(true);
@@ -769,12 +769,10 @@ impl MultiPaneStyle {
             ProcessStatus::Failed => Color::Red,
         };
 
-        // Get logs for this process first (needed for title)
         use crate::logs::timestamp_to_day;
 
-        let logs = app.logs.filtered_logs(&process.name);
+        let total_lines = app.logs.total_count(&process.name);
         let visible_height = area.height.saturating_sub(2) as usize;
-        let total_lines = logs.len();
 
         // Per-pane scroll handling
         let is_following = app.pane_follow.get(&pane_index).copied().unwrap_or(true);
@@ -784,6 +782,10 @@ impl MultiPaneStyle {
             let stored = app.get_pane_scroll(pane_index);
             stored.min(total_lines.saturating_sub(visible_height))
         };
+
+        let display_lines =
+            app.logs
+                .get_display_lines(&process.name, scroll_offset, visible_height);
 
         // Format title with process info
         let info = match process.kind {
@@ -806,11 +808,14 @@ impl MultiPaneStyle {
         // Add asterisk for focused pane
         let focus_indicator = if focused { "*" } else { "" };
 
-        // Add line range (e.g., "1-20/100")
+        // Add loading indicator and line range
+        let is_loading = app.pane_loading.get(&pane_index).copied().unwrap_or(false);
+        let loading_indicator = if is_loading { " loading" } else { "" };
+
         let line_range = if total_lines > 0 {
             let start = scroll_offset + 1;
             let end = (scroll_offset + visible_height).min(total_lines);
-            format!(" ({}-{}/{})", start, end, total_lines)
+            format!(" ({}-{}/{}{})", start, end, total_lines, loading_indicator)
         } else {
             " (empty)".to_string()
         };
@@ -829,53 +834,60 @@ impl MultiPaneStyle {
             Style::default()
         };
 
-        let reference_day = logs
-            .first()
-            .map(|(_, log)| timestamp_to_day(log.timestamp))
+        let reference_day = display_lines
+            .iter()
+            .find_map(|l| l.as_ref())
+            .map(|l| timestamp_to_day(l.log.timestamp))
             .unwrap_or(0);
 
-        let items: Vec<ListItem> = logs
+        let items: Vec<ListItem> = display_lines
             .iter()
-            .skip(scroll_offset)
-            .take(visible_height)
-            .map(|(_idx, log)| {
-                let is_match = app.logs.is_search_match(&log.content);
-                let is_daemon_log = log.source == crate::daemon::LogSource::Daemon;
+            .map(|entry| match entry {
+                Some(paged) => {
+                    let is_match = app.logs.is_search_match(&paged.log.content);
+                    let is_daemon_log = paged.log.source == crate::daemon::LogSource::Daemon;
 
-                let timestamp = log.format_timestamp(reference_day, app.show_full_timestamp);
+                    let timestamp =
+                        paged.log.format_timestamp(reference_day, app.show_full_timestamp);
 
-                // Build prefix spans (timestamp only for multi-pane since process name is in title)
-                let prefix_spans = vec![Span::styled(
-                    format!("{} ", timestamp),
-                    Style::default().fg(Color::DarkGray),
-                )];
+                    // Build prefix spans (timestamp only for multi-pane)
+                    let prefix_spans = vec![Span::styled(
+                        format!("{} ", timestamp),
+                        Style::default().fg(Color::DarkGray),
+                    )];
 
-                // Build the log line with ANSI color parsing
-                let line = if is_daemon_log {
-                    // Daemon logs (zaz internal) get special styling
-                    let mut spans = prefix_spans;
-                    spans.push(Span::styled(
-                        format!("[zaz] {}", log.content),
+                    let line = if is_daemon_log {
+                        let mut spans = prefix_spans;
+                        spans.push(Span::styled(
+                            format!("[zaz] {}", paged.log.content),
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                        Line::from(spans)
+                    } else if app.user_config.log_colors.preserve_ansi {
+                        ansi::parse_ansi_with_prefix(prefix_spans, &paged.log.content)
+                    } else {
+                        let mut spans = prefix_spans;
+                        spans.push(Span::raw(paged.log.content.clone()));
+                        Line::from(spans)
+                    };
+
+                    if is_match {
+                        ListItem::new(line)
+                            .style(Style::default().add_modifier(Modifier::REVERSED))
+                    } else {
+                        ListItem::new(line)
+                    }
+                }
+                None => {
+                    // Loading placeholder for uncached lines
+                    ListItem::new(Line::from(vec![Span::styled(
+                        "  Loading...",
                         Style::default()
-                            .fg(Color::Magenta)
+                            .fg(Color::DarkGray)
                             .add_modifier(Modifier::DIM),
-                    ));
-                    Line::from(spans)
-                } else if app.user_config.log_colors.preserve_ansi {
-                    // Parse ANSI codes for process logs
-                    ansi::parse_ansi_with_prefix(prefix_spans, &log.content)
-                } else {
-                    // No ANSI parsing - plain text
-                    let mut spans = prefix_spans;
-                    spans.push(Span::raw(log.content.clone()));
-                    Line::from(spans)
-                };
-
-                // Apply search highlight if matching
-                if is_match {
-                    ListItem::new(line).style(Style::default().add_modifier(Modifier::REVERSED))
-                } else {
-                    ListItem::new(line)
+                    )]))
                 }
             })
             .collect();

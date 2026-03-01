@@ -73,7 +73,7 @@ impl StyleRenderer for FullStyle {
                 KeyCode::Char('d') => {
                     // Half page down
                     let half_page = app.log_visible_height / 2;
-                    let total = app.logs.all_logs_combined().len();
+                    let total = app.logs.total_count("*");
                     let max_scroll = total.saturating_sub(app.log_visible_height);
 
                     // Sync scroll position from follow mode before disabling
@@ -88,7 +88,7 @@ impl StyleRenderer for FullStyle {
                 KeyCode::Char('u') => {
                     // Half page up
                     let half_page = app.log_visible_height / 2;
-                    let total = app.logs.all_logs_combined().len();
+                    let total = app.logs.total_count("*");
                     let max_scroll = total.saturating_sub(app.log_visible_height);
 
                     // Sync scroll position from follow mode before disabling
@@ -130,13 +130,13 @@ impl StyleRenderer for FullStyle {
                 KeyResult::Handled
             }
             KeyCode::Char('G') => {
-                let total = app.logs.all_logs_combined().len();
+                let total = app.logs.total_count("*");
                 app.log_scroll = total.saturating_sub(app.log_visible_height);
                 app.logs.enable_follow();
                 KeyResult::Handled
             }
             KeyCode::PageUp => {
-                let total = app.logs.all_logs_combined().len();
+                let total = app.logs.total_count("*");
                 let max_scroll = total.saturating_sub(app.log_visible_height);
 
                 // Sync scroll position from follow mode before disabling
@@ -149,7 +149,7 @@ impl StyleRenderer for FullStyle {
                 KeyResult::Handled
             }
             KeyCode::PageDown => {
-                let total = app.logs.all_logs_combined().len();
+                let total = app.logs.total_count("*");
                 let max_scroll = total.saturating_sub(app.log_visible_height);
 
                 // Sync scroll position from follow mode before disabling
@@ -272,8 +272,7 @@ impl StyleRenderer for FullStyle {
     }
 
     fn log_dimensions(&self, app: &App) -> (usize, usize) {
-        let combined = app.logs.all_logs_combined();
-        (app.log_visible_height, combined.len())
+        (app.log_visible_height, app.logs.total_count("*"))
     }
 }
 
@@ -319,7 +318,7 @@ impl FullStyle {
                 }
             }
             Focus::Logs => {
-                let total = app.logs.all_logs_combined().len();
+                let total = app.logs.total_count("*");
                 let max_scroll = total.saturating_sub(app.log_visible_height);
 
                 // Sync scroll position from follow mode before disabling
@@ -350,7 +349,7 @@ impl FullStyle {
             Focus::Logs => {
                 // Sync scroll position from follow mode before disabling
                 if app.logs.is_following() {
-                    let total = app.logs.all_logs_combined().len();
+                    let total = app.logs.total_count("*");
                     let max_scroll = total.saturating_sub(app.log_visible_height);
                     app.log_scroll = max_scroll;
                 }
@@ -592,9 +591,8 @@ impl FullStyle {
             Style::default()
         };
 
-        let combined = app.logs.all_logs_combined();
+        let total_lines = app.logs.total_count("*");
         let visible_height = area.height.saturating_sub(2) as usize;
-        let total_lines = combined.len();
 
         let scroll_offset = if app.logs.is_following() {
             total_lines.saturating_sub(visible_height)
@@ -603,72 +601,83 @@ impl FullStyle {
                 .min(total_lines.saturating_sub(visible_height))
         };
 
-        let reference_day = combined
-            .first()
-            .map(|(_, _, log)| timestamp_to_day(log.timestamp))
+        let display_lines = app.logs.get_display_lines("*", scroll_offset, visible_height);
+
+        let reference_day = display_lines
+            .iter()
+            .find_map(|l| l.as_ref())
+            .map(|l| timestamp_to_day(l.log.timestamp))
             .unwrap_or(0);
 
-        let items: Vec<ListItem> = combined
+        let items: Vec<ListItem> = display_lines
             .iter()
-            .skip(scroll_offset)
-            .take(visible_height)
-            .map(|(process, _idx, log)| {
-                let is_match = app.logs.is_search_match(&log.content);
-                let is_daemon_log = log.source == crate::daemon::LogSource::Daemon;
+            .map(|entry| match entry {
+                Some(paged) => {
+                    let is_match = app.logs.is_search_match(&paged.log.content);
+                    let is_daemon_log = paged.log.source == crate::daemon::LogSource::Daemon;
 
-                let timestamp = log.format_timestamp(reference_day, app.show_full_timestamp);
+                    let timestamp =
+                        paged.log.format_timestamp(reference_day, app.show_full_timestamp);
 
-                // Build prefix spans (timestamp and process name)
-                let prefix_spans = vec![
-                    Span::styled(
-                        format!("{} ", timestamp),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        format!("[{}] ", process),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ];
+                    // Build prefix spans (timestamp and process name)
+                    let prefix_spans = vec![
+                        Span::styled(
+                            format!("{} ", timestamp),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("[{}] ", paged.process),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ];
 
-                // Build the log line with ANSI color parsing
-                let line = if is_daemon_log {
-                    // Daemon logs (zaz internal) get special styling
-                    let mut spans = prefix_spans;
-                    spans.push(Span::styled(
-                        format!("[zaz] {}", log.content),
+                    // Build the log line with ANSI color parsing
+                    let line = if is_daemon_log {
+                        let mut spans = prefix_spans;
+                        spans.push(Span::styled(
+                            format!("[zaz] {}", paged.log.content),
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                        Line::from(spans)
+                    } else if app.user_config.log_colors.preserve_ansi {
+                        ansi::parse_ansi_with_prefix(prefix_spans, &paged.log.content)
+                    } else {
+                        let mut spans = prefix_spans;
+                        spans.push(Span::raw(paged.log.content.clone()));
+                        Line::from(spans)
+                    };
+
+                    if is_match {
+                        ListItem::new(line)
+                            .style(Style::default().add_modifier(Modifier::REVERSED))
+                    } else {
+                        ListItem::new(line)
+                    }
+                }
+                None => {
+                    // Loading placeholder for uncached lines
+                    ListItem::new(Line::from(vec![Span::styled(
+                        "  Loading...",
                         Style::default()
-                            .fg(Color::Magenta)
+                            .fg(Color::DarkGray)
                             .add_modifier(Modifier::DIM),
-                    ));
-                    Line::from(spans)
-                } else if app.user_config.log_colors.preserve_ansi {
-                    // Parse ANSI codes for process logs
-                    ansi::parse_ansi_with_prefix(prefix_spans, &log.content)
-                } else {
-                    // No ANSI parsing - plain text
-                    let mut spans = prefix_spans;
-                    spans.push(Span::raw(log.content.clone()));
-                    Line::from(spans)
-                };
-
-                // Apply search highlight if matching
-                if is_match {
-                    // For search matches, apply reversed style to whole line
-                    ListItem::new(line).style(Style::default().add_modifier(Modifier::REVERSED))
-                } else {
-                    ListItem::new(line)
+                    )]))
                 }
             })
             .collect();
 
         let focus_indicator = if app.focus == Focus::Logs { "*" } else { "" };
+        let loading_indicator = if app.log_loading { " loading" } else { "" };
         let title = if total_lines > 0 {
             format!(
-                " Logs{} ({}-{}/{}) ",
+                " Logs{} ({}-{}/{}{}) ",
                 focus_indicator,
                 scroll_offset + 1,
                 (scroll_offset + items.len()).min(total_lines),
-                total_lines
+                total_lines,
+                loading_indicator,
             )
         } else {
             format!(" Logs{} (empty) ", focus_indicator)

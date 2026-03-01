@@ -139,6 +139,12 @@ pub struct App {
     /// Whether to show help overlay.
     pub show_help: bool,
 
+    // === Lazy Loading ===
+    /// Whether any page fetch is in-flight (Full style).
+    pub log_loading: bool,
+    /// Per-pane loading state (Multi Pane style).
+    pub pane_loading: HashMap<usize, bool>,
+
     // === Connection State ===
     /// Current connection status for display.
     pub connection_status: ConnectionStatus,
@@ -222,6 +228,8 @@ impl App {
             should_quit: false,
             transient_message: None,
             show_help: false,
+            log_loading: false,
+            pane_loading: HashMap::new(),
             connection_status: ConnectionStatus::Initial,
             was_connected: false,
         }
@@ -343,6 +351,101 @@ impl App {
             // Receive log lines
             while let Some(log) = daemon.try_recv_log() {
                 self.logs.push(log);
+            }
+
+            // Drain page fetch results
+            while let Some(result) = daemon.try_recv_page() {
+                if !result.lines.is_empty() {
+                    self.logs.insert_page(
+                        &result.name,
+                        result.offset,
+                        result.lines,
+                        result.total_count,
+                    );
+                } else {
+                    // Total count update only (from regular poll)
+                    self.logs.set_total_count(&result.name, result.total_count);
+                }
+            }
+        }
+
+        // Request pages if needed for current scroll position
+        self.request_pages_if_needed();
+    }
+
+    /// Check if the current scroll position has uncached gaps and request
+    /// page fetches for missing ranges.
+    fn request_pages_if_needed(&mut self) {
+        use crate::logs::PAGE_SIZE;
+
+        match self.style {
+            TuiStyle::Full => {
+                if self.logs.is_following() {
+                    self.log_loading = false;
+                    return;
+                }
+
+                let total = self.logs.total_count("*");
+                let visible = self.log_visible_height;
+                let scroll = self.log_scroll.min(total.saturating_sub(visible));
+
+                // Buffer: fetch 1 page before and after visible range
+                let start = scroll.saturating_sub(PAGE_SIZE);
+                let end = (scroll + visible + PAGE_SIZE).min(total);
+
+                let fetches = self.logs.needs_fetch("*", start, end);
+                self.log_loading = !fetches.is_empty();
+
+                for (offset, limit) in fetches {
+                    self.logs.mark_pending("*", offset / PAGE_SIZE);
+                    if let Some(ref daemon) = self.daemon {
+                        let _ = daemon.fetch_page("*", offset, limit);
+                    }
+                }
+            }
+            TuiStyle::MultiPane => {
+                // Get process names for multi-pane
+                let mut processes = Vec::new();
+                for group in self.state.groups.values() {
+                    for task in &group.tasks {
+                        processes.push(task.name.clone());
+                    }
+                    for daemon in &group.daemons {
+                        processes.push(daemon.name.clone());
+                    }
+                }
+
+                let pane = self.selected_pane;
+                let is_following = self.pane_follow.get(&pane).copied().unwrap_or(true);
+
+                if is_following {
+                    self.pane_loading.insert(pane, false);
+                    return;
+                }
+
+                if let Some(process_name) = processes.get(pane) {
+                    let total = self.logs.total_count(process_name);
+                    let visible = self
+                        .pane_visible_height
+                        .get(&pane)
+                        .copied()
+                        .unwrap_or(20);
+                    let scroll = self.get_pane_scroll(pane).min(total.saturating_sub(visible));
+
+                    let start = scroll.saturating_sub(PAGE_SIZE);
+                    let end = (scroll + visible + PAGE_SIZE).min(total);
+
+                    let fetches = self.logs.needs_fetch(process_name, start, end);
+                    self.pane_loading.insert(pane, !fetches.is_empty());
+
+                    for (offset, limit) in fetches {
+                        self.logs
+                            .mark_pending(process_name, offset / PAGE_SIZE);
+                        if let Some(ref daemon_conn) = self.daemon {
+                            let _ = daemon_conn.fetch_page(process_name, offset, limit);
+                        }
+                    }
+                }
             }
         }
     }

@@ -3,8 +3,9 @@
 //! Provides per-process log storage with filtering and search capabilities.
 
 use regex::Regex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use crate::daemon::{LogLine, LogSource};
 
@@ -222,6 +223,108 @@ fn is_leap_year(year: i32) -> bool {
 /// Default maximum lines per process.
 const DEFAULT_MAX_LINES: usize = 10_000;
 
+/// Lines per page for lazy loading.
+pub const PAGE_SIZE: usize = 200;
+
+/// Maximum number of cached pages per name.
+const MAX_CACHED_PAGES: usize = 10;
+
+/// A log entry returned from paged access.
+#[derive(Debug, Clone)]
+pub struct PagedLogEntry {
+    /// The log entry.
+    pub log: StoredLog,
+    /// Process name (relevant for combined "*" view).
+    pub process: String,
+}
+
+/// A page of cached log lines fetched from the daemon.
+#[derive(Debug, Clone)]
+struct CachedPage {
+    /// Lines in this page: (process_name, stored_log).
+    lines: Vec<(String, StoredLog)>,
+    /// When this page was fetched.
+    #[allow(dead_code)]
+    fetched_at: Instant,
+}
+
+/// LRU page cache for lazily-loaded historical logs.
+#[derive(Debug)]
+struct PageCache {
+    /// Cached pages keyed by page number.
+    pages: HashMap<usize, CachedPage>,
+    /// LRU ordering (front = least recently inserted).
+    lru_order: VecDeque<usize>,
+    /// Maximum number of cached pages.
+    max_pages: usize,
+    /// Pages currently being fetched.
+    pending: HashSet<usize>,
+}
+
+impl PageCache {
+    fn new() -> Self {
+        Self {
+            pages: HashMap::new(),
+            lru_order: VecDeque::new(),
+            max_pages: MAX_CACHED_PAGES,
+            pending: HashSet::new(),
+        }
+    }
+
+    /// Insert a page of data, evicting the oldest if at capacity.
+    fn insert(&mut self, page_num: usize, lines: Vec<(String, StoredLog)>) {
+        // Remove from LRU if already present
+        self.lru_order.retain(|&p| p != page_num);
+
+        // Add to back of LRU (most recently inserted)
+        self.lru_order.push_back(page_num);
+
+        self.pages.insert(
+            page_num,
+            CachedPage {
+                lines,
+                fetched_at: Instant::now(),
+            },
+        );
+
+        self.pending.remove(&page_num);
+
+        // Evict if over capacity
+        while self.pages.len() > self.max_pages {
+            if let Some(evicted) = self.lru_order.pop_front() {
+                self.pages.remove(&evicted);
+            }
+        }
+    }
+
+    /// Get a line from a cached page.
+    fn get_line(&self, page_num: usize, offset_in_page: usize) -> Option<&(String, StoredLog)> {
+        self.pages
+            .get(&page_num)
+            .and_then(|p| p.lines.get(offset_in_page))
+    }
+
+    /// Check if a page is cached.
+    fn has_page(&self, page_num: usize) -> bool {
+        self.pages.contains_key(&page_num)
+    }
+
+    /// Check if a page is pending (being fetched).
+    fn is_pending(&self, page_num: usize) -> bool {
+        self.pending.contains(&page_num)
+    }
+
+    /// Mark a page as pending.
+    fn mark_pending(&mut self, page_num: usize) {
+        self.pending.insert(page_num);
+    }
+
+    /// Clear pending status for a page.
+    fn clear_pending(&mut self, page_num: usize) {
+        self.pending.remove(&page_num);
+    }
+}
+
 /// Search state for navigating matches.
 #[derive(Debug, Clone)]
 pub struct SearchState {
@@ -304,6 +407,10 @@ pub struct LogBuffer {
     follow_mode: bool,
     /// Currently selected process for log viewing.
     selected_process: Option<String>,
+    /// Per-name page caches for lazily-loaded historical logs.
+    page_caches: HashMap<String, PageCache>,
+    /// Total log counts reported by the daemon (per name).
+    daemon_total_counts: HashMap<String, usize>,
 }
 
 impl Default for LogBuffer {
@@ -322,6 +429,8 @@ impl LogBuffer {
             search: None,
             follow_mode: true,
             selected_process: None,
+            page_caches: HashMap::new(),
+            daemon_total_counts: HashMap::new(),
         }
     }
 
@@ -334,6 +443,8 @@ impl LogBuffer {
             search: None,
             follow_mode: true,
             selected_process: None,
+            page_caches: HashMap::new(),
+            daemon_total_counts: HashMap::new(),
         }
     }
 
@@ -370,6 +481,8 @@ impl LogBuffer {
     /// Clear all logs.
     pub fn clear_all(&mut self) {
         self.logs.clear();
+        self.page_caches.clear();
+        self.daemon_total_counts.clear();
     }
 
     /// Clear logs for a specific process.
@@ -377,6 +490,8 @@ impl LogBuffer {
         if let Some(buffer) = self.logs.get_mut(process) {
             buffer.clear();
         }
+        self.page_caches.remove(process);
+        self.daemon_total_counts.remove(process);
     }
 
     /// Get all process names with logs.
@@ -559,6 +674,242 @@ impl LogBuffer {
     /// Set the selected process.
     pub fn select_process(&mut self, process: Option<String>) {
         self.selected_process = process;
+    }
+
+    // === Page cache methods ===
+
+    /// Update the total log count from the daemon for a given name.
+    pub fn set_total_count(&mut self, name: &str, count: usize) {
+        self.daemon_total_counts.insert(name.to_string(), count);
+    }
+
+    /// Get the total log count for a name.
+    ///
+    /// When no filter is active, returns the maximum of the daemon's reported
+    /// count and the local buffer length. When a filter is active, returns
+    /// the filtered local count (lazy loading is disabled with filters).
+    pub fn total_count(&self, name: &str) -> usize {
+        if self.filter.is_some() {
+            // With filter active, only local data
+            if name == "*" {
+                self.all_logs_combined().len()
+            } else {
+                self.filtered_logs(name).len()
+            }
+        } else {
+            let local_len = if name == "*" {
+                self.total_len()
+            } else {
+                self.len_for(name)
+            };
+            let daemon_count = self.daemon_total_counts.get(name).copied().unwrap_or(0);
+            daemon_count.max(local_len)
+        }
+    }
+
+    /// Get lines for display using paginated access.
+    ///
+    /// Returns a vector of entries for offsets `[start, start+count)`.
+    /// Each entry is `Some(PagedLogEntry)` if the line is available, or `None`
+    /// if it needs to be fetched from the daemon.
+    ///
+    /// When a filter is active, falls back to existing local-only behavior.
+    pub fn get_display_lines(
+        &self,
+        name: &str,
+        start: usize,
+        count: usize,
+    ) -> Vec<Option<PagedLogEntry>> {
+        if self.filter.is_some() {
+            return self.get_filtered_display_lines(name, start, count);
+        }
+
+        let total = self.total_count(name);
+        let cache = self.page_caches.get(name);
+
+        // Compute tail data
+        let tail_data: Vec<(&str, &StoredLog)> = if name == "*" {
+            self.all_logs_combined()
+                .into_iter()
+                .map(|(proc, _idx, log)| (proc, log))
+                .collect()
+        } else {
+            self.logs
+                .get(name)
+                .map(|buf| buf.iter().map(|log| (name, log)).collect())
+                .unwrap_or_default()
+        };
+        let tail_len = tail_data.len();
+        let tail_start = total.saturating_sub(tail_len);
+
+        let mut result = Vec::with_capacity(count);
+
+        for offset in start..start + count {
+            if offset >= total {
+                break;
+            }
+
+            if offset >= tail_start {
+                // In tail range — serve from local buffer
+                let tail_idx = offset - tail_start;
+                if let Some(&(proc_name, log)) = tail_data.get(tail_idx) {
+                    result.push(Some(PagedLogEntry {
+                        log: log.clone(),
+                        process: proc_name.to_string(),
+                    }));
+                } else {
+                    result.push(None);
+                }
+            } else {
+                // In page cache range
+                let page_num = offset / PAGE_SIZE;
+                let offset_in_page = offset % PAGE_SIZE;
+
+                if let Some(c) = cache {
+                    if let Some((proc_name, log)) = c.get_line(page_num, offset_in_page) {
+                        result.push(Some(PagedLogEntry {
+                            log: log.clone(),
+                            process: proc_name.clone(),
+                        }));
+                    } else {
+                        result.push(None);
+                    }
+                } else {
+                    result.push(None);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Fallback for `get_display_lines` when a filter is active.
+    fn get_filtered_display_lines(
+        &self,
+        name: &str,
+        start: usize,
+        count: usize,
+    ) -> Vec<Option<PagedLogEntry>> {
+        if name == "*" {
+            self.all_logs_combined()
+                .into_iter()
+                .skip(start)
+                .take(count)
+                .map(|(proc, _idx, log)| {
+                    Some(PagedLogEntry {
+                        log: log.clone(),
+                        process: proc.to_string(),
+                    })
+                })
+                .collect()
+        } else {
+            self.filtered_logs(name)
+                .into_iter()
+                .skip(start)
+                .take(count)
+                .map(|(_idx, log)| {
+                    Some(PagedLogEntry {
+                        log: log.clone(),
+                        process: name.to_string(),
+                    })
+                })
+                .collect()
+        }
+    }
+
+    /// Insert a fetched page of log lines into the cache.
+    pub fn insert_page(
+        &mut self,
+        name: &str,
+        offset: usize,
+        lines: Vec<LogLine>,
+        total_count: usize,
+    ) {
+        self.daemon_total_counts
+            .insert(name.to_string(), total_count);
+
+        let page_num = offset / PAGE_SIZE;
+        let cached_lines: Vec<(String, StoredLog)> = lines
+            .into_iter()
+            .map(|l| {
+                (
+                    l.process,
+                    StoredLog {
+                        timestamp: l.timestamp,
+                        content: sanitize_log_content(&l.content),
+                        source: l.source,
+                    },
+                )
+            })
+            .collect();
+
+        let cache = self
+            .page_caches
+            .entry(name.to_string())
+            .or_insert_with(PageCache::new);
+        cache.insert(page_num, cached_lines);
+    }
+
+    /// Determine which page ranges need to be fetched for the given offset range.
+    ///
+    /// Returns `(offset, limit)` pairs for pages that are not cached,
+    /// not pending, and not covered by the tail buffer.
+    pub fn needs_fetch(&self, name: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
+        if self.filter.is_some() || end == 0 {
+            return vec![];
+        }
+
+        let total = self.total_count(name);
+        let tail_len = if name == "*" {
+            self.total_len()
+        } else {
+            self.len_for(name)
+        };
+        let tail_start = total.saturating_sub(tail_len);
+
+        let cache = self.page_caches.get(name);
+
+        let first_page = start / PAGE_SIZE;
+        let last_page = (end.saturating_sub(1)) / PAGE_SIZE;
+
+        let mut fetches = Vec::new();
+
+        for page_num in first_page..=last_page {
+            let page_start = page_num * PAGE_SIZE;
+
+            // Skip if entirely covered by the tail buffer
+            if page_start >= tail_start {
+                continue;
+            }
+
+            // Skip if already cached or pending
+            if let Some(c) = cache {
+                if c.has_page(page_num) || c.is_pending(page_num) {
+                    continue;
+                }
+            }
+
+            let page_end = ((page_num + 1) * PAGE_SIZE).min(total);
+            fetches.push((page_start, page_end - page_start));
+        }
+
+        fetches
+    }
+
+    /// Mark a page as pending (being fetched).
+    pub fn mark_pending(&mut self, name: &str, page: usize) {
+        let cache = self
+            .page_caches
+            .entry(name.to_string())
+            .or_insert_with(PageCache::new);
+        cache.mark_pending(page);
+    }
+
+    /// Clear pending status for a page.
+    pub fn clear_pending(&mut self, name: &str, page: usize) {
+        if let Some(cache) = self.page_caches.get_mut(name) {
+            cache.clear_pending(page);
+        }
     }
 }
 
@@ -1021,5 +1372,316 @@ mod tests {
 
         let logs = buffer.raw_logs("test").unwrap();
         assert_eq!(logs[0].content, "Building crate");
+    }
+
+    // === PageCache tests ===
+
+    #[test]
+    fn test_page_cache_insert_and_get() {
+        let mut cache = PageCache::new();
+        let lines = vec![
+            ("proc".to_string(), StoredLog {
+                timestamp: 1000,
+                content: "line 0".to_string(),
+                source: LogSource::Process,
+            }),
+            ("proc".to_string(), StoredLog {
+                timestamp: 2000,
+                content: "line 1".to_string(),
+                source: LogSource::Process,
+            }),
+        ];
+
+        cache.insert(0, lines);
+        assert!(cache.has_page(0));
+        assert!(!cache.has_page(1));
+
+        let line = cache.get_line(0, 0).unwrap();
+        assert_eq!(line.1.content, "line 0");
+
+        let line = cache.get_line(0, 1).unwrap();
+        assert_eq!(line.1.content, "line 1");
+
+        assert!(cache.get_line(0, 2).is_none());
+        assert!(cache.get_line(1, 0).is_none());
+    }
+
+    #[test]
+    fn test_page_cache_eviction() {
+        let mut cache = PageCache::new();
+        // max_pages defaults to MAX_CACHED_PAGES (10)
+
+        // Insert 11 pages — first should be evicted
+        for i in 0..11 {
+            cache.insert(i, vec![
+                (format!("proc_{}", i), StoredLog {
+                    timestamp: i as u64 * 1000,
+                    content: format!("page {}", i),
+                    source: LogSource::Process,
+                }),
+            ]);
+        }
+
+        // Page 0 should be evicted (first inserted)
+        assert!(!cache.has_page(0));
+        // Pages 1-10 should still be present
+        for i in 1..11 {
+            assert!(cache.has_page(i), "page {} should exist", i);
+        }
+    }
+
+    #[test]
+    fn test_page_cache_pending() {
+        let mut cache = PageCache::new();
+
+        assert!(!cache.is_pending(5));
+        cache.mark_pending(5);
+        assert!(cache.is_pending(5));
+
+        cache.clear_pending(5);
+        assert!(!cache.is_pending(5));
+
+        // Insert clears pending automatically
+        cache.mark_pending(3);
+        cache.insert(3, vec![]);
+        assert!(!cache.is_pending(3));
+    }
+
+    #[test]
+    fn test_total_count_no_daemon() {
+        let mut buffer = LogBuffer::new();
+        // No daemon total set, should return local len
+        assert_eq!(buffer.total_count("server"), 0);
+
+        buffer.push_line("server", "line 1".to_string(), 1000, LogSource::Process);
+        assert_eq!(buffer.total_count("server"), 1);
+    }
+
+    #[test]
+    fn test_total_count_with_daemon() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "line 1".to_string(), 1000, LogSource::Process);
+
+        // Daemon reports more than local
+        buffer.set_total_count("server", 5000);
+        assert_eq!(buffer.total_count("server"), 5000);
+
+        // Daemon reports less than local (shouldn't happen, but max handles it)
+        buffer.set_total_count("server", 0);
+        assert_eq!(buffer.total_count("server"), 1);
+    }
+
+    #[test]
+    fn test_total_count_combined() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "line 1".to_string(), 1000, LogSource::Process);
+        buffer.push_line("worker", "line 2".to_string(), 2000, LogSource::Process);
+
+        buffer.set_total_count("*", 10000);
+        assert_eq!(buffer.total_count("*"), 10000);
+    }
+
+    #[test]
+    fn test_total_count_with_filter() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "INFO: started".to_string(), 1000, LogSource::Process);
+        buffer.push_line("server", "DEBUG: details".to_string(), 2000, LogSource::Process);
+        buffer.push_line("server", "INFO: running".to_string(), 3000, LogSource::Process);
+
+        buffer.set_total_count("server", 10000);
+
+        // Without filter, returns daemon total
+        assert_eq!(buffer.total_count("server"), 10000);
+
+        // With filter, returns filtered local count
+        buffer.set_filter("INFO").unwrap();
+        assert_eq!(buffer.total_count("server"), 2);
+    }
+
+    #[test]
+    fn test_get_display_lines_tail_only() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "line 0".to_string(), 1000, LogSource::Process);
+        buffer.push_line("server", "line 1".to_string(), 2000, LogSource::Process);
+        buffer.push_line("server", "line 2".to_string(), 3000, LogSource::Process);
+
+        // No daemon total set — total = local len = 3
+        let lines = buffer.get_display_lines("server", 0, 3);
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| l.is_some()));
+        assert_eq!(lines[0].as_ref().unwrap().log.content, "line 0");
+        assert_eq!(lines[2].as_ref().unwrap().log.content, "line 2");
+    }
+
+    #[test]
+    fn test_get_display_lines_with_gaps() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "tail line".to_string(), 5000, LogSource::Process);
+
+        // Daemon has 1000 total lines, but we only have 1 locally
+        buffer.set_total_count("server", 1000);
+
+        // Request lines from the beginning — should have gaps
+        let lines = buffer.get_display_lines("server", 0, 5);
+        assert_eq!(lines.len(), 5);
+        // Lines 0-4 are all before the tail (tail_start = 999)
+        assert!(lines.iter().all(|l| l.is_none()));
+
+        // Request the last line — should be from the tail
+        let lines = buffer.get_display_lines("server", 999, 1);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].is_some());
+        assert_eq!(lines[0].as_ref().unwrap().log.content, "tail line");
+    }
+
+    #[test]
+    fn test_get_display_lines_with_cached_page() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "tail".to_string(), 5000, LogSource::Process);
+        buffer.set_total_count("server", 1000);
+
+        // Insert a page at offset 0
+        let page_lines = vec![
+            LogLine {
+                timestamp: 100,
+                process: "server".to_string(),
+                group: None,
+                content: "old line 0".to_string(),
+                source: LogSource::Process,
+            },
+            LogLine {
+                timestamp: 200,
+                process: "server".to_string(),
+                group: None,
+                content: "old line 1".to_string(),
+                source: LogSource::Process,
+            },
+        ];
+        buffer.insert_page("server", 0, page_lines, 1000);
+
+        // Request from the cached page
+        let lines = buffer.get_display_lines("server", 0, 2);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].as_ref().unwrap().log.content, "old line 0");
+        assert_eq!(lines[1].as_ref().unwrap().log.content, "old line 1");
+    }
+
+    #[test]
+    fn test_get_display_lines_combined() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "server line".to_string(), 1000, LogSource::Process);
+        buffer.push_line("worker", "worker line".to_string(), 2000, LogSource::Process);
+
+        let lines = buffer.get_display_lines("*", 0, 2);
+        assert_eq!(lines.len(), 2);
+        // Should be sorted by timestamp
+        assert_eq!(lines[0].as_ref().unwrap().process, "server");
+        assert_eq!(lines[1].as_ref().unwrap().process, "worker");
+    }
+
+    #[test]
+    fn test_needs_fetch_tail_range() {
+        let mut buffer = LogBuffer::new();
+        for i in 0..10 {
+            buffer.push_line("server", format!("line {}", i), i as u64 * 1000, LogSource::Process);
+        }
+        // total = local = 10, tail covers all
+        let fetches = buffer.needs_fetch("server", 0, 10);
+        assert!(fetches.is_empty());
+    }
+
+    #[test]
+    fn test_needs_fetch_history() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "tail".to_string(), 5000, LogSource::Process);
+        buffer.set_total_count("server", 1000);
+
+        // Request lines 0-200 (page 0) — should need fetching
+        let fetches = buffer.needs_fetch("server", 0, 200);
+        assert_eq!(fetches.len(), 1);
+        assert_eq!(fetches[0], (0, 200));
+    }
+
+    #[test]
+    fn test_needs_fetch_skips_cached() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "tail".to_string(), 5000, LogSource::Process);
+        buffer.set_total_count("server", 1000);
+
+        // Cache page 0
+        buffer.insert_page("server", 0, vec![], 1000);
+
+        let fetches = buffer.needs_fetch("server", 0, 200);
+        assert!(fetches.is_empty());
+    }
+
+    #[test]
+    fn test_needs_fetch_skips_pending() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "tail".to_string(), 5000, LogSource::Process);
+        buffer.set_total_count("server", 1000);
+
+        // Mark page 0 as pending
+        buffer.mark_pending("server", 0);
+
+        let fetches = buffer.needs_fetch("server", 0, 200);
+        assert!(fetches.is_empty());
+    }
+
+    #[test]
+    fn test_needs_fetch_no_fetch_with_filter() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "tail".to_string(), 5000, LogSource::Process);
+        buffer.set_total_count("server", 1000);
+        buffer.set_filter("tail").unwrap();
+
+        // With filter active, never fetch pages
+        let fetches = buffer.needs_fetch("server", 0, 200);
+        assert!(fetches.is_empty());
+    }
+
+    #[test]
+    fn test_clear_all_resets_page_cache() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "line".to_string(), 1000, LogSource::Process);
+        buffer.set_total_count("server", 5000);
+        buffer.insert_page("server", 0, vec![], 5000);
+
+        buffer.clear_all();
+
+        assert_eq!(buffer.total_count("server"), 0);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_clear_process_resets_page_cache() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "line".to_string(), 1000, LogSource::Process);
+        buffer.push_line("worker", "line".to_string(), 2000, LogSource::Process);
+        buffer.set_total_count("server", 5000);
+        buffer.set_total_count("worker", 3000);
+
+        buffer.clear_process("server");
+
+        assert_eq!(buffer.total_count("server"), 0);
+        assert_eq!(buffer.total_count("worker"), 3000);
+    }
+
+    #[test]
+    fn test_follow_mode_no_page_fetches() {
+        let mut buffer = LogBuffer::new();
+        for i in 0..100 {
+            buffer.push_line("server", format!("line {}", i), i as u64 * 100, LogSource::Process);
+        }
+        buffer.set_total_count("server", 10000);
+
+        // In follow mode, the last visible_height lines are from the tail
+        // Request lines from the end (follow mode position)
+        let start = 10000 - 20; // visible_height = 20
+        let lines = buffer.get_display_lines("server", start, 20);
+        // tail_start = 10000 - 100 = 9900, start = 9980 >= 9900
+        // All should be from the tail
+        assert_eq!(lines.len(), 20);
+        assert!(lines.iter().all(|l| l.is_some()));
     }
 }

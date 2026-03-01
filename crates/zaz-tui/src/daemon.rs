@@ -28,6 +28,25 @@ pub enum ClientCommand {
     UnsubscribeLogs(String),
     /// Request current status (one-shot).
     RefreshStatus,
+    /// Fetch a page of historical logs.
+    FetchPage {
+        name: String,
+        offset: usize,
+        limit: usize,
+    },
+}
+
+/// Result of a page fetch from the daemon.
+#[derive(Debug)]
+pub struct PageFetchResult {
+    /// Process name (or "*" for combined).
+    pub name: String,
+    /// Offset of the first line in this result.
+    pub offset: usize,
+    /// The fetched log lines.
+    pub lines: Vec<LogLine>,
+    /// Total number of logs available in the daemon.
+    pub total_count: usize,
 }
 
 /// Source of a log line.
@@ -80,6 +99,8 @@ pub struct DaemonConnection {
     state_rx: mpsc::Receiver<DaemonState>,
     /// Receive log lines from the background task.
     logs_rx: mpsc::Receiver<LogLine>,
+    /// Receive page fetch results from the background task.
+    page_rx: mpsc::Receiver<PageFetchResult>,
     /// Whether we're currently connected.
     connected: Arc<AtomicBool>,
     /// Socket path for reconnection.
@@ -96,6 +117,7 @@ impl DaemonConnection {
         let (command_tx, command_rx) = mpsc::channel::<ClientCommand>(32);
         let (state_tx, state_rx) = mpsc::channel::<DaemonState>(32);
         let (logs_tx, logs_rx) = mpsc::channel::<LogLine>(256);
+        let (page_tx, page_rx) = mpsc::channel::<PageFetchResult>(32);
         let connected = Arc::new(AtomicBool::new(false));
 
         let socket_path_owned = socket_path.to_path_buf();
@@ -108,6 +130,7 @@ impl DaemonConnection {
                 command_rx,
                 state_tx,
                 logs_tx,
+                page_tx,
                 connected_clone,
             )
             .await;
@@ -117,6 +140,7 @@ impl DaemonConnection {
             command_tx,
             state_rx,
             logs_rx,
+            page_rx,
             connected,
             socket_path: socket_path.to_path_buf(),
             _task_handle: task_handle,
@@ -175,6 +199,20 @@ impl DaemonConnection {
     pub fn shutdown(&self) -> Result<(), TuiError> {
         self.send_command(ClientCommand::Shutdown)
     }
+
+    /// Try to receive a page fetch result without blocking.
+    pub fn try_recv_page(&mut self) -> Option<PageFetchResult> {
+        self.page_rx.try_recv().ok()
+    }
+
+    /// Request a page of historical logs from the daemon.
+    pub fn fetch_page(&self, name: &str, offset: usize, limit: usize) -> Result<(), TuiError> {
+        self.send_command(ClientCommand::FetchPage {
+            name: name.to_string(),
+            offset,
+            limit,
+        })
+    }
 }
 
 /// Background task that handles async daemon communication.
@@ -183,6 +221,7 @@ async fn background_task(
     mut command_rx: mpsc::Receiver<ClientCommand>,
     state_tx: mpsc::Sender<DaemonState>,
     logs_tx: mpsc::Sender<LogLine>,
+    page_tx: mpsc::Sender<PageFetchResult>,
     connected: Arc<AtomicBool>,
 ) {
     let mut client: Option<Client> = None;
@@ -226,7 +265,7 @@ async fn background_task(
             // Handle incoming commands
             Some(cmd) = command_rx.recv() => {
                 if let Some(ref mut c) = client {
-                    let result = handle_command(c, cmd, &state_tx).await;
+                    let result = handle_command(c, cmd, &state_tx, &page_tx).await;
                     if result.is_err() {
                         // Connection lost, will reconnect
                         tracing::debug!("connection lost, will reconnect");
@@ -262,7 +301,7 @@ async fn background_task(
                         limit: Some(500),
                         search: None,
                     }).await {
-                        Ok(ApiResponse::Logs { lines, .. }) => {
+                        Ok(ApiResponse::Logs { lines, total_count, .. }) => {
                             // Find max timestamp first, then send all new logs
                             // This avoids dropping logs with the same timestamp
                             let mut max_ts = last_log_timestamp;
@@ -279,6 +318,16 @@ async fn background_task(
                             }
                             // Update after processing all
                             last_log_timestamp = max_ts;
+
+                            // Send total count update via page channel
+                            if let Some(tc) = total_count {
+                                let _ = page_tx.send(PageFetchResult {
+                                    name: "*".to_string(),
+                                    offset: 0,
+                                    lines: vec![],
+                                    total_count: tc,
+                                }).await;
+                            }
                         }
                         Ok(_) => {}
                         Err(_) => {
@@ -299,7 +348,45 @@ async fn handle_command(
     client: &mut Client,
     cmd: ClientCommand,
     state_tx: &mpsc::Sender<DaemonState>,
+    page_tx: &mpsc::Sender<PageFetchResult>,
 ) -> Result<(), TuiError> {
+    // Handle FetchPage separately since it routes through page_tx
+    if let ClientCommand::FetchPage {
+        name,
+        offset,
+        limit,
+    } = cmd
+    {
+        let response = client
+            .request(&ApiRequest::GetLogs {
+                name: name.clone(),
+                lines: None,
+                offset: Some(offset),
+                limit: Some(limit),
+                search: None,
+            })
+            .await
+            .map_err(|e| TuiError::Connection(e.to_string()))?;
+
+        if let ApiResponse::Logs {
+            lines,
+            total_count,
+            ..
+        } = response
+        {
+            let _ = page_tx
+                .send(PageFetchResult {
+                    name,
+                    offset,
+                    lines: lines.into_iter().map(|l| l.into()).collect(),
+                    total_count: total_count.unwrap_or(0),
+                })
+                .await;
+        }
+
+        return Ok(());
+    }
+
     let request = match cmd {
         ClientCommand::RestartGroup(name) => ApiRequest::RestartGroup { name },
         ClientCommand::RestartProcess { group, process } => {
@@ -313,6 +400,7 @@ async fn handle_command(
             // TODO: implement unsubscribe
             return Ok(());
         }
+        ClientCommand::FetchPage { .. } => unreachable!(),
     };
 
     let response = client
