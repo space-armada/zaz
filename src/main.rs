@@ -71,6 +71,20 @@ enum Commands {
     /// Stop the running daemon
     Stop,
 
+    /// Reload configuration (requires running daemon)
+    Reload,
+
+    /// Validate configuration file without starting daemon
+    Check {
+        /// Configuration file to check (defaults to zaz.toml or zaz.json)
+        #[arg(value_name = "FILE")]
+        config: Option<PathBuf>,
+
+        /// Output as JSON for tooling integration
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show default ignore patterns
     Ignores,
 }
@@ -164,6 +178,18 @@ async fn main() -> Result<()> {
                 cli.socket.clone().unwrap_or_else(default_socket_path)
             };
             stop_daemon(&socket_path).await
+        }
+        Some(Commands::Reload) => {
+            let socket_path = if let Ok(config_path) = find_config(&cli.config) {
+                get_socket_path(&config_path)
+            } else {
+                cli.socket.clone().unwrap_or_else(default_socket_path)
+            };
+            reload_config(&socket_path).await
+        }
+        Some(Commands::Check { config, json }) => {
+            let config_path = find_config(&config.or(cli.config.clone()))?;
+            check_config(&config_path, json)
         }
         Some(Commands::Ignores) => show_ignores(),
         None => {
@@ -424,11 +450,89 @@ async fn stop_daemon(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn reload_config(socket_path: &Path) -> Result<()> {
+    let mut client = match Client::connect(socket_path).await {
+        Ok(c) => c,
+        Err(_) => {
+            anyhow::bail!(
+                "No daemon running (could not connect to {})",
+                socket_path.display()
+            );
+        }
+    };
+
+    let response = client.request(&ApiRequest::ReloadConfig).await?;
+    match response {
+        ApiResponse::Ok { message } => {
+            println!(
+                "{}",
+                message.unwrap_or_else(|| "Configuration reloaded".to_string())
+            );
+        }
+        ApiResponse::Error { message } => {
+            anyhow::bail!("Error: {}", message);
+        }
+        _ => {
+            anyhow::bail!("Unexpected response");
+        }
+    }
+
+    Ok(())
+}
+
+fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct CheckResult {
+        valid: bool,
+        path: String,
+        errors: Vec<String>,
+    }
+
+    let result = zaz_config::load(config_path);
+    match result {
+        Ok(_config) => {
+            if json_output {
+                let result = CheckResult {
+                    valid: true,
+                    path: config_path.display().to_string(),
+                    errors: vec![],
+                };
+
+                println!("{}", serde_json::to_string(&result)?);
+                return Ok(());
+            }
+
+            println!("{}: OK", config_path.display());
+            Ok(())
+        }
+
+        Err(e) => {
+            if json_output {
+                let result = CheckResult {
+                    valid: false,
+                    path: config_path.display().to_string(),
+                    errors: vec![e.to_string()],
+                };
+
+                println!("{}", serde_json::to_string(&result)?);
+                std::process::exit(1);
+            }
+
+            eprintln!("{}: {}", config_path.display(), e);
+            eprintln!("\nFound 1 error in {}", config_path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
 fn show_ignores() -> Result<()> {
     println!("Default ignore patterns:");
     for pattern in zaz_watch::default_ignores() {
         println!("  {}", pattern);
     }
+
     Ok(())
 }
 
