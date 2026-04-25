@@ -7,7 +7,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
 use zaz_daemon::{
-    default_socket_path, socket_path_for_config, ApiRequest, ApiResponse, Client, Engine,
+    resolve_socket, socket_path_for_config,
+    ApiRequest, ApiResponse, Client, Engine,
     EngineCommand, Server,
 };
 
@@ -204,36 +205,23 @@ async fn main() -> Result<()> {
             run_daemon(&config_path, &socket_path, detach, quiet).await
         }
         Some(Commands::Status) => {
-            // For status/restart/stop without config, try to find config for socket path
-            let socket_path = if let Ok(config_path) = find_config(&cli.config) {
-                get_socket_path(&config_path)
-            } else {
-                cli.socket.clone().unwrap_or_else(default_socket_path)
-            };
+            let socket_path =
+                resolve_control_command_socket(&cli.config, cli.socket.clone(), &std::env::current_dir()?)?;
             show_status(&socket_path).await
         }
         Some(Commands::Restart { group }) => {
-            let socket_path = if let Ok(config_path) = find_config(&cli.config) {
-                get_socket_path(&config_path)
-            } else {
-                cli.socket.clone().unwrap_or_else(default_socket_path)
-            };
+            let socket_path =
+                resolve_control_command_socket(&cli.config, cli.socket.clone(), &std::env::current_dir()?)?;
             restart(&socket_path, group).await
         }
         Some(Commands::Stop) => {
-            let socket_path = if let Ok(config_path) = find_config(&cli.config) {
-                get_socket_path(&config_path)
-            } else {
-                cli.socket.clone().unwrap_or_else(default_socket_path)
-            };
+            let socket_path =
+                resolve_control_command_socket(&cli.config, cli.socket.clone(), &std::env::current_dir()?)?;
             stop_daemon(&socket_path).await
         }
         Some(Commands::Reload) => {
-            let socket_path = if let Ok(config_path) = find_config(&cli.config) {
-                get_socket_path(&config_path)
-            } else {
-                cli.socket.clone().unwrap_or_else(default_socket_path)
-            };
+            let socket_path =
+                resolve_control_command_socket(&cli.config, cli.socket.clone(), &std::env::current_dir()?)?;
             reload_config(&socket_path).await
         }
         Some(Commands::Check { config, json }) => {
@@ -265,6 +253,23 @@ fn find_config(explicit: &Option<PathBuf>) -> Result<PathBuf> {
         Ok((path, _)) => Ok(path),
         Err(e) => anyhow::bail!("no config file found: {}", e),
     }
+}
+
+fn resolve_control_command_socket(
+    explicit_config: &Option<PathBuf>,
+    explicit_socket: Option<PathBuf>,
+    start_dir: &Path,
+) -> Result<PathBuf> {
+    if let Some(socket_path) = explicit_socket {
+        return Ok(socket_path);
+    }
+
+    if explicit_config.is_some() {
+        let config_path = find_config(explicit_config)?;
+        return Ok(socket_path_for_config(&config_path));
+    }
+
+    Ok(resolve_socket(None, start_dir)?)
 }
 
 async fn run_tasks(config_path: &Path) -> Result<()> {
@@ -840,6 +845,86 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
     app.run()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_control_command_socket;
+    use anyhow::Result;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+    use zaz_daemon::{socket_path_for_config, DaemonError};
+
+    #[test]
+    fn control_command_socket_uses_explicit_socket() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "")?;
+
+        let explicit_socket = temp.path().join("explicit.sock");
+        let resolved = resolve_control_command_socket(
+            &Some(config_path),
+            Some(explicit_socket.clone()),
+            temp.path(),
+        )?;
+
+        assert_eq!(resolved, explicit_socket);
+        Ok(())
+    }
+
+    #[test]
+    fn control_command_socket_uses_explicit_config() -> Result<()> {
+        let temp = TempDir::new()?;
+        let project_dir = temp.path().join("project");
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&project_dir)?;
+        std::fs::create_dir_all(&elsewhere)?;
+
+        let config_path = project_dir.join("zaz.toml");
+        std::fs::write(&config_path, "")?;
+
+        let resolved = resolve_control_command_socket(&Some(config_path.clone()), None, &elsewhere)?;
+
+        assert_eq!(resolved, socket_path_for_config(&config_path));
+        Ok(())
+    }
+
+    #[test]
+    fn control_command_socket_discovers_project_from_start_dir() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "")?;
+
+        let nested = temp.path().join("a/b/c");
+        std::fs::create_dir_all(&nested)?;
+
+        let resolved = resolve_control_command_socket(&None, None, &nested)?;
+
+        assert_eq!(resolved, socket_path_for_config(&config_path));
+        Ok(())
+    }
+
+    #[test]
+    fn control_command_socket_errors_outside_project_without_socket() -> Result<()> {
+        let temp = TempDir::new()?;
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside)?;
+
+        let err = resolve_control_command_socket(&None, None, &outside).unwrap_err();
+        let daemon_err = err.downcast_ref::<DaemonError>().expect("daemon error");
+
+        match daemon_err {
+            DaemonError::SocketResolution { start_dir } => {
+                assert_eq!(start_dir, &PathBuf::from(&outside));
+            }
+            other => panic!("expected socket resolution error, got {:?}", other),
+        }
+
+        let message = err.to_string();
+        assert!(message.contains("--socket <PATH>"));
+        assert!(message.contains("zaz project directory"));
+        Ok(())
+    }
 }
 
 fn now_ms() -> u64 {
