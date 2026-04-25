@@ -343,6 +343,61 @@ mod tests {
     }
 
     #[test]
+    fn test_logs_response_backward_compatible_serialization() {
+        let resp = ApiResponse::Logs {
+            name: "server".to_string(),
+            lines: vec![],
+            total_count: None,
+            has_more: None,
+            offset: None,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""type":"logs""#));
+        assert!(json.contains(r#""name":"server""#));
+        assert!(json.contains(r#""lines":[]"#));
+        assert!(!json.contains("total_count"));
+        assert!(!json.contains("has_more"));
+        assert!(!json.contains(r#""offset":"#));
+    }
+
+    #[test]
+    fn test_logs_response_pagination_fields_round_trip() {
+        let resp = ApiResponse::Logs {
+            name: "*".to_string(),
+            lines: vec![LogLine::process("server", "hello")],
+            total_count: Some(125),
+            has_more: Some(true),
+            offset: Some(50),
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""total_count":125"#));
+        assert!(json.contains(r#""has_more":true"#));
+        assert!(json.contains(r#""offset":50"#));
+
+        let parsed: ApiResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ApiResponse::Logs {
+                name,
+                lines,
+                total_count,
+                has_more,
+                offset,
+            } => {
+                assert_eq!(name, "*");
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0].process, "server");
+                assert_eq!(lines[0].content, "hello");
+                assert_eq!(total_count, Some(125));
+                assert_eq!(has_more, Some(true));
+                assert_eq!(offset, Some(50));
+            }
+            _ => panic!("expected Logs"),
+        }
+    }
+
+    #[test]
     fn test_all_request_variants() {
         // Ensure all variants can be serialized and deserialized
         let requests = vec![

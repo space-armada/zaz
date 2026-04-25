@@ -2679,6 +2679,7 @@ fn topological_sort(groups: &[Group]) -> Result<Vec<String>, DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ApiRequest;
     use zaz_config::{Group, Silence, TaskCommand};
 
     // =========================================================================
@@ -2794,6 +2795,84 @@ mod tests {
         let group = engine.groups.get("mygroup").unwrap();
         assert_eq!(group.state.tasks[0].status, ProcessStatus::Failed);
         assert_eq!(group.state.tasks[0].exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_handle_api_get_logs_legacy_response_omits_pagination_metadata() {
+        let groups = vec![test_group("mygroup", &["task1"])];
+        let mut engine = create_test_engine(groups);
+
+        engine.push_log(LogLine::process("task1", "line 1").with_group("mygroup"));
+        engine.push_log(LogLine::process("task1", "line 2").with_group("mygroup"));
+
+        let response = engine
+            .handle_request(ApiRequest::GetLogs {
+                name: "task1".to_string(),
+                lines: Some(1),
+                offset: None,
+                limit: None,
+                search: None,
+            })
+            .await;
+
+        match response {
+            ApiResponse::Logs {
+                name,
+                lines,
+                total_count,
+                has_more,
+                offset,
+            } => {
+                assert_eq!(name, "task1");
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0].content, "line 2");
+                assert_eq!(total_count, None);
+                assert_eq!(has_more, None);
+                assert_eq!(offset, None);
+            }
+            other => panic!("expected logs response, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_api_get_logs_pagination_returns_metadata() {
+        let groups = vec![test_group("mygroup", &["task1"])];
+        let mut engine = create_test_engine(groups);
+
+        for i in 0..5 {
+            engine.push_log(
+                LogLine::process("task1", format!("error line {}", i)).with_group("mygroup"),
+            );
+        }
+
+        let response = engine
+            .handle_request(ApiRequest::GetLogs {
+                name: "task1".to_string(),
+                lines: None,
+                offset: Some(1),
+                limit: Some(2),
+                search: Some("ERROR".to_string()),
+            })
+            .await;
+
+        match response {
+            ApiResponse::Logs {
+                name,
+                lines,
+                total_count,
+                has_more,
+                offset,
+            } => {
+                assert_eq!(name, "task1");
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0].content, "error line 1");
+                assert_eq!(lines[1].content, "error line 2");
+                assert_eq!(total_count, Some(5));
+                assert_eq!(has_more, Some(true));
+                assert_eq!(offset, Some(1));
+            }
+            other => panic!("expected logs response, got {:?}", other),
+        }
     }
 
     #[tokio::test]
