@@ -7,9 +7,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
 use zaz_daemon::{
-    resolve_socket, socket_path_for_config,
-    ApiRequest, ApiResponse, Client, Engine,
-    EngineCommand, Server,
+    resolve_socket, socket_path_for_config, ApiRequest, ApiResponse, Client, Engine, EngineCommand,
+    Server,
 };
 
 #[derive(Parser)]
@@ -182,17 +181,11 @@ fn init_tracing(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let current_dir = std::env::current_dir()?;
 
     // Determine if we're running in TUI mode (default command with no subcommand)
     let is_tui_mode = cli.command.is_none();
     let _log_guard = init_tracing(cli.debug, is_tui_mode, cli.log_file.as_deref());
-
-    // Helper to get socket path: CLI override, or config-specific path
-    let get_socket_path = |config_path: &Path| -> PathBuf {
-        cli.socket
-            .clone()
-            .unwrap_or_else(|| socket_path_for_config(config_path))
-    };
 
     match cli.command {
         Some(Commands::Task) => {
@@ -201,27 +194,28 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Daemon { detach, quiet }) => {
             let config_path = find_config(&cli.config)?;
-            let socket_path = get_socket_path(&config_path);
+            let socket_path =
+                resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             run_daemon(&config_path, &socket_path, detach, quiet).await
         }
         Some(Commands::Status) => {
             let socket_path =
-                resolve_control_command_socket(&cli.config, cli.socket.clone(), &std::env::current_dir()?)?;
+                resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             show_status(&socket_path).await
         }
         Some(Commands::Restart { group }) => {
             let socket_path =
-                resolve_control_command_socket(&cli.config, cli.socket.clone(), &std::env::current_dir()?)?;
+                resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             restart(&socket_path, group).await
         }
         Some(Commands::Stop) => {
             let socket_path =
-                resolve_control_command_socket(&cli.config, cli.socket.clone(), &std::env::current_dir()?)?;
+                resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             stop_daemon(&socket_path).await
         }
         Some(Commands::Reload) => {
             let socket_path =
-                resolve_control_command_socket(&cli.config, cli.socket.clone(), &std::env::current_dir()?)?;
+                resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             reload_config(&socket_path).await
         }
         Some(Commands::Check { config, json }) => {
@@ -231,7 +225,8 @@ async fn main() -> Result<()> {
         Some(Commands::Ignores) => show_ignores(),
         None => {
             let config_path = find_config(&cli.config)?;
-            let socket_path = get_socket_path(&config_path);
+            let socket_path =
+                resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             let user_config = load_user_config();
             let tui_options = TuiOptions::from_cli_and_user_config(&cli, &user_config);
             run_tui(&config_path, &socket_path, &tui_options).await
@@ -256,6 +251,14 @@ fn find_config(explicit: &Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn resolve_control_command_socket(
+    explicit_config: &Option<PathBuf>,
+    explicit_socket: Option<PathBuf>,
+    start_dir: &Path,
+) -> Result<PathBuf> {
+    resolve_command_socket(explicit_config, explicit_socket, start_dir)
+}
+
+fn resolve_command_socket(
     explicit_config: &Option<PathBuf>,
     explicit_socket: Option<PathBuf>,
     start_dir: &Path,
@@ -849,7 +852,7 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_control_command_socket;
+    use super::{resolve_command_socket, resolve_control_command_socket};
     use anyhow::Result;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -873,6 +876,77 @@ mod tests {
     }
 
     #[test]
+    fn command_socket_uses_explicit_socket() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "")?;
+
+        let explicit_socket = temp.path().join("explicit.sock");
+        let resolved = resolve_command_socket(
+            &Some(config_path),
+            Some(explicit_socket.clone()),
+            temp.path(),
+        )?;
+
+        assert_eq!(resolved, explicit_socket);
+        Ok(())
+    }
+
+    #[test]
+    fn command_socket_uses_explicit_config() -> Result<()> {
+        let temp = TempDir::new()?;
+        let project_dir = temp.path().join("project");
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&project_dir)?;
+        std::fs::create_dir_all(&elsewhere)?;
+
+        let config_path = project_dir.join("zaz.toml");
+        std::fs::write(&config_path, "")?;
+
+        let resolved = resolve_command_socket(&Some(config_path.clone()), None, &elsewhere)?;
+
+        assert_eq!(resolved, socket_path_for_config(&config_path));
+        Ok(())
+    }
+
+    #[test]
+    fn command_socket_discovers_project_from_start_dir() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "")?;
+
+        let nested = temp.path().join("a/b/c");
+        std::fs::create_dir_all(&nested)?;
+
+        let resolved = resolve_command_socket(&None, None, &nested)?;
+
+        assert_eq!(resolved, socket_path_for_config(&config_path));
+        Ok(())
+    }
+
+    #[test]
+    fn command_socket_errors_outside_project_without_socket() -> Result<()> {
+        let temp = TempDir::new()?;
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside)?;
+
+        let err = resolve_command_socket(&None, None, &outside).unwrap_err();
+        let daemon_err = err.downcast_ref::<DaemonError>().expect("daemon error");
+
+        match daemon_err {
+            DaemonError::SocketResolution { start_dir } => {
+                assert_eq!(start_dir, &PathBuf::from(&outside));
+            }
+            other => panic!("expected socket resolution error, got {:?}", other),
+        }
+
+        let message = err.to_string();
+        assert!(message.contains("--socket <PATH>"));
+        assert!(message.contains("zaz project directory"));
+        Ok(())
+    }
+
+    #[test]
     fn control_command_socket_uses_explicit_config() -> Result<()> {
         let temp = TempDir::new()?;
         let project_dir = temp.path().join("project");
@@ -883,7 +957,8 @@ mod tests {
         let config_path = project_dir.join("zaz.toml");
         std::fs::write(&config_path, "")?;
 
-        let resolved = resolve_control_command_socket(&Some(config_path.clone()), None, &elsewhere)?;
+        let resolved =
+            resolve_control_command_socket(&Some(config_path.clone()), None, &elsewhere)?;
 
         assert_eq!(resolved, socket_path_for_config(&config_path));
         Ok(())
