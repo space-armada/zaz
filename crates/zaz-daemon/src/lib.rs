@@ -18,5 +18,5 @@ pub use engine::Engine;
 pub use error::DaemonError;
 pub use log_layer::DaemonLogLayer;
 pub use log_storage::{LogQuery, LogQueryResult, LogStorage, LogStorageStats};
-pub use server::{default_socket_path, resolve_socket, socket_path_for_config, Client, Server};
+pub use server::{resolve_socket, socket_path_for_config, Client, Server};
 pub use state::{DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus};

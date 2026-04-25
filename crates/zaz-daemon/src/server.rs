@@ -98,7 +98,8 @@ fn discover_config_upward(start_dir: &Path) -> Option<PathBuf> {
 /// Uses `$XDG_RUNTIME_DIR/zaz.sock` if available (preferred).
 /// Falls back to `~/.local/state/zaz/zaz.sock` for user-specific access.
 /// As a last resort, uses `/tmp/zaz-<username>.sock`.
-pub fn default_socket_path() -> PathBuf {
+#[cfg_attr(not(test), allow(dead_code))]
+fn default_socket_path() -> PathBuf {
     // Prefer XDG_RUNTIME_DIR (e.g., /run/user/1000/) - already user-private
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime_dir).join("zaz.sock");
