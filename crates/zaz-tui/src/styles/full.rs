@@ -601,7 +601,9 @@ impl FullStyle {
                 .min(total_lines.saturating_sub(visible_height))
         };
 
-        let display_lines = app.logs.get_display_lines("*", scroll_offset, visible_height);
+        let display_lines = app
+            .logs
+            .get_display_lines("*", scroll_offset, visible_height);
 
         let reference_day = display_lines
             .iter()
@@ -616,8 +618,9 @@ impl FullStyle {
                     let is_match = app.logs.is_search_match(&paged.log.content);
                     let is_daemon_log = paged.log.source == crate::daemon::LogSource::Daemon;
 
-                    let timestamp =
-                        paged.log.format_timestamp(reference_day, app.show_full_timestamp);
+                    let timestamp = paged
+                        .log
+                        .format_timestamp(reference_day, app.show_full_timestamp);
 
                     // Build prefix spans (timestamp and process name)
                     let prefix_spans = vec![
@@ -650,8 +653,7 @@ impl FullStyle {
                     };
 
                     if is_match {
-                        ListItem::new(line)
-                            .style(Style::default().add_modifier(Modifier::REVERSED))
+                        ListItem::new(line).style(Style::default().add_modifier(Modifier::REVERSED))
                     } else {
                         ListItem::new(line)
                     }

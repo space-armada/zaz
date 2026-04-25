@@ -359,8 +359,14 @@ tui_style = "full"
         assert_eq!(parse_byte_size("2GB"), Some(2 * 1024 * 1024 * 1024));
 
         // Fractional values
-        assert_eq!(parse_byte_size("1.5MB"), Some((1.5 * 1024.0 * 1024.0) as usize));
-        assert_eq!(parse_byte_size("0.5GB"), Some((0.5 * 1024.0 * 1024.0 * 1024.0) as usize));
+        assert_eq!(
+            parse_byte_size("1.5MB"),
+            Some((1.5 * 1024.0 * 1024.0) as usize)
+        );
+        assert_eq!(
+            parse_byte_size("0.5GB"),
+            Some((0.5 * 1024.0 * 1024.0 * 1024.0) as usize)
+        );
 
         // With whitespace
         assert_eq!(parse_byte_size("  100MB  "), Some(100 * 1024 * 1024));

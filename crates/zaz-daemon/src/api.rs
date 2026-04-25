@@ -284,7 +284,13 @@ mod tests {
         let json = r#"{"type":"get_logs","name":"server","lines":100}"#;
         let req: ApiRequest = serde_json::from_str(json).unwrap();
         match req {
-            ApiRequest::GetLogs { name, lines, offset, limit, search } => {
+            ApiRequest::GetLogs {
+                name,
+                lines,
+                offset,
+                limit,
+                search,
+            } => {
                 assert_eq!(name, "server");
                 assert_eq!(lines, Some(100));
                 assert_eq!(offset, None);
@@ -298,7 +304,13 @@ mod tests {
         let json = r#"{"type":"get_logs","name":"*","offset":50,"limit":25,"search":"error"}"#;
         let req: ApiRequest = serde_json::from_str(json).unwrap();
         match req {
-            ApiRequest::GetLogs { name, lines, offset, limit, search } => {
+            ApiRequest::GetLogs {
+                name,
+                lines,
+                offset,
+                limit,
+                search,
+            } => {
                 assert_eq!(name, "*");
                 assert_eq!(lines, None);
                 assert_eq!(offset, Some(50));

@@ -1,5 +1,6 @@
 //! Error types for the daemon.
 
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Errors that can occur in the daemon.
@@ -40,4 +41,11 @@ pub enum DaemonError {
     /// Task failed.
     #[error("task '{task}' failed: {error}")]
     TaskFailed { task: String, error: String },
+
+    /// Socket target could not be resolved from the current location.
+    #[error(
+        "could not resolve daemon socket from {}: run this command from a zaz project directory or pass --socket <PATH>",
+        start_dir.display()
+    )]
+    SocketResolution { start_dir: PathBuf },
 }

@@ -153,10 +153,7 @@ impl DependencyResolver {
     /// or None if all dependencies are already satisfied.
     pub fn mark_waiting(&mut self, group: &str) -> Option<HashSet<String>> {
         let deps = self.get_dependencies(group);
-        let unready: HashSet<String> = deps
-            .into_iter()
-            .filter(|d| !self.is_ready(d))
-            .collect();
+        let unready: HashSet<String> = deps.into_iter().filter(|d| !self.is_ready(d)).collect();
 
         if unready.is_empty() {
             None

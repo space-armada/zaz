@@ -19,3 +19,6 @@ zaz-config.workspace = true
 zaz-process.workspace = true
 zaz-vars.workspace = true
 zaz-watch.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

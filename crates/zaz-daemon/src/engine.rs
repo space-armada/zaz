@@ -1693,8 +1693,7 @@ impl Engine {
             return Err(DaemonError::GroupNotFound(group_name.to_string()));
         }
         tracing::info!(group = group_name, "restarting group");
-        let trigger_ctx =
-            self.manual_restart_context(RestartScope::Group(group_name.to_string()));
+        let trigger_ctx = self.manual_restart_context(RestartScope::Group(group_name.to_string()));
         self.spawn_group_tasks(group_name, &trigger_ctx);
         Ok(())
     }
@@ -1820,10 +1819,7 @@ impl Engine {
     }
 
     /// Compute changes between current config and new config.
-    fn get_config_changes(
-        &self,
-        new_config: &Config,
-    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+    fn get_config_changes(&self, new_config: &Config) -> (Vec<String>, Vec<String>, Vec<String>) {
         compute_config_changes(&self.config.groups, &new_config.groups)
     }
 
@@ -2235,7 +2231,7 @@ impl Engine {
                 .with_variables(self.config.variables.clone())
                 .with_root(config_dir.to_path_buf()),
             run_on_change_tasks: false, // Don't run on_change_only tasks for manual restarts
-            should_cascade: true,        // Manual restarts cascade to dependents
+            should_cascade: true,       // Manual restarts cascade to dependents
         }
     }
 
@@ -2729,7 +2725,12 @@ mod tests {
     }
 
     /// Create a TaskCompletion for testing.
-    fn task_completion(group: &str, task: &str, task_index: usize, success: bool) -> TaskCompletion {
+    fn task_completion(
+        group: &str,
+        task: &str,
+        task_index: usize,
+        success: bool,
+    ) -> TaskCompletion {
         TaskCompletion {
             task_id: format!("{}:{}", group, task),
             group_name: group.to_string(),
@@ -2933,8 +2934,7 @@ mod tests {
         // Group goes to Failed, then cascade_skip may change it to Skipped
         // Both indicate failure - check for either
         assert!(
-            group.state.status == GroupStatus::Failed
-                || group.state.status == GroupStatus::Skipped,
+            group.state.status == GroupStatus::Failed || group.state.status == GroupStatus::Skipped,
             "Expected Failed or Skipped, got {:?}",
             group.state.status
         );
@@ -3050,8 +3050,7 @@ mod tests {
         // Group either stays Pending (daemon action queued but not fully processed)
         // or becomes Ready (if handle_daemon_action completed)
         assert!(
-            group.state.status == GroupStatus::Pending
-                || group.state.status == GroupStatus::Ready,
+            group.state.status == GroupStatus::Pending || group.state.status == GroupStatus::Ready,
             "Expected Pending or Ready for daemon start signal, got {:?}",
             group.state.status
         );
@@ -3969,7 +3968,9 @@ mod tests {
         engine.groups.get_mut("a").unwrap().state.status = GroupStatus::Waiting;
         engine.dependency_resolver.mark_waiting("a");
         engine.groups.get_mut("b").unwrap().state.status = GroupStatus::Ready;
-        engine.dependency_resolver.set_status("b", GroupStatus::Ready);
+        engine
+            .dependency_resolver
+            .set_status("b", GroupStatus::Ready);
 
         // Trigger dependents of b
         engine.trigger_dependents("b");
@@ -4148,8 +4149,10 @@ mod tests {
         engine.process_task_completions().await;
 
         // b should be Failed or Skipped
-        assert!(engine.groups.get("b").unwrap().state.status == GroupStatus::Failed
-            || engine.groups.get("b").unwrap().state.status == GroupStatus::Skipped);
+        assert!(
+            engine.groups.get("b").unwrap().state.status == GroupStatus::Failed
+                || engine.groups.get("b").unwrap().state.status == GroupStatus::Skipped
+        );
 
         // a should be Skipped
         assert_eq!(
@@ -4212,9 +4215,13 @@ mod tests {
 
         // Both groups are already Ready (simulating post-startup state)
         engine.groups.get_mut("a").unwrap().state.status = GroupStatus::Ready;
-        engine.dependency_resolver.set_status("a", GroupStatus::Ready);
+        engine
+            .dependency_resolver
+            .set_status("a", GroupStatus::Ready);
         engine.groups.get_mut("b").unwrap().state.status = GroupStatus::Ready;
-        engine.dependency_resolver.set_status("b", GroupStatus::Ready);
+        engine
+            .dependency_resolver
+            .set_status("b", GroupStatus::Ready);
 
         // Call trigger_dependents (simulating what happens after a restart)
         engine.trigger_dependents("a");

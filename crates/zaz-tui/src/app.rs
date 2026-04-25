@@ -425,12 +425,10 @@ impl App {
 
                 if let Some(process_name) = processes.get(pane) {
                     let total = self.logs.total_count(process_name);
-                    let visible = self
-                        .pane_visible_height
-                        .get(&pane)
-                        .copied()
-                        .unwrap_or(20);
-                    let scroll = self.get_pane_scroll(pane).min(total.saturating_sub(visible));
+                    let visible = self.pane_visible_height.get(&pane).copied().unwrap_or(20);
+                    let scroll = self
+                        .get_pane_scroll(pane)
+                        .min(total.saturating_sub(visible));
 
                     let start = scroll.saturating_sub(PAGE_SIZE);
                     let end = (scroll + visible + PAGE_SIZE).min(total);
@@ -439,8 +437,7 @@ impl App {
                     self.pane_loading.insert(pane, !fetches.is_empty());
 
                     for (offset, limit) in fetches {
-                        self.logs
-                            .mark_pending(process_name, offset / PAGE_SIZE);
+                        self.logs.mark_pending(process_name, offset / PAGE_SIZE);
                         if let Some(ref daemon_conn) = self.daemon {
                             let _ = daemon_conn.fetch_page(process_name, offset, limit);
                         }

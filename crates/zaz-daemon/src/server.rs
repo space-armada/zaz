@@ -50,6 +50,49 @@ pub fn socket_path_for_config(config_path: &Path) -> PathBuf {
     state_dir.join(format!("{:016x}.sock", hash))
 }
 
+/// Resolve the daemon socket for a command invocation.
+///
+/// Resolution order:
+/// 1. Explicit `--socket` override, if provided
+/// 2. Project config discovered by walking upward from `start_dir`
+/// 3. Actionable error if no project config can be found
+pub fn resolve_socket(
+    explicit_socket: Option<PathBuf>,
+    start_dir: &Path,
+) -> Result<PathBuf, DaemonError> {
+    if let Some(socket) = explicit_socket {
+        return Ok(socket);
+    }
+
+    let config_path =
+        discover_config_upward(start_dir).ok_or_else(|| DaemonError::SocketResolution {
+            start_dir: start_dir.to_path_buf(),
+        })?;
+
+    Ok(socket_path_for_config(&config_path))
+}
+
+fn discover_config_upward(start_dir: &Path) -> Option<PathBuf> {
+    let mut current = if start_dir.is_file() {
+        start_dir.parent()?.to_path_buf()
+    } else {
+        start_dir.to_path_buf()
+    };
+
+    loop {
+        for filename in zaz_config::CONFIG_FILES {
+            let path = current.join(filename);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 /// Default socket path (legacy, for when no config is known).
 ///
 /// Uses `$XDG_RUNTIME_DIR/zaz.sock` if available (preferred).
@@ -222,6 +265,7 @@ mod tests {
     use super::*;
     use crate::ApiRequest;
     use std::time::Duration;
+    use tempfile::TempDir;
 
     #[tokio::test]
     #[ignore = "requires Unix socket permissions"]
@@ -279,5 +323,84 @@ mod tests {
             filename.starts_with("zaz"),
             "socket filename should start with 'zaz'"
         );
+    }
+
+    #[test]
+    fn test_resolve_socket_explicit_socket_wins() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let explicit = temp.path().join("custom.sock");
+        let resolved = resolve_socket(Some(explicit.clone()), temp.path()).unwrap();
+
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn test_resolve_socket_uses_local_toml_config() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let resolved = resolve_socket(None, temp.path()).unwrap();
+
+        assert_eq!(resolved, socket_path_for_config(&config_path));
+    }
+
+    #[test]
+    fn test_resolve_socket_walks_upward_to_parent_config() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let nested = temp.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let resolved = resolve_socket(None, &nested).unwrap();
+
+        assert_eq!(resolved, socket_path_for_config(&config_path));
+    }
+
+    #[test]
+    fn test_resolve_socket_prefers_toml_before_json() {
+        let temp = TempDir::new().unwrap();
+        let toml_path = temp.path().join("zaz.toml");
+        let json_path = temp.path().join("zaz.json");
+        std::fs::write(&toml_path, "").unwrap();
+        std::fs::write(&json_path, "{}").unwrap();
+
+        let resolved = resolve_socket(None, temp.path()).unwrap();
+
+        assert_eq!(resolved, socket_path_for_config(&toml_path));
+    }
+
+    #[test]
+    fn test_resolve_socket_uses_json_when_toml_absent() {
+        let temp = TempDir::new().unwrap();
+        let json_path = temp.path().join("zaz.json");
+        std::fs::write(&json_path, "{}").unwrap();
+
+        let resolved = resolve_socket(None, temp.path()).unwrap();
+
+        assert_eq!(resolved, socket_path_for_config(&json_path));
+    }
+
+    #[test]
+    fn test_resolve_socket_errors_when_no_project_config_found() {
+        let temp = TempDir::new().unwrap();
+        let nested = temp.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let err = resolve_socket(None, &nested).unwrap_err();
+
+        match &err {
+            DaemonError::SocketResolution { start_dir } => assert_eq!(start_dir, &nested),
+            other => panic!("expected SocketResolution error, got {:?}", other),
+        }
+
+        let message = err.to_string();
+        assert!(message.contains("--socket <PATH>"));
+        assert!(message.contains("zaz project directory"));
     }
 }

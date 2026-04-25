@@ -143,7 +143,9 @@ impl LogStore {
         // Per-process eviction: trim to max size
         while buffer.len() > self.max_lines_per_process {
             if let Some(evicted) = buffer.pop_front() {
-                self.estimated_memory = self.estimated_memory.saturating_sub(Self::estimate_log_size(&evicted));
+                self.estimated_memory = self
+                    .estimated_memory
+                    .saturating_sub(Self::estimate_log_size(&evicted));
             }
         }
 
@@ -391,8 +393,9 @@ impl LogStorage for LogStore {
         for buffer in self.buffers.values_mut() {
             while buffer.len() > max {
                 if let Some(evicted) = buffer.pop_front() {
-                    self.estimated_memory =
-                        self.estimated_memory.saturating_sub(Self::estimate_log_size(&evicted));
+                    self.estimated_memory = self
+                        .estimated_memory
+                        .saturating_sub(Self::estimate_log_size(&evicted));
                 }
             }
         }

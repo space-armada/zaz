@@ -847,8 +847,9 @@ impl MultiPaneStyle {
                     let is_match = app.logs.is_search_match(&paged.log.content);
                     let is_daemon_log = paged.log.source == crate::daemon::LogSource::Daemon;
 
-                    let timestamp =
-                        paged.log.format_timestamp(reference_day, app.show_full_timestamp);
+                    let timestamp = paged
+                        .log
+                        .format_timestamp(reference_day, app.show_full_timestamp);
 
                     // Build prefix spans (timestamp only for multi-pane)
                     let prefix_spans = vec![Span::styled(
@@ -874,8 +875,7 @@ impl MultiPaneStyle {
                     };
 
                     if is_match {
-                        ListItem::new(line)
-                            .style(Style::default().add_modifier(Modifier::REVERSED))
+                        ListItem::new(line).style(Style::default().add_modifier(Modifier::REVERSED))
                     } else {
                         ListItem::new(line)
                     }

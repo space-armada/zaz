@@ -1380,16 +1380,22 @@ mod tests {
     fn test_page_cache_insert_and_get() {
         let mut cache = PageCache::new();
         let lines = vec![
-            ("proc".to_string(), StoredLog {
-                timestamp: 1000,
-                content: "line 0".to_string(),
-                source: LogSource::Process,
-            }),
-            ("proc".to_string(), StoredLog {
-                timestamp: 2000,
-                content: "line 1".to_string(),
-                source: LogSource::Process,
-            }),
+            (
+                "proc".to_string(),
+                StoredLog {
+                    timestamp: 1000,
+                    content: "line 0".to_string(),
+                    source: LogSource::Process,
+                },
+            ),
+            (
+                "proc".to_string(),
+                StoredLog {
+                    timestamp: 2000,
+                    content: "line 1".to_string(),
+                    source: LogSource::Process,
+                },
+            ),
         ];
 
         cache.insert(0, lines);
@@ -1413,13 +1419,17 @@ mod tests {
 
         // Insert 11 pages — first should be evicted
         for i in 0..11 {
-            cache.insert(i, vec![
-                (format!("proc_{}", i), StoredLog {
-                    timestamp: i as u64 * 1000,
-                    content: format!("page {}", i),
-                    source: LogSource::Process,
-                }),
-            ]);
+            cache.insert(
+                i,
+                vec![(
+                    format!("proc_{}", i),
+                    StoredLog {
+                        timestamp: i as u64 * 1000,
+                        content: format!("page {}", i),
+                        source: LogSource::Process,
+                    },
+                )],
+            );
         }
 
         // Page 0 should be evicted (first inserted)
@@ -1484,9 +1494,24 @@ mod tests {
     #[test]
     fn test_total_count_with_filter() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "INFO: started".to_string(), 1000, LogSource::Process);
-        buffer.push_line("server", "DEBUG: details".to_string(), 2000, LogSource::Process);
-        buffer.push_line("server", "INFO: running".to_string(), 3000, LogSource::Process);
+        buffer.push_line(
+            "server",
+            "INFO: started".to_string(),
+            1000,
+            LogSource::Process,
+        );
+        buffer.push_line(
+            "server",
+            "DEBUG: details".to_string(),
+            2000,
+            LogSource::Process,
+        );
+        buffer.push_line(
+            "server",
+            "INFO: running".to_string(),
+            3000,
+            LogSource::Process,
+        );
 
         buffer.set_total_count("server", 10000);
 
@@ -1569,8 +1594,18 @@ mod tests {
     #[test]
     fn test_get_display_lines_combined() {
         let mut buffer = LogBuffer::new();
-        buffer.push_line("server", "server line".to_string(), 1000, LogSource::Process);
-        buffer.push_line("worker", "worker line".to_string(), 2000, LogSource::Process);
+        buffer.push_line(
+            "server",
+            "server line".to_string(),
+            1000,
+            LogSource::Process,
+        );
+        buffer.push_line(
+            "worker",
+            "worker line".to_string(),
+            2000,
+            LogSource::Process,
+        );
 
         let lines = buffer.get_display_lines("*", 0, 2);
         assert_eq!(lines.len(), 2);
@@ -1583,7 +1618,12 @@ mod tests {
     fn test_needs_fetch_tail_range() {
         let mut buffer = LogBuffer::new();
         for i in 0..10 {
-            buffer.push_line("server", format!("line {}", i), i as u64 * 1000, LogSource::Process);
+            buffer.push_line(
+                "server",
+                format!("line {}", i),
+                i as u64 * 1000,
+                LogSource::Process,
+            );
         }
         // total = local = 10, tail covers all
         let fetches = buffer.needs_fetch("server", 0, 10);
@@ -1671,7 +1711,12 @@ mod tests {
     fn test_follow_mode_no_page_fetches() {
         let mut buffer = LogBuffer::new();
         for i in 0..100 {
-            buffer.push_line("server", format!("line {}", i), i as u64 * 100, LogSource::Process);
+            buffer.push_line(
+                "server",
+                format!("line {}", i),
+                i as u64 * 100,
+                LogSource::Process,
+            );
         }
         buffer.set_total_count("server", 10000);
 

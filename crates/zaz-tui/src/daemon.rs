@@ -369,9 +369,7 @@ async fn handle_command(
             .map_err(|e| TuiError::Connection(e.to_string()))?;
 
         if let ApiResponse::Logs {
-            lines,
-            total_count,
-            ..
+            lines, total_count, ..
         } = response
         {
             let _ = page_tx
