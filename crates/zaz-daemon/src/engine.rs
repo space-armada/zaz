@@ -561,6 +561,18 @@ impl Engine {
             .unwrap_or(false)
     }
 
+    fn group_has_runnable_tasks(&self, group_name: &str, trigger_ctx: &TriggerContext) -> bool {
+        self.groups
+            .get(group_name)
+            .map(|g| {
+                g.config
+                    .tasks
+                    .iter()
+                    .any(|t| !t.on_change_only || trigger_ctx.run_on_change_tasks)
+            })
+            .unwrap_or(false)
+    }
+
     fn group_has_daemons(&self, group_name: &str) -> bool {
         self.groups
             .get(group_name)
@@ -675,9 +687,7 @@ impl Engine {
 
         let trigger_ctx = self.startup_context();
 
-        // Track groups that need immediate daemon startup (no runnable tasks at startup
-        // AND all dependencies satisfied)
-        let mut groups_needing_daemon_start: Vec<String> = Vec::new();
+        let mut ready_groups = Vec::new();
 
         for group_name in &self.execution_order.clone() {
             // Check if group has unready dependencies using the resolver
@@ -695,40 +705,10 @@ impl Engine {
                 continue;
             }
 
-            // Can start group when all dependencies are Ready or no dependencies
-            let has_startup_tasks = self.group_has_startup_tasks(group_name);
-
-            if has_startup_tasks {
-                // Spawn tasks; daemons will start when tasks complete
-                self.spawn_group_tasks(group_name, &trigger_ctx);
-            } else if self.task_only {
-                // Task-only mode treats daemon-only or empty groups as satisfied.
-                self.set_group_status(group_name, GroupStatus::Ready);
-                self.trigger_dependents(group_name);
-            } else {
-                // Group has no tasks: queue daemon startup
-                let has_daemons = self.group_has_daemons(group_name);
-
-                if has_daemons {
-                    groups_needing_daemon_start.push(group_name.clone());
-                } else {
-                    // No tasks and no daemons - mark as Ready immediately
-                    // This is important for groups that only serve as dependency markers
-                    self.set_group_status(group_name, GroupStatus::Ready);
-                }
-            }
+            ready_groups.push(group_name.clone());
         }
 
-        // Start daemons for groups with no tasks (and trigger their dependents)
-        for group_name in groups_needing_daemon_start {
-            if let Err(e) = self.handle_daemon_action(&group_name, true).await {
-                tracing::error!(group = %group_name, error = %e, "failed to start daemons");
-            }
-
-            // trigger_dependents will be called after daemon action completes
-            // via process_task_completions or here for groups without tasks
-            self.trigger_dependents(&group_name);
-        }
+        self.execute_groups(&ready_groups, &trigger_ctx).await;
 
         self.update_state();
         Ok(())
@@ -1074,7 +1054,7 @@ impl Engine {
         // Build trigger context for command expansion
         let trigger_ctx = self.file_change_context(changed_paths);
 
-        self.execute_groups(&roots, &trigger_ctx);
+        self.execute_groups(&roots, &trigger_ctx).await;
 
         Ok(())
     }
@@ -1090,7 +1070,45 @@ impl Engine {
         );
 
         for group_name in groups {
-            self.spawn_group_tasks(group_name, trigger_ctx);
+            if self.group_has_runnable_tasks(group_name, trigger_ctx) {
+                self.spawn_group_tasks(group_name, trigger_ctx);
+                continue;
+            }
+
+            let phase = self.determine_lifecycle_phase(group_name);
+
+            if self.task_only {
+                self.set_group_status(group_name, GroupStatus::Ready);
+            } else if self.group_has_daemons(group_name) {
+                let should_start = self
+                    .groups
+                    .get(group_name)
+                    .map(|group| !group.daemons_started)
+                    .unwrap_or(true);
+
+                if let Err(e) = self.handle_daemon_action(group_name, should_start).await {
+                    tracing::error!(
+                        group = %group_name,
+                        error = %e,
+                        "failed to handle daemon action during group execution"
+                    );
+                    continue;
+                }
+            } else {
+                // Groups with nothing runnable still become Ready so dependency
+                // markers and task-only daemon groups can unblock dependents.
+                self.set_group_status(group_name, GroupStatus::Ready);
+            }
+
+            if trigger_ctx.should_cascade {
+                if let Err(e) = self.propagate_to_dependents(group_name, phase).await {
+                    tracing::error!(
+                        group = %group_name,
+                        error = %e,
+                        "failed to propagate trigger to dependents"
+                    );
+                }
+            }
         }
     }
 
@@ -4123,6 +4141,54 @@ mod tests {
         };
         let dependent = test_group_with_deps("b", &["task1"], &["a"]);
         let mut engine = create_test_task_only_engine(vec![daemon_only, dependent]);
+
+        engine.startup().await.unwrap();
+
+        assert_eq!(
+            engine.groups.get("a").unwrap().state.status,
+            GroupStatus::Ready
+        );
+        assert_eq!(
+            engine.groups.get("b").unwrap().state.status,
+            GroupStatus::Running
+        );
+        assert!(engine.running_tasks.contains("b:task1"));
+        assert!(!engine.dependency_resolver.is_waiting("b"));
+    }
+
+    #[tokio::test]
+    async fn test_startup_daemon_only_group_triggers_dependents() {
+        let daemon_only = test_daemon_group("a", "sleep 1");
+        let dependent = test_group_with_deps("b", &["task1"], &["a"]);
+        let mut engine = create_test_engine(vec![daemon_only, dependent]);
+
+        engine.startup().await.unwrap();
+
+        assert_eq!(
+            engine.groups.get("a").unwrap().state.status,
+            GroupStatus::Ready
+        );
+        assert!(engine.groups.get("a").unwrap().daemons_started);
+        assert_eq!(
+            engine.groups.get("b").unwrap().state.status,
+            GroupStatus::Running
+        );
+        assert!(engine.running_tasks.contains("b:task1"));
+        assert!(!engine.dependency_resolver.is_waiting("b"));
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_startup_empty_group_triggers_dependents() {
+        let empty = Group {
+            name: "a".to_string(),
+            tasks: vec![],
+            patterns: vec!["*.test".to_string()],
+            ..Default::default()
+        };
+        let dependent = test_group_with_deps("b", &["task1"], &["a"]);
+        let mut engine = create_test_engine(vec![empty, dependent]);
 
         engine.startup().await.unwrap();
 
