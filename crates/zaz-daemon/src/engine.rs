@@ -235,6 +235,15 @@ pub enum TriggerSource {
         /// Scope of the restart.
         scope: RestartScope,
     },
+    /// Configuration reload after diffing and rebuilding groups.
+    ConfigReload {
+        /// Number of added groups.
+        added: usize,
+        /// Number of removed groups.
+        removed: usize,
+        /// Number of modified groups.
+        modified: usize,
+    },
     /// Dependency became ready during startup.
     DependencyReady {
         /// Group that completed.
@@ -258,6 +267,15 @@ impl fmt::Display for TriggerSource {
             TriggerSource::ManualRestart { scope } => {
                 write!(f, "manual restart ({})", scope)
             }
+            TriggerSource::ConfigReload {
+                added,
+                removed,
+                modified,
+            } => write!(
+                f,
+                "config reload ({} added, {} removed, {} modified)",
+                added, removed, modified
+            ),
             TriggerSource::DependencyReady { completed_group } => {
                 write!(f, "dependency '{}' ready", completed_group)
             }
@@ -317,7 +335,7 @@ pub struct TriggerContext {
     /// Whether to run `on_change_only` tasks.
     ///
     /// - `true` for file change triggers (run all tasks including on_change_only)
-    /// - `false` for startup, manual restarts, and dependency triggers
+    /// - `false` for startup, reload, manual restarts, and dependency triggers
     pub run_on_change_tasks: bool,
     /// Whether to cascade/propagate to dependent groups after completion.
     pub should_cascade: bool,
@@ -367,6 +385,9 @@ pub struct Engine {
 
     /// Sender for spawned tasks to signal task completion.
     task_completion_tx: mpsc::Sender<TaskCompletion>,
+
+    /// Groups whose next task completion should not cascade to dependents.
+    suppress_task_completion_cascade: std::collections::HashSet<String>,
 
     /// Notification configuration from user config.
     notification_config: zaz_config::NotificationConfig,
@@ -549,6 +570,7 @@ impl Engine {
             dependency_resolver,
             task_completion_rx,
             task_completion_tx,
+            suppress_task_completion_cascade: std::collections::HashSet::new(),
             notification_config,
             task_only,
         })
@@ -1229,8 +1251,9 @@ impl Engine {
     /// - If daemons haven't been started yet, start them
     /// - If daemons are already running, signal them to restart
     pub async fn process_task_completions(&mut self) {
-        // Collect groups that need daemon action (group_name, should_start_not_signal)
-        let mut daemon_actions: Vec<(String, bool)> = Vec::new();
+        // Collect groups that need daemon action
+        // (group_name, should_start_not_signal, should_cascade_to_dependents)
+        let mut daemon_actions: Vec<(String, bool, bool)> = Vec::new();
         // Collect groups that failed (for cascade_skip)
         let mut failed_groups: Vec<String> = Vec::new();
 
@@ -1247,6 +1270,7 @@ impl Engine {
                 daemon_actions.push((
                     completion.group_name.clone(),
                     completion.task_id == DAEMON_START_TASK_ID,
+                    true,
                 ));
                 continue;
             }
@@ -1308,6 +1332,9 @@ impl Engine {
                 {
                     // All tasks complete - update group status
                     group.state.status = new_status;
+                    let should_cascade = !self
+                        .suppress_task_completion_cascade
+                        .remove(&completion.group_name);
                     let any_failed = new_status == GroupStatus::Failed;
 
                     // Send notification for group completion
@@ -1327,11 +1354,26 @@ impl Engine {
                         // Queue daemon action: start if not yet started, signal if already running
                         if !group.daemons.is_empty() {
                             let should_start = !group.daemons_started;
-                            daemon_actions.push((completion.group_name.clone(), should_start));
+                            daemon_actions.push((
+                                completion.group_name.clone(),
+                                should_start,
+                                should_cascade,
+                            ));
                         } else {
                             // No daemons - group is ready, daemon_actions will trigger dependents
                             // We still need to add to daemon_actions for trigger_dependents call
-                            daemon_actions.push((completion.group_name.clone(), true));
+                            daemon_actions.push((
+                                completion.group_name.clone(),
+                                true,
+                                should_cascade,
+                            ));
+                        }
+
+                        if !should_cascade {
+                            tracing::debug!(
+                                group = %completion.group_name,
+                                "suppressing dependent cascade for task completion"
+                            );
                         }
                     }
                 }
@@ -1389,7 +1431,7 @@ impl Engine {
         }
 
         // Process daemon actions after releasing borrows from the loop
-        for (group_name, should_start) in daemon_actions {
+        for (group_name, should_start, should_cascade) in daemon_actions {
             // Check if this group has daemons to start/signal
             let has_daemons = self
                 .groups
@@ -1412,10 +1454,10 @@ impl Engine {
                 group = %group_name,
                 phase = ?phase,
                 trigger_source = ?trigger_ctx.source,
-                should_cascade = trigger_ctx.should_cascade,
+                should_cascade,
                 "propagating task completion to dependents"
             );
-            if trigger_ctx.should_cascade {
+            if should_cascade {
                 if let Err(e) = self.propagate_to_dependents(&group_name, phase).await {
                     tracing::error!(
                         group = %group_name,
@@ -1820,12 +1862,19 @@ impl Engine {
             return ReloadResult::Failed(format!("rebuild error: {}", e));
         }
 
-        // 8. Run new/modified groups
-        for group_name in diff.added.iter().chain(&diff.modified) {
-            if let Err(e) = self.run_group(group_name, &[], false).await {
-                tracing::error!(group = %group_name, error = %e, "failed to start group after reload");
-            }
-        }
+        // 8. Run new/modified groups through the shared execution path.
+        let reload_targets: Vec<String> = self
+            .execution_order
+            .iter()
+            .filter(|group_name| {
+                diff.added.contains(group_name) || diff.modified.contains(group_name)
+            })
+            .cloned()
+            .collect();
+        self.suppress_task_completion_cascade
+            .extend(reload_targets.iter().cloned());
+        let trigger_ctx = self.reload_context(&diff);
+        self.execute_groups(&reload_targets, &trigger_ctx).await;
 
         // 9. Broadcast reload complete
         self.push_log(LogLine::daemon(
@@ -2200,6 +2249,23 @@ impl Engine {
                 .with_root(config_dir.to_path_buf()),
             run_on_change_tasks: false, // Don't run on_change_only tasks for manual restarts
             should_cascade: true,       // Manual restarts cascade to dependents
+        }
+    }
+
+    /// Create a trigger context for config reload execution.
+    fn reload_context(&self, diff: &ConfigDiff) -> TriggerContext {
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        TriggerContext {
+            source: TriggerSource::ConfigReload {
+                added: diff.added.len(),
+                removed: diff.removed.len(),
+                modified: diff.modified.len(),
+            },
+            vars: Context::new()
+                .with_variables(self.config.variables.clone())
+                .with_root(config_dir.to_path_buf()),
+            run_on_change_tasks: false, // Don't run on_change_only tasks during reload
+            should_cascade: false,      // Reload only executes added/modified groups directly
         }
     }
 
@@ -4647,12 +4713,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reload_config_preserves_unchanged_daemon_pid() {
+    async fn test_reload_config_executes_only_diffed_groups_via_shared_path() {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("zaz.toml");
-        let initial_config = r#"
+        let source_log = temp_dir.path().join("source.log");
+        let dependent_log = temp_dir.path().join("dependent.log");
+        let changed_log = temp_dir.path().join("changed.log");
+
+        let initial_config = format!(
+            r#"
 [[group]]
 name = "server"
 patterns = ["server.txt"]
@@ -4662,21 +4733,40 @@ name = "server"
 command = "sleep 30"
 
 [[group]]
-name = "build"
-patterns = ["build.txt"]
+name = "source"
+patterns = ["source.txt"]
 
 [[group.task]]
-name = "build"
-command = "true"
-"#;
+name = "source"
+command = "printf source >> '{source_log}'"
+
+[[group]]
+name = "dependent"
+patterns = ["dependent.txt"]
+depends_on = ["source"]
+
+[[group.task]]
+name = "dependent"
+command = "printf dependent >> '{dependent_log}'"
+"#,
+            source_log = source_log.display(),
+            dependent_log = dependent_log.display(),
+        );
         std::fs::write(&config_path, initial_config).unwrap();
 
         let mut engine = Engine::new(&config_path).unwrap();
         engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
 
         let original_pid = engine.groups["server"].state.daemons[0].pid.unwrap();
+        assert_eq!(std::fs::read_to_string(&source_log).unwrap(), "source");
+        assert_eq!(
+            std::fs::read_to_string(&dependent_log).unwrap(),
+            "dependent"
+        );
 
-        let updated_config = r#"
+        let updated_config = format!(
+            r#"
 [[group]]
 name = "server"
 patterns = ["server.txt"]
@@ -4686,13 +4776,47 @@ name = "server"
 command = "sleep 30"
 
 [[group]]
-name = "build"
-patterns = ["build-changed.txt"]
+name = "source"
+patterns = ["source-changed.txt"]
 
 [[group.task]]
-name = "build"
-command = "true"
-"#;
+name = "source"
+command = "printf source >> '{source_log}'"
+
+[[group]]
+name = "dependent"
+patterns = ["dependent.txt"]
+depends_on = ["source"]
+
+[[group.task]]
+name = "dependent"
+command = "printf dependent >> '{dependent_log}'"
+
+[[group]]
+name = "changed"
+patterns = ["changed.txt"]
+
+[[group.task]]
+name = "startup"
+command = "printf startup >> '{changed_log}'"
+
+[[group.task]]
+name = "watch-only"
+command = "printf watch >> '{changed_log}'"
+on_change_only = true
+
+[[group]]
+name = "new-daemon"
+patterns = ["new-daemon.txt"]
+
+[[group.daemon]]
+name = "new-daemon"
+command = "sleep 30"
+"#,
+            source_log = source_log.display(),
+            dependent_log = dependent_log.display(),
+            changed_log = changed_log.display(),
+        );
         std::fs::write(&config_path, updated_config).unwrap();
 
         let result = engine.reload_config().await;
@@ -4702,15 +4826,29 @@ command = "true"
                 removed,
                 modified,
             } => {
-                assert!(added.is_empty());
+                assert_eq!(added.len(), 2);
+                assert!(added.contains(&"changed".to_string()));
+                assert!(added.contains(&"new-daemon".to_string()));
                 assert!(removed.is_empty());
-                assert_eq!(modified, vec!["build"]);
+                assert_eq!(modified, vec!["source"]);
             }
             other => panic!("expected reload success, got {:?}", other),
         }
 
+        assert!(engine.wait_for_tasks().await);
+
         let reloaded_pid = engine.groups["server"].state.daemons[0].pid.unwrap();
         assert_eq!(reloaded_pid, original_pid);
+        assert_eq!(
+            std::fs::read_to_string(&source_log).unwrap(),
+            "sourcesource"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dependent_log).unwrap(),
+            "dependent"
+        );
+        assert_eq!(std::fs::read_to_string(&changed_log).unwrap(), "startup");
+        assert!(engine.groups["new-daemon"].state.daemons[0].pid.is_some());
 
         engine.shutdown().await.unwrap();
     }
