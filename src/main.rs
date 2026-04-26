@@ -858,6 +858,13 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
     Ok(())
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,11 +1075,4 @@ command = "true"
         let response = client.request(&ApiRequest::Shutdown).await.unwrap();
         assert!(matches!(response, ApiResponse::Ok { .. }));
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
 }
