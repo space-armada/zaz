@@ -156,25 +156,25 @@ command = "true"
 }
 
 #[test]
-fn stop_returns_nonzero_on_api_error() {
+fn stop_returns_zero_on_shutdown_acknowledgement() {
     let temp = TempDir::new().unwrap();
     let socket_path = temp.path().join("daemon.sock");
     let server = start_fake_server(
         &socket_path,
         ApiRequest::Shutdown,
-        ApiResponse::Error {
-            message: "cannot stop embedded daemon; use the TUI to quit or press Ctrl+C".to_string(),
+        ApiResponse::Ok {
+            message: Some("shutting down".to_string()),
         },
     );
 
     let socket = socket_path.to_str().unwrap();
     let output = run_zaz(temp.path(), &["--socket", socket, "stop"]);
-    let stderr = stderr_string(&output);
+    let stdout = stdout_string(&output);
 
     server.join().expect("fake server thread should finish");
 
-    assert!(!output.status.success());
-    assert!(stderr.contains("cannot stop embedded daemon"));
+    assert!(output.status.success());
+    assert!(stdout.contains("shutting down"));
 }
 
 #[test]

@@ -367,10 +367,6 @@ pub struct Engine {
 
     /// Notification configuration from user config.
     notification_config: zaz_config::NotificationConfig,
-
-    /// Whether the engine is running embedded in another process (e.g., TUI).
-    /// When embedded, remote shutdown commands are rejected.
-    embedded: bool,
 }
 
 /// Result of a config reload operation.
@@ -411,27 +407,15 @@ struct ManagedGroup {
 impl Engine {
     /// Create a new engine from a configuration file.
     pub fn new(config_path: &Path) -> Result<Self, DaemonError> {
-        Self::with_options(config_path, true, false)
-    }
-
-    /// Create a new engine for embedded mode (e.g., TUI).
-    ///
-    /// In embedded mode, remote shutdown commands are rejected.
-    pub fn new_embedded(config_path: &Path) -> Result<Self, DaemonError> {
-        Self::with_options(config_path, false, true)
+        Self::with_options(config_path, true)
     }
 
     /// Create a new engine with options.
     ///
     /// `verbose_output` controls whether process output is printed to stdout.
-    /// `embedded` indicates whether the engine is running embedded in another process.
-    pub fn with_options(
-        config_path: &Path,
-        verbose_output: bool,
-        embedded: bool,
-    ) -> Result<Self, DaemonError> {
+    pub fn with_options(config_path: &Path, verbose_output: bool) -> Result<Self, DaemonError> {
         let config = zaz_config::load(config_path).map_err(DaemonError::Config)?;
-        Self::from_config(config, config_path.to_path_buf(), verbose_output, embedded)
+        Self::from_config(config, config_path.to_path_buf(), verbose_output)
     }
 
     /// Create a new engine from a loaded configuration.
@@ -439,7 +423,6 @@ impl Engine {
         config: Config,
         config_path: PathBuf,
         verbose_output: bool,
-        embedded: bool,
     ) -> Result<Self, DaemonError> {
         // Load user config for notification settings
         let user_config = zaz_config::load_user_config();
@@ -592,7 +575,6 @@ impl Engine {
             task_completion_rx,
             task_completion_tx,
             notification_config,
-            embedded,
         })
     }
 
@@ -2143,14 +2125,8 @@ impl Engine {
                 ReloadResult::Failed(e) => ApiResponse::error(format!("reload failed: {}", e)),
             },
             ApiRequest::Shutdown => {
-                if self.embedded {
-                    ApiResponse::error(
-                        "cannot stop embedded daemon; use the TUI to quit or press Ctrl+C",
-                    )
-                } else {
-                    // Signal handled by caller
-                    ApiResponse::ok_with_message("shutting down")
-                }
+                // Signal handled by caller
+                ApiResponse::ok_with_message("shutting down")
             }
         }
     }
@@ -2701,7 +2677,7 @@ mod tests {
         // Create a fake config path in temp dir
         let config_path = temp_dir.join("zaz.yaml");
 
-        Engine::from_config(config, config_path, false, false).unwrap()
+        Engine::from_config(config, config_path, false).unwrap()
     }
 
     /// Create a test group with specified tasks.

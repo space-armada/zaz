@@ -377,7 +377,7 @@ async fn run_daemon(
 
     tracing::info!(config = %config_path.display(), "starting daemon");
 
-    let mut engine = Engine::with_options(config_path, !quiet, false)?;
+    let mut engine = Engine::with_options(config_path, !quiet)?;
     let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
 
     // Start API server
