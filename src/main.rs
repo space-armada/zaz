@@ -510,10 +510,10 @@ async fn stop_daemon(socket_path: &Path) -> Result<()> {
             );
         }
         ApiResponse::Error { message } => {
-            println!("Error: {}", message);
+            anyhow::bail!("Error: {}", message);
         }
         _ => {
-            println!("Unexpected response");
+            anyhow::bail!("Unexpected response");
         }
     }
 

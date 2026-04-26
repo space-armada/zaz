@@ -1,8 +1,12 @@
+use serde_json::to_writer;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use zaz_daemon::{ApiRequest, ApiResponse};
 
 fn zaz_bin() -> &'static str {
     env!("CARGO_BIN_EXE_zaz")
@@ -56,6 +60,37 @@ fn wait_for_daemon(current_dir: &Path, socket_path: &Path) {
     panic!("daemon did not become ready in time");
 }
 
+fn start_fake_server(socket_path: &Path, response: ApiResponse) -> thread::JoinHandle<()> {
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path).expect("failed to bind fake socket");
+    let socket_path = socket_path.to_path_buf();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("failed to accept connection");
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .expect("failed to clone stream for reading"),
+        );
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("failed to read request line");
+
+        let request: ApiRequest =
+            serde_json::from_str(&line).expect("request should deserialize");
+        assert!(matches!(request, ApiRequest::Shutdown));
+
+        to_writer(&mut stream, &response).expect("failed to serialize response");
+        stream
+            .write_all(b"\n")
+            .expect("failed to write response newline");
+
+        drop(stream);
+        std::fs::remove_file(&socket_path).expect("failed to remove fake socket");
+    })
+}
+
 #[test]
 fn restart_returns_nonzero_on_api_error() {
     let temp = TempDir::new().unwrap();
@@ -98,6 +133,28 @@ command = "true"
         stderr.contains("failed to restart group 'missing-group': group not found: missing-group")
     );
     assert!(stop_output.status.success());
+}
+
+#[test]
+fn stop_returns_nonzero_on_api_error() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("daemon.sock");
+    let server = start_fake_server(
+        &socket_path,
+        ApiResponse::Error {
+            message: "cannot stop embedded daemon; use the TUI to quit or press Ctrl+C"
+                .to_string(),
+        },
+    );
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "stop"]);
+    let stderr = stderr_string(&output);
+
+    server.join().expect("fake server thread should finish");
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("cannot stop embedded daemon"));
 }
 
 trait ChildExt {
