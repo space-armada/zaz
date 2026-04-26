@@ -41,6 +41,10 @@ struct Cli {
     #[arg(long)]
     no_autostart: bool,
 
+    /// Stop the daemon when the TUI exits
+    #[arg(long)]
+    stop_on_exit: bool,
+
     /// Write debug logs to a file (works in both TUI and daemon modes)
     #[arg(long, value_name = "PATH")]
     log_file: Option<PathBuf>,
@@ -113,6 +117,7 @@ enum Commands {
 pub struct TuiOptions {
     pub style: TuiStylePreference,
     pub no_autostart: bool,
+    pub stop_on_exit: bool,
     pub disable_animations: bool,
 }
 
@@ -131,6 +136,7 @@ impl TuiOptions {
         Self {
             style,
             no_autostart: cli.no_autostart || user_config.no_autostart,
+            stop_on_exit: cli.stop_on_exit,
             disable_animations: user_config.disable_animations,
         }
     }
@@ -814,7 +820,7 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
         tracing::debug!("no responsive daemon running");
     }
 
-    let started_daemon = if !daemon_running && !options.no_autostart {
+    if !daemon_running && !options.no_autostart {
         tracing::info!("starting daemon in background");
 
         match start_daemon_subprocess(config_path, socket_path) {
@@ -824,16 +830,12 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
                 if !ready {
                     tracing::warn!("daemon may not be ready after 2s");
                 }
-                true
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to auto-start daemon");
-                false
             }
         }
-    } else {
-        false
-    };
+    }
 
     // Create TUI app
     use zaz_tui::{App, TuiStyle};
@@ -853,7 +855,7 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
         .unwrap_or_else(|| "zaz.toml".to_string());
 
     let mut app = App::new(style, user_config, config_name);
-    app.started_daemon = started_daemon;
+    app.stop_on_exit = options.stop_on_exit;
 
     // Connect to daemon
     if let Err(e) = app.connect(socket_path).await {
@@ -868,15 +870,33 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_daemon_responsive, resolve_command_socket, resolve_control_command_socket,
-        start_daemon_subprocess, wait_for_daemon_ready,
-    };
+    use super::*;
     use anyhow::Result;
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::TempDir;
     use zaz_daemon::{socket_path_for_config, ApiRequest, ApiResponse, Client, DaemonError};
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn tui_options_stop_on_exit_defaults_false() {
+        let cli = parse_cli(&["zaz"]);
+        let options = TuiOptions::from_cli_and_user_config(&cli, &UserConfig::default());
+
+        assert!(!options.stop_on_exit);
+        assert!(!options.no_autostart);
+    }
+
+    #[test]
+    fn tui_options_include_cli_stop_on_exit_flag() {
+        let cli = parse_cli(&["zaz", "--stop-on-exit"]);
+        let options = TuiOptions::from_cli_and_user_config(&cli, &UserConfig::default());
+
+        assert!(options.stop_on_exit);
+    }
 
     #[test]
     fn control_command_socket_uses_explicit_socket() -> Result<()> {

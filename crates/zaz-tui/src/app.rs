@@ -45,7 +45,7 @@ pub enum InputMode {
     Filter,
     /// Searching logs.
     Search,
-    /// Confirming quit (when we started the daemon).
+    /// Legacy mode kept for enum completeness.
     QuitPrompt,
 }
 
@@ -130,8 +130,8 @@ pub struct App {
     pub user_config: UserConfig,
 
     // === Lifecycle ===
-    /// Whether we started the daemon (affects quit behavior).
-    pub started_daemon: bool,
+    /// Whether the TUI should request daemon shutdown on exit.
+    pub stop_on_exit: bool,
     /// Whether the app should quit.
     pub should_quit: bool,
     /// Transient status message with expiration.
@@ -224,7 +224,7 @@ impl App {
             search_input: String::new(),
             animation_tick: 0,
             user_config,
-            started_daemon: false,
+            stop_on_exit: false,
             should_quit: false,
             transient_message: None,
             show_help: false,
@@ -476,8 +476,7 @@ impl App {
 
         // Handle quit regardless of mode
         if events::is_quit(&event) {
-            if self.started_daemon {
-                // If we started the daemon, shut it down when quitting
+            if self.stop_on_exit {
                 self.send_command(ClientCommand::Shutdown);
             }
             self.should_quit = true;
@@ -742,6 +741,7 @@ mod tests {
         );
         assert_eq!(app.style, TuiStyle::Full);
         assert!(!app.should_quit);
+        assert!(!app.stop_on_exit);
         assert_eq!(app.input_mode, InputMode::Normal);
     }
 
@@ -817,6 +817,34 @@ mod tests {
         assert_eq!(
             TuiStyle::from(TuiStylePreference::MultiPane),
             TuiStyle::MultiPane
+        );
+    }
+
+    #[test]
+    fn test_quit_without_stop_on_exit_does_not_send_shutdown() {
+        let mut app = App::default();
+
+        app.handle_event(Event::Key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char('q'),
+        )));
+
+        assert!(app.should_quit);
+        assert!(app.transient_message.is_none());
+    }
+
+    #[test]
+    fn test_quit_with_stop_on_exit_attempts_shutdown() {
+        let mut app = App::default();
+        app.stop_on_exit = true;
+
+        app.handle_event(Event::Key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Char('q'),
+        )));
+
+        assert!(app.should_quit);
+        assert_eq!(
+            app.transient_message.as_ref().map(|m| m.text.as_str()),
+            Some("Not connected to daemon")
         );
     }
 }

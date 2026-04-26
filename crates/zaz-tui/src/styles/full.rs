@@ -735,17 +735,13 @@ impl FullStyle {
 
         // Build connection status text based on state
         let connection_text_spans: Vec<Span> = match app.connection_status {
-            ConnectionStatus::Loaded => {
-                let daemon_indicator = if app.started_daemon { " (daemon)" } else { "" };
-                vec![
-                    Span::raw(" Loaded "),
-                    Span::styled(
-                        &app.config_name,
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(daemon_indicator, Style::default().fg(Color::Cyan)),
-                ]
-            }
+            ConnectionStatus::Loaded => vec![
+                Span::raw(" Loaded "),
+                Span::styled(
+                    &app.config_name,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ],
             ConnectionStatus::Disconnected => {
                 vec![Span::styled(
                     " Disconnected",

@@ -956,15 +956,7 @@ impl MultiPaneStyle {
 
         // Build connection status text based on state
         let (connection_text, connection_text_style) = match app.connection_status {
-            ConnectionStatus::Loaded => {
-                let daemon_indicator = if app.started_daemon { " (daemon)" } else { "" };
-                (
-                    format!(" {} {}", app.config_name, daemon_indicator)
-                        .trim()
-                        .to_string(),
-                    Style::default(),
-                )
-            }
+            ConnectionStatus::Loaded => (app.config_name.clone(), Style::default()),
             ConnectionStatus::Disconnected => {
                 ("Disconnected".to_string(), Style::default().fg(Color::Red))
             }
