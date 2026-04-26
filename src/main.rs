@@ -587,6 +587,10 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
             .collect()
     }
 
+    fn check_failed(message: &str) -> Result<()> {
+        anyhow::bail!(message.to_string())
+    }
+
     let result = zaz_config::load(config_path);
     match result {
         Ok(_config) => {
@@ -619,7 +623,7 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                 };
 
                 println!("{}", serde_json::to_string(&result)?);
-                std::process::exit(1);
+                return check_failed("configuration validation failed");
             }
 
             // Pretty print each error with colors
@@ -651,7 +655,7 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                 plural.red().bold(),
                 config_path.display().bold()
             );
-            std::process::exit(1);
+            check_failed("configuration validation failed")
         }
 
         Err(e) => {
@@ -672,7 +676,7 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                 };
 
                 println!("{}", serde_json::to_string(&result)?);
-                std::process::exit(1);
+                return check_failed("configuration parse failed");
             }
 
             eprintln!(
@@ -686,7 +690,7 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                 "Found 1 error".red().bold(),
                 config_path.display().bold()
             );
-            std::process::exit(1);
+            check_failed("configuration parse failed")
         }
     }
 }

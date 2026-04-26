@@ -1,4 +1,5 @@
 use serde_json::to_writer;
+use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -77,8 +78,7 @@ fn start_fake_server(socket_path: &Path, response: ApiResponse) -> thread::JoinH
             .read_line(&mut line)
             .expect("failed to read request line");
 
-        let request: ApiRequest =
-            serde_json::from_str(&line).expect("request should deserialize");
+        let request: ApiRequest = serde_json::from_str(&line).expect("request should deserialize");
         assert!(matches!(request, ApiRequest::Shutdown));
 
         to_writer(&mut stream, &response).expect("failed to serialize response");
@@ -142,8 +142,7 @@ fn stop_returns_nonzero_on_api_error() {
     let server = start_fake_server(
         &socket_path,
         ApiResponse::Error {
-            message: "cannot stop embedded daemon; use the TUI to quit or press Ctrl+C"
-                .to_string(),
+            message: "cannot stop embedded daemon; use the TUI to quit or press Ctrl+C".to_string(),
         },
     );
 
@@ -155,6 +154,65 @@ fn stop_returns_nonzero_on_api_error() {
 
     assert!(!output.status.success());
     assert!(stderr.contains("cannot stop embedded daemon"));
+}
+
+#[test]
+fn check_json_returns_nonzero_on_validation_error() {
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("zaz.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+[[group]]
+name = "backend"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "broken"
+command = ""
+"#,
+    )
+    .unwrap();
+
+    let config = config_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["check", "--json", config]);
+    let stdout = stdout_string(&output);
+    let stderr = stderr_string(&output);
+    let payload: Value = serde_json::from_str(&stdout).expect("stdout should be valid json");
+
+    assert!(!output.status.success());
+    assert_eq!(payload["valid"], false);
+    assert_eq!(payload["path"], Value::String(config.to_string()));
+    assert!(payload["errors"]
+        .as_array()
+        .is_some_and(|errors| !errors.is_empty()));
+    assert!(stderr.contains("configuration validation failed"));
+}
+
+#[test]
+fn check_pretty_returns_nonzero_on_parse_error() {
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("zaz.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"
+[[group]]
+name = "backend"
+patterns = ["**/*.rs"
+"#,
+    )
+    .unwrap();
+
+    let config = config_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["check", config]);
+    let stderr = stderr_string(&output);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("error"));
+    assert!(stderr.contains("Found 1 error"));
+    assert!(stderr.contains("configuration parse failed"));
 }
 
 trait ChildExt {
