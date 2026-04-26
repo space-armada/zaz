@@ -71,7 +71,7 @@ enum Commands {
     /// Run task commands once and exit
     Task,
 
-    /// Start the daemon in the background
+    /// Run the daemon in the foreground
     Daemon {
         /// Detach from terminal
         #[arg(short, long)]

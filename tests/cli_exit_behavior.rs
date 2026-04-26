@@ -29,6 +29,17 @@ fn stderr_string(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr should be valid utf-8")
 }
 
+#[test]
+fn daemon_help_describes_foreground_mode() {
+    let temp = TempDir::new().unwrap();
+    let output = run_zaz(temp.path(), &["daemon", "--help"]);
+    let stdout = stdout_string(&output);
+
+    assert!(output.status.success());
+    assert!(stdout.contains("Run the daemon in the foreground"));
+    assert!(stdout.contains("--quiet"));
+}
+
 fn start_daemon(current_dir: &Path, config_path: &Path, socket_path: &Path) -> Child {
     Command::new(zaz_bin())
         .args([
