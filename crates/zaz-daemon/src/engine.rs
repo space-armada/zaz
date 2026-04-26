@@ -1074,11 +1074,24 @@ impl Engine {
         // Build trigger context for command expansion
         let trigger_ctx = self.file_change_context(changed_paths);
 
-        for group_name in roots {
-            self.spawn_group_tasks(&group_name, &trigger_ctx);
-        }
+        self.execute_groups(&roots, &trigger_ctx);
 
         Ok(())
+    }
+
+    /// Execute the given groups under a shared trigger context.
+    async fn execute_groups(&mut self, groups: &[String], trigger_ctx: &TriggerContext) {
+        tracing::debug!(
+            group_count = groups.len(),
+            trigger_source = ?trigger_ctx.source,
+            run_on_change_tasks = trigger_ctx.run_on_change_tasks,
+            should_cascade = trigger_ctx.should_cascade,
+            "executing groups"
+        );
+
+        for group_name in groups {
+            self.spawn_group_tasks(group_name, trigger_ctx);
+        }
     }
 
     /// Spawn all tasks in a group. Each task runs in parallel with per-task deduplication.
@@ -3955,6 +3968,28 @@ mod tests {
         // Group should be Ready (nothing to do)
         let group = engine.groups.get("empty").unwrap();
         assert_eq!(group.state.status, GroupStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_handle_changes_triggers_only_root_affected_groups() {
+        let groups = vec![
+            test_group("a", &["task1"]),
+            test_group_with_deps("b", &["task1"], &["a"]),
+        ];
+        let mut engine = create_test_engine(groups);
+
+        engine
+            .handle_changes(vec![FileEvent {
+                path: PathBuf::from("changed.test"),
+                kind: zaz_watch::FileEventKind::Modified,
+            }])
+            .await
+            .unwrap();
+
+        assert!(engine.running_tasks.contains("a:task1"));
+        assert!(!engine.running_tasks.contains("b:task1"));
+        assert_eq!(engine.groups.get("a").unwrap().state.status, GroupStatus::Running);
+        assert_eq!(engine.groups.get("b").unwrap().state.status, GroupStatus::Pending);
     }
 
     #[tokio::test]

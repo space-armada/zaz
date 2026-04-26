@@ -482,7 +482,7 @@ mod tests {
         let waiting = resolver.mark_waiting("a");
 
         assert!(waiting.is_some());
-        assert!(waiting.unwrap().contains(&"b".to_string()));
+        assert!(waiting.unwrap().contains("b"));
         assert!(resolver.is_waiting("a"));
         assert_eq!(resolver.get_status("a"), Some(GroupStatus::Waiting));
     }
