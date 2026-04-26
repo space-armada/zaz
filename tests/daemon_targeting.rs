@@ -46,7 +46,10 @@ fn restart_uses_explicit_socket_outside_any_project() {
 
     let explicit_socket = temp.path().join("explicit.sock");
     let explicit_socket_string = explicit_socket.to_string_lossy().into_owned();
-    let output = run_zaz(&current_dir, &["--socket", &explicit_socket_string, "restart"]);
+    let output = run_zaz(
+        &current_dir,
+        &["--socket", &explicit_socket_string, "restart"],
+    );
     let stderr = stderr_string(&output);
 
     assert!(!output.status.success());

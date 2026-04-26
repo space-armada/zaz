@@ -482,10 +482,10 @@ async fn restart(socket_path: &Path, group: Option<String>) -> Result<()> {
             println!("{}", message.unwrap_or_else(|| "OK".to_string()));
         }
         ApiResponse::Error { message } => {
-            println!("Error: {}", message);
+            anyhow::bail!("Error: {}", message);
         }
         _ => {
-            println!("Unexpected response");
+            anyhow::bail!("Unexpected response");
         }
     }
 

@@ -1,0 +1,126 @@
+use std::path::Path;
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+
+fn zaz_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_zaz")
+}
+
+fn run_zaz(current_dir: &Path, args: &[&str]) -> Output {
+    Command::new(zaz_bin())
+        .args(args)
+        .current_dir(current_dir)
+        .output()
+        .expect("failed to run zaz binary")
+}
+
+fn stdout_string(output: &Output) -> String {
+    String::from_utf8(output.stdout.clone()).expect("stdout should be valid utf-8")
+}
+
+fn stderr_string(output: &Output) -> String {
+    String::from_utf8(output.stderr.clone()).expect("stderr should be valid utf-8")
+}
+
+fn start_daemon(current_dir: &Path, config_path: &Path, socket_path: &Path) -> Child {
+    Command::new(zaz_bin())
+        .args([
+            "--config",
+            config_path.to_str().expect("config path should be utf-8"),
+            "--socket",
+            socket_path.to_str().expect("socket path should be utf-8"),
+            "daemon",
+            "--quiet",
+        ])
+        .current_dir(current_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start zaz daemon")
+}
+
+fn wait_for_daemon(current_dir: &Path, socket_path: &Path) {
+    let socket = socket_path.to_str().expect("socket path should be utf-8");
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while Instant::now() < deadline {
+        let output = run_zaz(current_dir, &["--socket", socket, "status"]);
+        if output.status.success() && stdout_string(&output).contains("Daemon Status:") {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    panic!("daemon did not become ready in time");
+}
+
+#[test]
+fn restart_returns_nonzero_on_api_error() {
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("zaz.toml");
+    let socket_path = temp.path().join("daemon.sock");
+
+    std::fs::write(
+        &config_path,
+        r#"
+[[group]]
+name = "backend"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "noop"
+command = "true"
+"#,
+    )
+    .unwrap();
+
+    let mut daemon = start_daemon(temp.path(), &config_path, &socket_path);
+    wait_for_daemon(temp.path(), &socket_path);
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(
+        temp.path(),
+        &["--socket", socket, "restart", "missing-group"],
+    );
+    let stderr = stderr_string(&output);
+
+    let stop_output = run_zaz(temp.path(), &["--socket", socket, "stop"]);
+    let _ = daemon.wait_timeout(Duration::from_secs(5));
+    if daemon.try_wait().unwrap().is_none() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("failed to restart group 'missing-group': group not found: missing-group")
+    );
+    assert!(stop_output.status.success());
+}
+
+trait ChildExt {
+    fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>>;
+}
+
+impl ChildExt for Child {
+    fn wait_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
