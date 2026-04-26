@@ -1,7 +1,8 @@
 //! zaz - A modern file-watching task runner and process manager.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -192,7 +193,22 @@ fn init_tracing(
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    let exit_code = match try_main().await {
+        Ok(()) => 0,
+        Err(err) if err.downcast_ref::<StatusNotRunning>().is_some() => 3,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            1
+        }
+    };
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+async fn try_main() -> Result<()> {
     let cli = Cli::parse();
     let current_dir = std::env::current_dir()?;
 
@@ -246,6 +262,17 @@ async fn main() -> Result<()> {
         }
     }
 }
+
+#[derive(Debug)]
+struct StatusNotRunning;
+
+impl fmt::Display for StatusNotRunning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("daemon not running")
+    }
+}
+
+impl std::error::Error for StatusNotRunning {}
 
 /// Find the configuration file.
 fn find_config(explicit: &Option<PathBuf>) -> Result<PathBuf> {
@@ -419,7 +446,7 @@ async fn show_status(socket_path: &Path) -> Result<()> {
                 "No daemon running (could not connect to {})",
                 socket_path.display()
             );
-            return Ok(());
+            return Err(StatusNotRunning.into());
         }
     };
 
@@ -450,10 +477,10 @@ async fn show_status(socket_path: &Path) -> Result<()> {
             }
         }
         ApiResponse::Error { message } => {
-            println!("Error: {}", message);
+            bail!("status request failed: {}", message);
         }
         _ => {
-            println!("Unexpected response");
+            bail!("status request returned unexpected response");
         }
     }
 

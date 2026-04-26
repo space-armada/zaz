@@ -52,7 +52,7 @@ fn wait_for_daemon(current_dir: &Path, socket_path: &Path) {
 
     while Instant::now() < deadline {
         let output = run_zaz(current_dir, &["--socket", socket, "status"]);
-        if output.status.success() && stdout_string(&output).contains("Daemon Status:") {
+        if output.status.code() == Some(0) && stdout_string(&output).contains("Daemon Status:") {
             return;
         }
         thread::sleep(Duration::from_millis(50));
@@ -61,7 +61,11 @@ fn wait_for_daemon(current_dir: &Path, socket_path: &Path) {
     panic!("daemon did not become ready in time");
 }
 
-fn start_fake_server(socket_path: &Path, response: ApiResponse) -> thread::JoinHandle<()> {
+fn start_fake_server(
+    socket_path: &Path,
+    expected_request: ApiRequest,
+    response: ApiResponse,
+) -> thread::JoinHandle<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path).expect("failed to bind fake socket");
     let socket_path = socket_path.to_path_buf();
@@ -79,7 +83,11 @@ fn start_fake_server(socket_path: &Path, response: ApiResponse) -> thread::JoinH
             .expect("failed to read request line");
 
         let request: ApiRequest = serde_json::from_str(&line).expect("request should deserialize");
-        assert!(matches!(request, ApiRequest::Shutdown));
+        match (request, expected_request) {
+            (ApiRequest::Shutdown, ApiRequest::Shutdown) => {}
+            (ApiRequest::Status, ApiRequest::Status) => {}
+            (actual, expected) => panic!("unexpected request: got {actual:?}, expected {expected:?}"),
+        }
 
         to_writer(&mut stream, &response).expect("failed to serialize response");
         stream
@@ -141,6 +149,7 @@ fn stop_returns_nonzero_on_api_error() {
     let socket_path = temp.path().join("daemon.sock");
     let server = start_fake_server(
         &socket_path,
+        ApiRequest::Shutdown,
         ApiResponse::Error {
             message: "cannot stop embedded daemon; use the TUI to quit or press Ctrl+C".to_string(),
         },
@@ -154,6 +163,42 @@ fn stop_returns_nonzero_on_api_error() {
 
     assert!(!output.status.success());
     assert!(stderr.contains("cannot stop embedded daemon"));
+}
+
+#[test]
+fn status_returns_exit_code_3_when_daemon_is_not_running() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("missing.sock");
+    let socket = socket_path.to_str().unwrap();
+
+    let output = run_zaz(temp.path(), &["--socket", socket, "status"]);
+    let stdout = stdout_string(&output);
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(stdout.contains("No daemon running (could not connect to"));
+    assert!(stdout.contains(socket));
+}
+
+#[test]
+fn status_returns_nonzero_on_api_error_response() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("daemon.sock");
+    let server = start_fake_server(
+        &socket_path,
+        ApiRequest::Status,
+        ApiResponse::Error {
+            message: "status unavailable".to_string(),
+        },
+    );
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "status"]);
+    let stderr = stderr_string(&output);
+
+    server.join().expect("fake server thread should finish");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("status request failed: status unavailable"));
 }
 
 #[test]
