@@ -62,7 +62,7 @@ Or in JSON:
 ```bash
 zaz                 # Open the TUI (reuses or auto-starts a daemon)
 zaz task            # Run task commands once and exit
-zaz daemon          # Start the daemon
+zaz daemon          # Run the daemon in the foreground
 zaz status          # Show daemon status
 zaz restart [group] # Restart a group (or all)
 zaz stop            # Stop the running daemon

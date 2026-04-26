@@ -38,6 +38,17 @@ fn daemon_help_describes_foreground_mode() {
     assert!(output.status.success());
     assert!(stdout.contains("Run the daemon in the foreground"));
     assert!(stdout.contains("--quiet"));
+    assert!(!stdout.contains("--detach"));
+}
+
+#[test]
+fn daemon_rejects_detach_flag() {
+    let temp = TempDir::new().unwrap();
+    let output = run_zaz(temp.path(), &["daemon", "--detach"]);
+    let stderr = stderr_string(&output);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("unexpected argument '--detach'"));
 }
 
 fn start_daemon(current_dir: &Path, config_path: &Path, socket_path: &Path) -> Child {
