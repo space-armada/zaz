@@ -391,6 +391,49 @@ fn reload_returns_nonzero_on_unexpected_response() {
 }
 
 #[test]
+fn task_command_does_not_start_daemons_for_daemon_only_groups() {
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("zaz.toml");
+    let daemon_marker = temp.path().join("daemon-started");
+
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[settings]
+shell = "/bin/sh"
+
+[[group]]
+name = "daemon-only"
+patterns = ["**/*.rs"]
+
+[[group.daemon]]
+name = "server"
+command = "echo started > {}"
+
+[[group]]
+name = "tasks"
+patterns = ["**/*.rs"]
+depends_on = ["daemon-only"]
+
+[[group.task]]
+name = "noop"
+command = "true"
+"#,
+            daemon_marker.display()
+        ),
+    )
+    .unwrap();
+
+    let config = config_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--config", config, "task"]);
+    let stderr = stderr_string(&output);
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(!daemon_marker.exists());
+}
+
+#[test]
 fn check_pretty_returns_nonzero_on_parse_error() {
     let temp = TempDir::new().unwrap();
     let config_path = temp.path().join("zaz.toml");

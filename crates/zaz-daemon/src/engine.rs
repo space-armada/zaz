@@ -367,6 +367,9 @@ pub struct Engine {
 
     /// Notification configuration from user config.
     notification_config: zaz_config::NotificationConfig,
+
+    /// Whether this engine should skip daemon startup entirely.
+    task_only: bool,
 }
 
 /// Result of a config reload operation.
@@ -407,15 +410,28 @@ struct ManagedGroup {
 impl Engine {
     /// Create a new engine from a configuration file.
     pub fn new(config_path: &Path) -> Result<Self, DaemonError> {
-        Self::with_options(config_path, true)
+        Self::with_mode(config_path, true, false)
+    }
+
+    /// Create a new engine from a configuration file in task-only mode.
+    pub fn new_task_only(config_path: &Path) -> Result<Self, DaemonError> {
+        Self::with_mode(config_path, true, true)
     }
 
     /// Create a new engine with options.
     ///
     /// `verbose_output` controls whether process output is printed to stdout.
     pub fn with_options(config_path: &Path, verbose_output: bool) -> Result<Self, DaemonError> {
+        Self::with_mode(config_path, verbose_output, false)
+    }
+
+    fn with_mode(
+        config_path: &Path,
+        verbose_output: bool,
+        task_only: bool,
+    ) -> Result<Self, DaemonError> {
         let config = zaz_config::load(config_path).map_err(DaemonError::Config)?;
-        Self::from_config(config, config_path.to_path_buf(), verbose_output)
+        Self::from_config_with_mode(config, config_path.to_path_buf(), verbose_output, task_only)
     }
 
     /// Create a new engine from a loaded configuration.
@@ -423,6 +439,15 @@ impl Engine {
         config: Config,
         config_path: PathBuf,
         verbose_output: bool,
+    ) -> Result<Self, DaemonError> {
+        Self::from_config_with_mode(config, config_path, verbose_output, false)
+    }
+
+    fn from_config_with_mode(
+        config: Config,
+        config_path: PathBuf,
+        verbose_output: bool,
+        task_only: bool,
     ) -> Result<Self, DaemonError> {
         // Load user config for notification settings
         let user_config = zaz_config::load_user_config();
@@ -575,7 +600,22 @@ impl Engine {
             task_completion_rx,
             task_completion_tx,
             notification_config,
+            task_only,
         })
+    }
+
+    fn group_has_startup_tasks(&self, group_name: &str) -> bool {
+        self.groups
+            .get(group_name)
+            .map(|g| g.config.tasks.iter().any(|t| !t.on_change_only))
+            .unwrap_or(false)
+    }
+
+    fn group_has_daemons(&self, group_name: &str) -> bool {
+        self.groups
+            .get(group_name)
+            .map(|g| !g.daemons.is_empty())
+            .unwrap_or(false)
     }
 
     /// Get current daemon state.
@@ -706,22 +746,18 @@ impl Engine {
             }
 
             // Can start group when all dependencies are Ready or no dependencies
-            let has_startup_tasks = self
-                .groups
-                .get(group_name)
-                .map(|g| g.config.tasks.iter().any(|t| !t.on_change_only))
-                .unwrap_or(false);
+            let has_startup_tasks = self.group_has_startup_tasks(group_name);
 
             if has_startup_tasks {
                 // Spawn tasks; daemons will start when tasks complete
                 self.spawn_group_tasks(group_name, &trigger_ctx);
+            } else if self.task_only {
+                // Task-only mode treats daemon-only or empty groups as satisfied.
+                self.set_group_status(group_name, GroupStatus::Ready);
+                self.trigger_dependents(group_name);
             } else {
                 // Group has no tasks: queue daemon startup
-                let has_daemons = self
-                    .groups
-                    .get(group_name)
-                    .map(|g| !g.daemons.is_empty())
-                    .unwrap_or(false);
+                let has_daemons = self.group_has_daemons(group_name);
 
                 if has_daemons {
                     groups_needing_daemon_start.push(group_name.clone());
@@ -2330,21 +2366,16 @@ impl Engine {
 
     /// Start a group that was waiting for dependencies.
     fn start_waiting_group(&mut self, group_name: &str, trigger_ctx: &TriggerContext) {
-        let has_startup_tasks = self
-            .groups
-            .get(group_name)
-            .map(|g| g.config.tasks.iter().any(|t| !t.on_change_only))
-            .unwrap_or(false);
+        let has_startup_tasks = self.group_has_startup_tasks(group_name);
 
         if has_startup_tasks {
             self.spawn_group_tasks(group_name, trigger_ctx);
+        } else if self.task_only {
+            self.set_group_status(group_name, GroupStatus::Ready);
+            self.trigger_dependents(group_name);
         } else {
             // No tasks - mark as ready immediately or start daemons
-            let has_daemons = self
-                .groups
-                .get(group_name)
-                .map(|g| !g.daemons.is_empty())
-                .unwrap_or(false);
+            let has_daemons = self.group_has_daemons(group_name);
 
             if has_daemons {
                 // Queue daemon start - this will be handled asynchronously
@@ -2652,7 +2683,7 @@ fn topological_sort(groups: &[Group]) -> Result<Vec<String>, DaemonError> {
 mod tests {
     use super::*;
     use crate::ApiRequest;
-    use zaz_config::{Group, Silence, TaskCommand};
+    use zaz_config::{DaemonCommand, Group, Silence, TaskCommand};
 
     // =========================================================================
     // Test helpers
@@ -2678,6 +2709,12 @@ mod tests {
         let config_path = temp_dir.join("zaz.yaml");
 
         Engine::from_config(config, config_path, false).unwrap()
+    }
+
+    fn create_test_task_only_engine(groups: Vec<Group>) -> Engine {
+        let mut engine = create_test_engine(groups);
+        engine.task_only = true;
+        engine
     }
 
     /// Create a test group with specified tasks.
@@ -3856,6 +3893,51 @@ mod tests {
         assert_eq!(group.state.status, GroupStatus::Ready);
         // No tasks should be running
         assert!(engine.running_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_task_only_startup_skips_daemon_only_group() {
+        let groups = vec![Group {
+            name: "daemon-only".to_string(),
+            tasks: vec![],
+            daemons: vec![DaemonCommand::new("server", "sleep 1")],
+            patterns: vec!["*.test".to_string()],
+            ..Default::default()
+        }];
+        let mut engine = create_test_task_only_engine(groups);
+
+        engine.startup().await.unwrap();
+
+        let group = engine.groups.get("daemon-only").unwrap();
+        assert_eq!(group.state.status, GroupStatus::Ready);
+        assert!(engine.running_tasks.is_empty());
+        assert!(!group.daemons_started);
+    }
+
+    #[tokio::test]
+    async fn test_task_only_dependency_on_daemon_only_group_triggers_dependents() {
+        let daemon_only = Group {
+            name: "a".to_string(),
+            tasks: vec![],
+            daemons: vec![DaemonCommand::new("server", "sleep 1")],
+            patterns: vec!["*.test".to_string()],
+            ..Default::default()
+        };
+        let dependent = test_group_with_deps("b", &["task1"], &["a"]);
+        let mut engine = create_test_task_only_engine(vec![daemon_only, dependent]);
+
+        engine.startup().await.unwrap();
+
+        assert_eq!(
+            engine.groups.get("a").unwrap().state.status,
+            GroupStatus::Ready
+        );
+        assert_eq!(
+            engine.groups.get("b").unwrap().state.status,
+            GroupStatus::Running
+        );
+        assert!(engine.running_tasks.contains("b:task1"));
+        assert!(!engine.dependency_resolver.is_waiting("b"));
     }
 
     #[tokio::test]

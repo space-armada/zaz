@@ -321,11 +321,11 @@ fn resolve_command_socket(
 async fn run_tasks(config_path: &Path) -> Result<()> {
     tracing::info!(config = %config_path.display(), "running task commands");
 
-    let mut engine = Engine::new(config_path)?;
+    let mut engine = Engine::new_task_only(config_path)?;
     engine.startup().await?;
     engine.wait_for_tasks().await;
 
-    // Shutdown daemons since we're in task-only mode
+    // Shutdown still performs normal cleanup, even though task-only mode never starts daemons.
     engine.shutdown().await?;
 
     tracing::info!("all tasks completed");
