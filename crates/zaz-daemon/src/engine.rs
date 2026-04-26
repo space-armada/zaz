@@ -1542,7 +1542,7 @@ impl Engine {
     /// Wait for all running tasks to complete.
     ///
     /// This polls for task completions until no tasks are running.
-    pub async fn wait_for_tasks(&mut self) {
+    pub async fn wait_for_tasks(&mut self) -> bool {
         while !self.running_tasks.is_empty() {
             self.process_task_completions().await;
             if self.running_tasks.is_empty() {
@@ -1553,6 +1553,12 @@ impl Engine {
         }
         // Final drain of any remaining completions
         self.process_task_completions().await;
+
+        !self
+            .groups
+            .values()
+            .flat_map(|group| group.state.tasks.iter())
+            .any(|task| task.status == ProcessStatus::Failed)
     }
 
     /// Poll for file changes and process them.
@@ -2809,6 +2815,63 @@ mod tests {
         let group = engine.groups.get("mygroup").unwrap();
         assert_eq!(group.state.tasks[0].status, ProcessStatus::Failed);
         assert_eq!(group.state.tasks[0].exit_code, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_tasks_returns_true_when_all_tasks_succeed() {
+        let groups = vec![test_group("mygroup", &["task1", "task2"])];
+        let mut engine = create_test_engine(groups);
+
+        engine.running_tasks.insert("mygroup:task1".to_string());
+        engine.running_tasks.insert("mygroup:task2".to_string());
+        engine.groups.get_mut("mygroup").unwrap().state.tasks[0].status = ProcessStatus::Running;
+        engine.groups.get_mut("mygroup").unwrap().state.tasks[1].status = ProcessStatus::Running;
+
+        engine
+            .task_completion_tx
+            .send(task_completion("mygroup", "task1", 0, true))
+            .await
+            .unwrap();
+        engine
+            .task_completion_tx
+            .send(task_completion("mygroup", "task2", 1, true))
+            .await
+            .unwrap();
+
+        let success = engine.wait_for_tasks().await;
+
+        assert!(success);
+        assert!(engine.running_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_tasks_returns_false_when_any_task_fails() {
+        let groups = vec![test_group("mygroup", &["task1", "task2"])];
+        let mut engine = create_test_engine(groups);
+
+        engine.running_tasks.insert("mygroup:task1".to_string());
+        engine.running_tasks.insert("mygroup:task2".to_string());
+        engine.groups.get_mut("mygroup").unwrap().state.tasks[0].status = ProcessStatus::Running;
+        engine.groups.get_mut("mygroup").unwrap().state.tasks[1].status = ProcessStatus::Running;
+
+        engine
+            .task_completion_tx
+            .send(task_completion("mygroup", "task1", 0, false))
+            .await
+            .unwrap();
+        engine
+            .task_completion_tx
+            .send(task_completion("mygroup", "task2", 1, true))
+            .await
+            .unwrap();
+
+        let success = engine.wait_for_tasks().await;
+
+        assert!(!success);
+        assert!(engine.running_tasks.is_empty());
+        let group = engine.groups.get("mygroup").unwrap();
+        assert_eq!(group.state.tasks[0].status, ProcessStatus::Failed);
+        assert_eq!(group.state.tasks[1].status, ProcessStatus::Success);
     }
 
     #[tokio::test]

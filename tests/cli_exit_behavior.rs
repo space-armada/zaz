@@ -29,6 +29,26 @@ fn stderr_string(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr should be valid utf-8")
 }
 
+fn write_task_config(temp: &TempDir, command: &str) -> std::path::PathBuf {
+    let config_path = temp.path().join("zaz.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[[group]]
+name = "tasks"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "run"
+command = "{command}"
+"#
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
 #[test]
 fn daemon_help_describes_foreground_mode() {
     let temp = TempDir::new().unwrap();
@@ -49,6 +69,34 @@ fn daemon_rejects_detach_flag() {
 
     assert!(!output.status.success());
     assert!(stderr.contains("unexpected argument '--detach'"));
+}
+
+#[test]
+fn task_returns_zero_when_all_tasks_succeed() {
+    let temp = TempDir::new().unwrap();
+    let config_path = write_task_config(&temp, "true");
+
+    let output = run_zaz(
+        temp.path(),
+        &["--config", config_path.to_str().unwrap(), "task"],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn task_returns_nonzero_when_any_task_fails() {
+    let temp = TempDir::new().unwrap();
+    let config_path = write_task_config(&temp, "false");
+
+    let output = run_zaz(
+        temp.path(),
+        &["--config", config_path.to_str().unwrap(), "task"],
+    );
+    let stderr = stderr_string(&output);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("one or more tasks failed"));
 }
 
 fn start_daemon(current_dir: &Path, config_path: &Path, socket_path: &Path) -> Child {

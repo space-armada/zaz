@@ -323,10 +323,14 @@ async fn run_tasks(config_path: &Path) -> Result<()> {
 
     let mut engine = Engine::new_task_only(config_path)?;
     engine.startup().await?;
-    engine.wait_for_tasks().await;
+    let success = engine.wait_for_tasks().await;
 
     // Shutdown still performs normal cleanup, even though task-only mode never starts daemons.
     engine.shutdown().await?;
+
+    if !success {
+        bail!("one or more tasks failed");
+    }
 
     tracing::info!("all tasks completed");
     Ok(())
