@@ -207,6 +207,14 @@ impl DependencyResolver {
         self.cascade_skip_from(group)
     }
 
+    /// Reset waiting state and statuses for a new full execution wave.
+    pub fn reset_for_rerun(&mut self) {
+        self.waiting.clear();
+        for status in self.statuses.values_mut() {
+            *status = GroupStatus::Pending;
+        }
+    }
+
     /// Compute groups to skip starting from a failed/skipped group.
     ///
     /// This is called internally and can also be used to compute skips

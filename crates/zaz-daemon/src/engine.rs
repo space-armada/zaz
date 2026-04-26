@@ -20,6 +20,9 @@ use zaz_process::{Daemon, Executor, OutputLine, TaskRunner};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
 
+const DAEMON_START_TASK_ID: &str = "__daemon_start__";
+const DAEMON_RESTART_TASK_ID: &str = "__daemon_restart__";
+
 /// Completion signal from a spawned task execution.
 #[derive(Debug)]
 struct TaskCompletion {
@@ -1201,13 +1204,19 @@ impl Engine {
         let mut failed_groups: Vec<String> = Vec::new();
 
         while let Ok(completion) = self.task_completion_rx.try_recv() {
-            // Handle special __daemon_start__ task for groups without tasks
-            if completion.task_id == "__daemon_start__" {
+            // Handle synthetic daemon actions for groups without tasks.
+            if completion.task_id == DAEMON_START_TASK_ID
+                || completion.task_id == DAEMON_RESTART_TASK_ID
+            {
                 tracing::debug!(
                     group = %completion.group_name,
-                    "processing daemon start request for group without tasks"
+                    should_start = completion.task_id == DAEMON_START_TASK_ID,
+                    "processing daemon action request for group without tasks"
                 );
-                daemon_actions.push((completion.group_name.clone(), true));
+                daemon_actions.push((
+                    completion.group_name.clone(),
+                    completion.task_id == DAEMON_START_TASK_ID,
+                ));
                 continue;
             }
 
@@ -1671,13 +1680,28 @@ impl Engine {
 
     /// Restart all groups.
     ///
-    /// Spawns all group executions asynchronously. Returns immediately.
-    pub fn restart_all(&mut self) -> Result<(), DaemonError> {
+    /// Spawns all group executions asynchronously while respecting dependency
+    /// ordering. Returns immediately after queuing the work.
+    pub async fn restart_all(&mut self) -> Result<(), DaemonError> {
         tracing::info!("restarting all groups");
+        self.dependency_resolver.reset_for_rerun();
         let trigger_ctx = self.manual_restart_context(RestartScope::All);
-        for group_name in &self.execution_order.clone() {
-            self.spawn_group_tasks(group_name, &trigger_ctx);
+        for group_name in self.execution_order.clone() {
+            if let Some(unready_deps) = self.dependency_resolver.mark_waiting(&group_name) {
+                tracing::debug!(
+                    group = %group_name,
+                    waiting_for = ?unready_deps,
+                    "group waiting for dependencies during restart_all"
+                );
+                self.set_group_status(&group_name, GroupStatus::Waiting);
+                continue;
+            }
+
+            self.restart_dependency_ready_group(&group_name, &trigger_ctx)
+                .await?;
         }
+
+        self.update_state();
         Ok(())
     }
 
@@ -2042,7 +2066,7 @@ impl Engine {
                     )),
                 }
             }
-            ApiRequest::RestartAll => match self.restart_all() {
+            ApiRequest::RestartAll => match self.restart_all().await {
                 Ok(()) => ApiResponse::ok_with_message("restart initiated for all groups"),
                 Err(e) => ApiResponse::error(format!("failed to restart: {}", e)),
             },
@@ -2204,24 +2228,23 @@ impl Engine {
         self.groups
             .get(group_name)
             .map(|g| {
+                if self.dependency_resolver.has_waiting_dependents(group_name) {
+                    return LifecyclePhase::Startup;
+                }
+
                 // Check if group has daemons
                 let has_daemons = !g.daemons.is_empty();
 
                 if has_daemons {
-                    // Groups with daemons: runtime after first start
+                    // Groups with daemons: runtime after first start, unless a
+                    // dependency-ordered rerun wave still has blocked dependents.
                     if g.daemons_started {
                         LifecyclePhase::Runtime
                     } else {
                         LifecyclePhase::Startup
                     }
                 } else {
-                    // Groups without daemons: check if any dependents are waiting
-                    // If dependents are waiting, we're in startup. If not, runtime.
-                    if self.dependency_resolver.has_waiting_dependents(group_name) {
-                        LifecyclePhase::Startup
-                    } else {
-                        LifecyclePhase::Runtime
-                    }
+                    LifecyclePhase::Runtime
                 }
             })
             .unwrap_or(LifecyclePhase::Startup)
@@ -2277,25 +2300,12 @@ impl Engine {
             let has_daemons = self.group_has_daemons(group_name);
 
             if has_daemons {
-                // Queue daemon start - this will be handled asynchronously
-                // We need to spawn a task to handle this since we can't await here
-                let group_name = group_name.to_string();
-                let task_completion_tx = self.task_completion_tx.clone();
-                tokio::spawn(async move {
-                    // Signal that this group needs daemon startup
-                    // We use a special task completion to trigger daemon startup
-                    let _ = task_completion_tx
-                        .send(TaskCompletion {
-                            group_name,
-                            task_id: "__daemon_start__".to_string(),
-                            task_index: 0,
-                            success: true,
-                            status: ProcessStatus::Success,
-                            duration_ms: None,
-                            exit_code: None,
-                        })
-                        .await;
-                });
+                let should_start = self
+                    .groups
+                    .get(group_name)
+                    .map(|group| !group.daemons_started)
+                    .unwrap_or(true);
+                self.queue_daemon_action(group_name, should_start);
             } else {
                 // No tasks and no daemons - mark as Ready and trigger dependents
                 self.set_group_status(group_name, GroupStatus::Ready);
@@ -2415,6 +2425,58 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    async fn restart_dependency_ready_group(
+        &mut self,
+        group_name: &str,
+        trigger_ctx: &TriggerContext,
+    ) -> Result<(), DaemonError> {
+        let has_startup_tasks = self.group_has_startup_tasks(group_name);
+
+        if has_startup_tasks {
+            self.spawn_group_tasks(group_name, trigger_ctx);
+        } else if self.task_only {
+            self.set_group_status(group_name, GroupStatus::Ready);
+            self.trigger_dependents(group_name);
+        } else if self.group_has_daemons(group_name) {
+            let should_start = self
+                .groups
+                .get(group_name)
+                .map(|group| !group.daemons_started)
+                .unwrap_or(true);
+            self.handle_daemon_action(group_name, should_start).await?;
+            self.trigger_dependents(group_name);
+        } else {
+            self.set_group_status(group_name, GroupStatus::Ready);
+            self.trigger_dependents(group_name);
+        }
+
+        Ok(())
+    }
+
+    fn queue_daemon_action(&self, group_name: &str, should_start: bool) {
+        let group_name = group_name.to_string();
+        let task_completion_tx = self.task_completion_tx.clone();
+        let task_id = if should_start {
+            DAEMON_START_TASK_ID
+        } else {
+            DAEMON_RESTART_TASK_ID
+        };
+
+        tokio::spawn(async move {
+            let _ = task_completion_tx
+                .send(TaskCompletion {
+                    group_name,
+                    task_id: task_id.to_string(),
+                    task_index: 0,
+                    success: true,
+                    status: ProcessStatus::Success,
+                    duration_ms: None,
+                    exit_code: None,
+                })
+                .await;
+        });
     }
 
     /// Signal all daemons in a group to restart (without cascading).
@@ -2695,11 +2757,15 @@ mod tests {
 
     /// Create a test group with specified tasks.
     fn test_group(name: &str, task_names: &[&str]) -> Group {
+        test_group_with_command(name, task_names, "echo test")
+    }
+
+    fn test_group_with_command(name: &str, task_names: &[&str], command: &str) -> Group {
         Group {
             name: name.to_string(),
             tasks: task_names
                 .iter()
-                .map(|n| TaskCommand::new(*n, "echo test"))
+                .map(|n| TaskCommand::new(*n, command))
                 .collect(),
             patterns: vec!["*.test".to_string()],
             ..Default::default()
@@ -2709,6 +2775,17 @@ mod tests {
     /// Create a test group with dependencies.
     fn test_group_with_deps(name: &str, task_names: &[&str], depends_on: &[&str]) -> Group {
         let mut group = test_group(name, task_names);
+        group.depends_on = depends_on.iter().map(|s| s.to_string()).collect();
+        group
+    }
+
+    fn test_group_with_deps_and_command(
+        name: &str,
+        task_names: &[&str],
+        depends_on: &[&str],
+        command: &str,
+    ) -> Group {
+        let mut group = test_group_with_command(name, task_names, command);
         group.depends_on = depends_on.iter().map(|s| s.to_string()).collect();
         group
     }
@@ -3083,7 +3160,7 @@ mod tests {
 
         // Send daemon start signal
         let completion = TaskCompletion {
-            task_id: "__daemon_start__".to_string(),
+            task_id: DAEMON_START_TASK_ID.to_string(),
             group_name: "mygroup".to_string(),
             task_index: 0,
             success: true,
@@ -4125,6 +4202,74 @@ mod tests {
         let waiting_for_a = engine.dependency_resolver.waiting_for("a").unwrap();
         assert!(!waiting_for_a.contains("b"));
         assert!(waiting_for_a.contains("c"));
+    }
+
+    #[tokio::test]
+    async fn test_restart_all_waits_for_dependencies() {
+        let groups = vec![
+            test_group_with_command("a", &["task1"], "sleep 0.05"),
+            test_group_with_deps_and_command("b", &["task1"], &["a"], "sleep 0.05"),
+        ];
+        let mut engine = create_test_engine(groups);
+
+        engine.restart_all().await.unwrap();
+
+        assert_eq!(engine.groups.get("a").unwrap().state.status, GroupStatus::Running);
+        assert_eq!(engine.groups.get("b").unwrap().state.status, GroupStatus::Waiting);
+        assert!(engine.running_tasks.contains("a:task1"));
+        assert!(!engine.running_tasks.contains("b:task1"));
+        assert!(engine.dependency_resolver.is_waiting("b"));
+
+        for _ in 0..20 {
+            engine.process_task_completions().await;
+            if engine.running_tasks.contains("b:task1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(engine.running_tasks.contains("b:task1"));
+        assert_eq!(engine.groups.get("b").unwrap().state.status, GroupStatus::Running);
+        assert!(!engine.dependency_resolver.is_waiting("b"));
+    }
+
+    #[tokio::test]
+    async fn test_restart_all_unblocks_dependency_chain_transitively() {
+        let groups = vec![
+            test_group_with_command("a", &["task1"], "sleep 0.05"),
+            test_group_with_deps_and_command("b", &["task1"], &["a"], "sleep 0.05"),
+            test_group_with_deps_and_command("c", &["task1"], &["b"], "sleep 0.05"),
+        ];
+        let mut engine = create_test_engine(groups);
+
+        engine.restart_all().await.unwrap();
+
+        assert!(engine.running_tasks.contains("a:task1"));
+        assert_eq!(engine.groups.get("b").unwrap().state.status, GroupStatus::Waiting);
+        assert_eq!(engine.groups.get("c").unwrap().state.status, GroupStatus::Waiting);
+
+        for _ in 0..30 {
+            engine.process_task_completions().await;
+            if engine.running_tasks.contains("b:task1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(engine.running_tasks.contains("b:task1"));
+        assert_eq!(engine.groups.get("c").unwrap().state.status, GroupStatus::Waiting);
+
+        for _ in 0..30 {
+            engine.process_task_completions().await;
+            if engine.running_tasks.contains("c:task1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(engine.running_tasks.contains("c:task1"));
+        assert!(!engine.dependency_resolver.is_waiting("b"));
+        assert!(!engine.dependency_resolver.is_waiting("c"));
     }
 
     #[tokio::test]
