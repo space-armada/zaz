@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
@@ -731,6 +732,73 @@ fn show_ignores() -> Result<()> {
     Ok(())
 }
 
+async fn is_daemon_responsive(socket_path: &Path, timeout: Duration) -> bool {
+    match tokio::time::timeout(timeout, Client::connect(socket_path)).await {
+        Ok(Ok(mut client)) => {
+            matches!(
+                tokio::time::timeout(timeout, client.request(&ApiRequest::Status)).await,
+                Ok(Ok(_))
+            )
+        }
+        _ => false,
+    }
+}
+
+fn resolve_autostart_executable() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_zaz") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let current_exe = std::env::current_exe()?;
+    if let Some(deps_dir) = current_exe.parent() {
+        if deps_dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
+            if let Some(target_dir) = deps_dir.parent() {
+                let candidate = target_dir.join(env!("CARGO_PKG_NAME"));
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+
+    Ok(current_exe)
+}
+
+fn start_daemon_subprocess(config_path: &Path, socket_path: &Path) -> Result<()> {
+    let current_exe = resolve_autostart_executable()?;
+
+    Command::new(current_exe)
+        .args([
+            "--config",
+            config_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("config path is not valid utf-8"))?,
+            "--socket",
+            socket_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("socket path is not valid utf-8"))?,
+            "daemon",
+            "--quiet",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    Ok(())
+}
+
+async fn wait_for_daemon_ready(socket_path: &Path, attempts: usize, delay: Duration) -> bool {
+    for _ in 0..attempts {
+        tokio::time::sleep(delay).await;
+        if is_daemon_responsive(socket_path, Duration::from_secs(1)).await {
+            return true;
+        }
+    }
+
+    false
+}
+
 async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -> Result<()> {
     tracing::info!(
         config = %config_path.display(),
@@ -738,127 +806,31 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
         "starting TUI"
     );
 
-    // Check if daemon is running
     let check_timeout = Duration::from_secs(1);
-    let daemon_running = match tokio::time::timeout(check_timeout, Client::connect(socket_path))
-        .await
-    {
-        Ok(Ok(mut client)) => {
-            // Try to communicate
-            match tokio::time::timeout(check_timeout, client.request(&ApiRequest::Status)).await {
-                Ok(Ok(_)) => {
-                    tracing::debug!("daemon is running");
-                    true
-                }
-                _ => {
-                    tracing::debug!("daemon socket exists but not responsive");
-                    false
-                }
-            }
-        }
-        _ => {
-            tracing::debug!("no daemon running");
-            false
-        }
-    };
+    let daemon_running = is_daemon_responsive(socket_path, check_timeout).await;
+    if daemon_running {
+        tracing::debug!("daemon is running");
+    } else {
+        tracing::debug!("no responsive daemon running");
+    }
 
-    // Start daemon if needed
     let started_daemon = if !daemon_running && !options.no_autostart {
         tracing::info!("starting daemon in background");
 
-        // Spawn daemon as a background process
-        let config_path_str = config_path.to_string_lossy().to_string();
-        let socket_path_str = socket_path.to_string_lossy().to_string();
-
-        let daemon_handle = tokio::spawn(async move {
-            let config_path = std::path::Path::new(&config_path_str);
-            let socket_path = std::path::Path::new(&socket_path_str);
-
-            // Use embedded mode to prevent remote shutdown
-            let mut engine = match Engine::new_embedded(config_path) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to create engine");
-                    return;
+        match start_daemon_subprocess(config_path, socket_path) {
+            Ok(()) => {
+                let ready =
+                    wait_for_daemon_ready(socket_path, 20, Duration::from_millis(100)).await;
+                if !ready {
+                    tracing::warn!("daemon may not be ready after 2s");
                 }
-            };
-
-            let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
-
-            // Start API server
-            let server = match Server::bind(socket_path, command_tx).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to start server");
-                    return;
-                }
-            };
-
-            let server_handle = tokio::spawn(async move {
-                if let Err(e) = server.run().await {
-                    tracing::error!(error = %e, "server error");
-                }
-            });
-
-            // Run startup (non-blocking, tasks run in background)
-            if let Err(e) = engine.startup().await {
-                tracing::error!(error = %e, "startup failed");
+                true
             }
-
-            // Main loop
-            loop {
-                tokio::select! {
-                    Some(cmd) = command_rx.recv() => {
-                        // Drain log channel before handling request (ensures GetLogs returns fresh data)
-                        engine.process_incoming_logs();
-
-                        let is_shutdown = matches!(cmd.request, ApiRequest::Shutdown);
-                        let response = engine.handle_request(cmd.request).await;
-                        let _ = cmd.response_tx.send(response);
-
-                        if is_shutdown {
-                            break;
-                        }
-                    }
-
-                    _ = async {
-                        // Process incoming logs from PTY readers
-                        engine.process_incoming_logs();
-
-                        if let Err(e) = engine.poll().await {
-                            tracing::error!(error = %e, "poll error");
-                        }
-                        if let Err(e) = engine.check_daemons().await {
-                            tracing::error!(error = %e, "daemon check error");
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    } => {}
-                }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to auto-start daemon");
+                false
             }
-
-            server_handle.abort();
-            let _ = engine.shutdown().await;
-        });
-
-        // Wait for daemon to be ready
-        let mut attempts = 0;
-        while attempts < 20 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Ok(mut client) = Client::connect(socket_path).await {
-                if client.request(&ApiRequest::Status).await.is_ok() {
-                    break;
-                }
-            }
-            attempts += 1;
         }
-
-        if attempts >= 20 {
-            tracing::warn!("daemon may not be ready after 2s");
-        }
-
-        // Store handle to prevent immediate drop
-        std::mem::forget(daemon_handle);
-        true
     } else {
         false
     };
@@ -896,11 +868,15 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_command_socket, resolve_control_command_socket};
+    use super::{
+        is_daemon_responsive, resolve_command_socket, resolve_control_command_socket,
+        start_daemon_subprocess, wait_for_daemon_ready,
+    };
     use anyhow::Result;
     use std::path::PathBuf;
+    use std::time::Duration;
     use tempfile::TempDir;
-    use zaz_daemon::{socket_path_for_config, DaemonError};
+    use zaz_daemon::{socket_path_for_config, ApiRequest, ApiResponse, Client, DaemonError};
 
     #[test]
     fn control_command_socket_uses_explicit_socket() -> Result<()> {
@@ -1043,6 +1019,44 @@ mod tests {
         assert!(message.contains("--socket <PATH>"));
         assert!(message.contains("zaz project directory"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn daemon_responsive_reports_false_for_missing_socket() {
+        let temp = TempDir::new().unwrap();
+        let socket_path = temp.path().join("missing.sock");
+
+        assert!(!is_daemon_responsive(&socket_path, Duration::from_millis(100)).await);
+    }
+
+    #[tokio::test]
+    async fn start_daemon_subprocess_starts_reachable_daemon() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("zaz.toml");
+        let socket_path = temp.path().join("daemon.sock");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[[group]]
+name = "backend"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "noop"
+command = "true"
+"#,
+        )
+        .unwrap();
+
+        start_daemon_subprocess(&config_path, &socket_path).unwrap();
+
+        assert!(wait_for_daemon_ready(&socket_path, 50, Duration::from_millis(100)).await);
+        assert!(is_daemon_responsive(&socket_path, Duration::from_secs(1)).await);
+
+        let mut client = Client::connect(&socket_path).await.unwrap();
+        let response = client.request(&ApiRequest::Shutdown).await.unwrap();
+        assert!(matches!(response, ApiResponse::Ok { .. }));
     }
 }
 
