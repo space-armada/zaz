@@ -29,6 +29,10 @@ Run zaz:
 zaz
 ```
 
+Plain `zaz` opens the TUI. If a daemon is already running for the target
+socket, the TUI reuses it; otherwise zaz auto-starts one unless you pass
+`--no-autostart`.
+
 ## Minimal Configuration
 
 The simplest valid configuration requires at least one group with a name and
@@ -53,20 +57,15 @@ Or in JSON:
 }
 ```
 
-## Configuration Reference
-
-See [docs/configuration.md](docs/configuration.md) for the complete
-configuration reference.
-
 ## Commands
 
 ```bash
-zaz                 # Start TUI mode (default)
+zaz                 # Open the TUI (reuses or auto-starts a daemon)
 zaz task            # Run task commands once and exit
-zaz daemon          # Start as background daemon
+zaz daemon          # Start the daemon
 zaz status          # Show daemon status
 zaz restart [group] # Restart a group (or all)
-zaz stop            # Stop the daemon
+zaz stop            # Stop the running daemon
 zaz ignores         # Show default ignore patterns
 ```
 
@@ -74,11 +73,12 @@ zaz ignores         # Show default ignore patterns
 
 ```bash
 zaz --full          # Full style: split panes with group tree + logs
-zaz --minimal       # Minimal style: one pane per task
-zaz --no-autostart  # Don't auto-start daemon when TUI starts
+zaz --multi-pane    # Multi-pane style: one pane per task
+zaz --no-autostart  # Don't auto-start a daemon before opening the TUI
+zaz --stop-on-exit  # Stop the connected daemon when the TUI exits
 ```
 
-Press `F1`/`F2` to switch between Full and Minimal styles at runtime.
+Press `F1`/`F2` to switch between Full and Multi Pane styles at runtime.
 
 ## User Configuration
 
@@ -86,18 +86,19 @@ User preferences are stored separately from project configuration at
 `~/.config/zaz/config.toml` (following XDG Base Directory specification):
 
 ```toml
-# Don't auto-start daemon when running TUI
+# Don't auto-start a daemon before opening the TUI
 no_autostart = false
 
 # Disable blinking/animation effects
 disable_animations = false
 
-# Default TUI style: "full" or "minimal"
+# Default TUI style: "full" or "multi_pane"
 tui_style = "full"
 ```
 
 These settings are optional - zaz works fine without a user config file.
-CLI flags take precedence over user config values.
+CLI flags take precedence over user config values. The legacy value
+`"minimal"` is still accepted as an alias for `"multi_pane"`.
 
 ## Keyboard Shortcuts
 
@@ -134,8 +135,8 @@ CLI flags take precedence over user config values.
 | Key | Action |
 |-----|--------|
 | `F1` | Switch to Full style |
-| `F2` | Switch to Minimal style |
-| `[`/`]` | Previous/next page (Minimal, >6 tasks) |
+| `F2` | Switch to Multi Pane style |
+| `[`/`]` | Previous/next page (Multi Pane, >6 tasks) |
 
 ### General
 

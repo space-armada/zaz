@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UserConfig {
-    /// Disable auto-starting daemon when TUI starts.
+    /// Disable auto-starting a daemon before the TUI opens.
     pub no_autostart: bool,
 
     /// Disable blinking/animation effects in the TUI.

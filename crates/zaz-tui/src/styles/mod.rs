@@ -84,8 +84,8 @@ pub enum KeyResult {
 ///
 /// Styles should use `App` fields for state:
 /// - `selected_item`: Selection index for Full style's groups tree
-/// - `selected_pane`: Selection index for Minimal style's panes
-/// - `pane_scroll`: Per-pane scroll positions for Minimal style
+/// - `selected_pane`: Selection index for Multi Pane style's panes
+/// - `pane_scroll`: Per-pane scroll positions for Multi Pane style
 /// - `log_scroll`: Global log scroll for Full style
 /// - `focus`: Which element is focused
 pub trait StyleRenderer: Send + Sync {

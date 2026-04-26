@@ -37,11 +37,11 @@ struct Cli {
     #[arg(long, conflicts_with = "full")]
     multi_pane: bool,
 
-    /// Don't auto-start daemon when running TUI
+    /// Don't auto-start a daemon before opening the TUI
     #[arg(long)]
     no_autostart: bool,
 
-    /// Stop the daemon when the TUI exits
+    /// Stop the connected daemon when the TUI exits
     #[arg(long)]
     stop_on_exit: bool,
 

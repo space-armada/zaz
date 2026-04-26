@@ -94,7 +94,7 @@ pub struct App {
     pub focus: Focus,
     /// Selected item index in flat list (groups + tasks + daemons).
     pub selected_item: usize,
-    /// Selected pane index (minimal style).
+    /// Selected pane index (Multi Pane style).
     pub selected_pane: usize,
     /// Current page for pagination (Multi Pane style).
     pub current_page: usize,
@@ -269,7 +269,7 @@ impl App {
             .sum()
     }
 
-    /// Get the number of pages needed for minimal style.
+    /// Get the number of pages needed for Multi Pane style.
     pub fn page_count(&self) -> usize {
         let count = self.task_count();
         if count <= 6 {
