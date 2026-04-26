@@ -1699,13 +1699,14 @@ impl Engine {
     /// Restart a specific group.
     ///
     /// Spawns the group execution asynchronously. Returns immediately.
-    pub fn restart_group(&mut self, group_name: &str) -> Result<(), DaemonError> {
+    pub async fn restart_group(&mut self, group_name: &str) -> Result<(), DaemonError> {
         if !self.groups.contains_key(group_name) {
             return Err(DaemonError::GroupNotFound(group_name.to_string()));
         }
         tracing::info!(group = group_name, "restarting group");
         let trigger_ctx = self.manual_restart_context(RestartScope::Group(group_name.to_string()));
-        self.spawn_group_tasks(group_name, &trigger_ctx);
+        self.execute_groups(&[group_name.to_string()], &trigger_ctx)
+            .await;
         Ok(())
     }
 
@@ -1717,6 +1718,7 @@ impl Engine {
         tracing::info!("restarting all groups");
         self.dependency_resolver.reset_for_rerun();
         let trigger_ctx = self.manual_restart_context(RestartScope::All);
+        let mut ready_groups = Vec::new();
         for group_name in self.execution_order.clone() {
             if let Some(unready_deps) = self.dependency_resolver.mark_waiting(&group_name) {
                 tracing::debug!(
@@ -1728,10 +1730,10 @@ impl Engine {
                 continue;
             }
 
-            self.restart_dependency_ready_group(&group_name, &trigger_ctx)
-                .await?;
+            ready_groups.push(group_name);
         }
 
+        self.execute_groups(&ready_groups, &trigger_ctx).await;
         self.update_state();
         Ok(())
     }
@@ -2082,7 +2084,7 @@ impl Engine {
                     offset: None,
                 }
             }
-            ApiRequest::RestartGroup { name } => match self.restart_group(&name) {
+            ApiRequest::RestartGroup { name } => match self.restart_group(&name).await {
                 Ok(()) => {
                     ApiResponse::ok_with_message(format!("restart initiated for group '{}'", name))
                 }
@@ -2458,34 +2460,6 @@ impl Engine {
         Ok(())
     }
 
-    async fn restart_dependency_ready_group(
-        &mut self,
-        group_name: &str,
-        trigger_ctx: &TriggerContext,
-    ) -> Result<(), DaemonError> {
-        let has_startup_tasks = self.group_has_startup_tasks(group_name);
-
-        if has_startup_tasks {
-            self.spawn_group_tasks(group_name, trigger_ctx);
-        } else if self.task_only {
-            self.set_group_status(group_name, GroupStatus::Ready);
-            self.trigger_dependents(group_name);
-        } else if self.group_has_daemons(group_name) {
-            let should_start = self
-                .groups
-                .get(group_name)
-                .map(|group| !group.daemons_started)
-                .unwrap_or(true);
-            self.handle_daemon_action(group_name, should_start).await?;
-            self.trigger_dependents(group_name);
-        } else {
-            self.set_group_status(group_name, GroupStatus::Ready);
-            self.trigger_dependents(group_name);
-        }
-
-        Ok(())
-    }
-
     fn queue_daemon_action(&self, group_name: &str, should_start: bool) {
         let group_name = group_name.to_string();
         let task_completion_tx = self.task_completion_tx.clone();
@@ -2798,6 +2772,15 @@ mod tests {
                 .iter()
                 .map(|n| TaskCommand::new(*n, command))
                 .collect(),
+            patterns: vec!["*.test".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn test_group_with_tasks(name: &str, tasks: Vec<TaskCommand>) -> Group {
+        Group {
+            name: name.to_string(),
+            tasks,
             patterns: vec!["*.test".to_string()],
             ..Default::default()
         }
@@ -4006,8 +3989,14 @@ mod tests {
 
         assert!(engine.running_tasks.contains("a:task1"));
         assert!(!engine.running_tasks.contains("b:task1"));
-        assert_eq!(engine.groups.get("a").unwrap().state.status, GroupStatus::Running);
-        assert_eq!(engine.groups.get("b").unwrap().state.status, GroupStatus::Pending);
+        assert_eq!(
+            engine.groups.get("a").unwrap().state.status,
+            GroupStatus::Running
+        );
+        assert_eq!(
+            engine.groups.get("b").unwrap().state.status,
+            GroupStatus::Pending
+        );
     }
 
     #[tokio::test]
@@ -4315,8 +4304,14 @@ mod tests {
 
         engine.restart_all().await.unwrap();
 
-        assert_eq!(engine.groups.get("a").unwrap().state.status, GroupStatus::Running);
-        assert_eq!(engine.groups.get("b").unwrap().state.status, GroupStatus::Waiting);
+        assert_eq!(
+            engine.groups.get("a").unwrap().state.status,
+            GroupStatus::Running
+        );
+        assert_eq!(
+            engine.groups.get("b").unwrap().state.status,
+            GroupStatus::Waiting
+        );
         assert!(engine.running_tasks.contains("a:task1"));
         assert!(!engine.running_tasks.contains("b:task1"));
         assert!(engine.dependency_resolver.is_waiting("b"));
@@ -4330,7 +4325,10 @@ mod tests {
         }
 
         assert!(engine.running_tasks.contains("b:task1"));
-        assert_eq!(engine.groups.get("b").unwrap().state.status, GroupStatus::Running);
+        assert_eq!(
+            engine.groups.get("b").unwrap().state.status,
+            GroupStatus::Running
+        );
         assert!(!engine.dependency_resolver.is_waiting("b"));
     }
 
@@ -4346,8 +4344,14 @@ mod tests {
         engine.restart_all().await.unwrap();
 
         assert!(engine.running_tasks.contains("a:task1"));
-        assert_eq!(engine.groups.get("b").unwrap().state.status, GroupStatus::Waiting);
-        assert_eq!(engine.groups.get("c").unwrap().state.status, GroupStatus::Waiting);
+        assert_eq!(
+            engine.groups.get("b").unwrap().state.status,
+            GroupStatus::Waiting
+        );
+        assert_eq!(
+            engine.groups.get("c").unwrap().state.status,
+            GroupStatus::Waiting
+        );
 
         for _ in 0..30 {
             engine.process_task_completions().await;
@@ -4358,7 +4362,10 @@ mod tests {
         }
 
         assert!(engine.running_tasks.contains("b:task1"));
-        assert_eq!(engine.groups.get("c").unwrap().state.status, GroupStatus::Waiting);
+        assert_eq!(
+            engine.groups.get("c").unwrap().state.status,
+            GroupStatus::Waiting
+        );
 
         for _ in 0..30 {
             engine.process_task_completions().await;
@@ -4371,6 +4378,58 @@ mod tests {
         assert!(engine.running_tasks.contains("c:task1"));
         assert!(!engine.dependency_resolver.is_waiting("b"));
         assert!(!engine.dependency_resolver.is_waiting("c"));
+    }
+
+    #[tokio::test]
+    async fn test_restart_group_skips_on_change_only_tasks() {
+        let build = TaskCommand::new("build", "sleep 0.05");
+        let mut changed_only = TaskCommand::new("changed-only", "sleep 0.05");
+        changed_only.on_change_only = true;
+
+        let groups = vec![test_group_with_tasks("app", vec![build, changed_only])];
+        let mut engine = create_test_engine(groups);
+
+        engine.restart_group("app").await.unwrap();
+
+        assert!(engine.running_tasks.contains("app:build"));
+        assert!(!engine.running_tasks.contains("app:changed-only"));
+        assert_eq!(
+            engine.groups.get("app").unwrap().state.tasks[0].status,
+            ProcessStatus::Running
+        );
+        assert_eq!(
+            engine.groups.get("app").unwrap().state.tasks[1].status,
+            ProcessStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restart_group_daemon_only_uses_shared_execution_and_cascades() {
+        let groups = vec![
+            test_daemon_group("a", "sleep 1"),
+            test_group_with_deps_and_command("b", &["task1"], &["a"], "sleep 0.05"),
+        ];
+        let mut engine = create_test_engine(groups);
+
+        engine.groups.get_mut("a").unwrap().daemons_started = true;
+        engine.groups.get_mut("a").unwrap().state.status = GroupStatus::Ready;
+        engine.groups.get_mut("b").unwrap().state.status = GroupStatus::Ready;
+
+        engine.restart_group("a").await.unwrap();
+
+        assert!(engine.groups.get("a").unwrap().daemons_started);
+        assert_eq!(
+            engine.groups.get("a").unwrap().state.status,
+            GroupStatus::Ready
+        );
+        assert_eq!(
+            engine.groups.get("a").unwrap().state.daemons[0].status,
+            ProcessStatus::Running
+        );
+        assert!(engine.running_tasks.contains("b:task1"));
+
+        // Avoid leaking the started daemon process from the test.
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
