@@ -47,6 +47,19 @@ struct Cli {
     command: Option<Commands>,
 }
 
+// CLI exit policy:
+//
+// - Query commands report state. `status` exits 0 when the daemon is running,
+//   exits 3 for "not running" per the LSB/systemctl convention, and exits 1
+//   for operational errors.
+// - Strict-mutating commands perform an action that requires a running daemon.
+//   `restart` and `reload` exit 1 when no daemon is running or when the daemon
+//   API returns an error.
+// - Idempotent-mutating commands ensure a postcondition. `stop` exits 0 when
+//   the daemon is already stopped, and exits 1 for API/operational errors.
+//
+// New CLI commands must declare which category they belong to before
+// implementation so their exit behavior stays predictable in scripts.
 #[derive(Subcommand)]
 enum Commands {
     /// Run task commands once and exit
