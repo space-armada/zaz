@@ -111,7 +111,7 @@ impl<'de> Deserialize<'de> for HumanDuration {
 }
 
 /// Root configuration structure.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Global settings.
@@ -126,7 +126,7 @@ pub struct Config {
 }
 
 /// Global settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     /// Shell to use for command execution (defaults to $SHELL).
@@ -187,7 +187,7 @@ pub enum Silence {
 }
 
 /// A watch group that pairs file patterns with commands.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Group {
     /// Unique name for this group.
@@ -219,7 +219,7 @@ pub struct Group {
 }
 
 /// A task command that runs to completion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskCommand {
     /// Display name for this command (derived from command if not set).
@@ -304,7 +304,7 @@ fn derive_name(command: &str) -> &str {
 }
 
 /// A daemon command that runs continuously.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonCommand {
     /// Display name for this daemon (derived from command if not set).

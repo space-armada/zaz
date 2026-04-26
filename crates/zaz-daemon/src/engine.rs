@@ -385,6 +385,14 @@ pub enum ReloadResult {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConfigDiff {
+    added: Vec<String>,
+    removed: Vec<String>,
+    modified: Vec<String>,
+    unchanged: Vec<String>,
+}
+
 /// A managed watch group with its processes.
 struct ManagedGroup {
     /// Group configuration.
@@ -475,70 +483,9 @@ impl Engine {
             let patterns =
                 PatternSet::new(&group.patterns, &group.ignore).map_err(DaemonError::Watch)?;
             group_patterns.insert(group.name.clone(), patterns);
-
-            // Create executor with shell, working directory, and group env
-            // Default to config directory if no explicit working_dir is set
-            let mut executor = Executor::new(config.settings.shell.clone());
-            let working_dir = group
-                .working_dir
-                .clone()
-                .unwrap_or_else(|| config_dir.to_string_lossy().to_string());
-            executor = executor.with_working_dir(working_dir);
-            if !group.env.is_empty() {
-                executor = executor.with_env(group.env.clone());
-            }
-
-            // Create daemons with per-daemon working_dir and env overrides
-            let daemons: Vec<Daemon> = group
-                .daemons
-                .iter()
-                .map(|d| {
-                    let mut daemon_executor = executor.clone();
-                    if let Some(ref dir) = d.working_dir {
-                        daemon_executor = daemon_executor.with_working_dir(dir.clone());
-                    }
-                    if !d.env.is_empty() {
-                        daemon_executor = daemon_executor.extend_env(d.env.clone());
-                    }
-                    Daemon::new(d.clone(), daemon_executor)
-                })
-                .collect();
-
-            // Initialize group state
-            let state = GroupState {
-                name: group.name.clone(),
-                status: GroupStatus::Pending,
-                tasks: group
-                    .tasks
-                    .iter()
-                    .map(|t| ProcessState {
-                        name: t.name().to_string(),
-                        status: ProcessStatus::Pending,
-                        ..Default::default()
-                    })
-                    .collect(),
-                daemons: group
-                    .daemons
-                    .iter()
-                    .map(|d| ProcessState {
-                        name: d.name().to_string(),
-                        status: ProcessStatus::Pending,
-                        ..Default::default()
-                    })
-                    .collect(),
-            };
-
-            let daemon_count = daemons.len();
             groups.insert(
                 group.name.clone(),
-                ManagedGroup {
-                    config: group.clone(),
-                    executor,
-                    daemons,
-                    state,
-                    daemons_started: false,
-                    pending_restarts: vec![None; daemon_count],
-                },
+                build_managed_group(group, config.settings.shell.clone(), &config_dir),
             );
         }
 
@@ -1755,10 +1702,10 @@ impl Engine {
         };
 
         // 2. Compute changes
-        let (added, removed, modified) = self.get_config_changes(&new_config);
+        let diff = self.get_config_diff(&new_config);
 
         // 3. Stop daemons in removed groups
-        for group_name in &removed {
+        for group_name in &diff.removed {
             if let Some(group) = self.groups.get_mut(group_name) {
                 for daemon in &mut group.daemons {
                     if let Err(e) = daemon.stop() {
@@ -1774,7 +1721,7 @@ impl Engine {
         }
 
         // 4. Stop daemons in modified groups (they'll be restarted)
-        for group_name in &modified {
+        for group_name in &diff.modified {
             if let Some(group) = self.groups.get_mut(group_name) {
                 for daemon in &mut group.daemons {
                     if let Err(e) = daemon.stop() {
@@ -1811,13 +1758,13 @@ impl Engine {
         );
 
         // 7. Rebuild groups
-        if let Err(e) = self.rebuild_groups() {
+        if let Err(e) = self.rebuild_groups(diff.clone()) {
             tracing::error!(error = %e, "failed to rebuild groups");
             return ReloadResult::Failed(format!("rebuild error: {}", e));
         }
 
         // 8. Run new/modified groups
-        for group_name in added.iter().chain(&modified) {
+        for group_name in diff.added.iter().chain(&diff.modified) {
             if let Err(e) = self.run_group(group_name, &[], false).await {
                 tracing::error!(group = %group_name, error = %e, "failed to start group after reload");
             }
@@ -1828,30 +1775,31 @@ impl Engine {
             "zaz",
             format!(
                 "configuration reloaded: {} added, {} removed, {} modified",
-                added.len(),
-                removed.len(),
-                modified.len()
+                diff.added.len(),
+                diff.removed.len(),
+                diff.modified.len()
             ),
         ));
         self.update_state();
 
         ReloadResult::Success {
-            added,
-            removed,
-            modified,
+            added: diff.added,
+            removed: diff.removed,
+            modified: diff.modified,
         }
     }
 
     /// Compute changes between current config and new config.
-    fn get_config_changes(&self, new_config: &Config) -> (Vec<String>, Vec<String>, Vec<String>) {
-        compute_config_changes(&self.config.groups, &new_config.groups)
+    fn get_config_diff(&self, new_config: &Config) -> ConfigDiff {
+        compute_config_diff(&self.config, new_config)
     }
 
     /// Rebuild group patterns and managed groups from current config.
-    fn rebuild_groups(&mut self) -> Result<(), DaemonError> {
+    fn rebuild_groups(&mut self, diff: ConfigDiff) -> Result<(), DaemonError> {
         // Clear and rebuild group patterns
         self.group_patterns.clear();
         let mut new_groups = IndexMap::new();
+        let mut old_groups = std::mem::take(&mut self.groups);
 
         // Get config directory for default working directory
         let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
@@ -1861,71 +1809,16 @@ impl Engine {
             let patterns =
                 PatternSet::new(&group.patterns, &group.ignore).map_err(DaemonError::Watch)?;
             self.group_patterns.insert(group.name.clone(), patterns);
-
-            // Create executor with shell, working directory, and group env
-            // Default to config directory if no explicit working_dir is set
-            let mut executor = Executor::new(self.config.settings.shell.clone());
-            let working_dir = group
-                .working_dir
-                .clone()
-                .unwrap_or_else(|| config_dir.to_string_lossy().to_string());
-            executor = executor.with_working_dir(working_dir);
-            if !group.env.is_empty() {
-                executor = executor.with_env(group.env.clone());
-            }
-
-            // Create daemons with per-daemon working_dir and env overrides
-            let daemons: Vec<Daemon> = group
-                .daemons
-                .iter()
-                .map(|d| {
-                    let mut daemon_executor = executor.clone();
-                    if let Some(ref dir) = d.working_dir {
-                        daemon_executor = daemon_executor.with_working_dir(dir.clone());
-                    }
-                    if !d.env.is_empty() {
-                        daemon_executor = daemon_executor.extend_env(d.env.clone());
-                    }
-                    Daemon::new(d.clone(), daemon_executor)
-                })
-                .collect();
-
-            // Initialize group state
-            let state = GroupState {
-                name: group.name.clone(),
-                status: GroupStatus::Pending,
-                tasks: group
-                    .tasks
-                    .iter()
-                    .map(|t| ProcessState {
-                        name: t.name().to_string(),
-                        status: ProcessStatus::Pending,
-                        ..Default::default()
-                    })
-                    .collect(),
-                daemons: group
-                    .daemons
-                    .iter()
-                    .map(|d| ProcessState {
-                        name: d.name().to_string(),
-                        status: ProcessStatus::Pending,
-                        ..Default::default()
-                    })
-                    .collect(),
+            let managed_group = if diff.unchanged.contains(&group.name) {
+                let mut existing = old_groups
+                    .swap_remove(&group.name)
+                    .ok_or_else(|| DaemonError::GroupNotFound(group.name.clone()))?;
+                existing.config = group.clone();
+                existing
+            } else {
+                build_managed_group(group, self.config.settings.shell.clone(), config_dir)
             };
-
-            let daemon_count = daemons.len();
-            new_groups.insert(
-                group.name.clone(),
-                ManagedGroup {
-                    config: group.clone(),
-                    executor,
-                    daemons,
-                    state,
-                    daemons_started: false,
-                    pending_restarts: vec![None; daemon_count],
-                },
-            );
+            new_groups.insert(group.name.clone(), managed_group);
         }
 
         self.groups = new_groups;
@@ -2554,6 +2447,71 @@ impl Engine {
     }
 }
 
+fn build_group_state(group: &Group) -> GroupState {
+    GroupState {
+        name: group.name.clone(),
+        status: GroupStatus::Pending,
+        tasks: group
+            .tasks
+            .iter()
+            .map(|t| ProcessState {
+                name: t.name().to_string(),
+                status: ProcessStatus::Pending,
+                ..Default::default()
+            })
+            .collect(),
+        daemons: group
+            .daemons
+            .iter()
+            .map(|d| ProcessState {
+                name: d.name().to_string(),
+                status: ProcessStatus::Pending,
+                ..Default::default()
+            })
+            .collect(),
+    }
+}
+
+fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) -> ManagedGroup {
+    // Create executor with shell, working directory, and group env
+    // Default to config directory if no explicit working_dir is set
+    let mut executor = Executor::new(shell);
+    let working_dir = group
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| config_dir.to_string_lossy().to_string());
+    executor = executor.with_working_dir(working_dir);
+    if !group.env.is_empty() {
+        executor = executor.with_env(group.env.clone());
+    }
+
+    // Create daemons with per-daemon working_dir and env overrides
+    let daemons: Vec<Daemon> = group
+        .daemons
+        .iter()
+        .map(|d| {
+            let mut daemon_executor = executor.clone();
+            if let Some(ref dir) = d.working_dir {
+                daemon_executor = daemon_executor.with_working_dir(dir.clone());
+            }
+            if !d.env.is_empty() {
+                daemon_executor = daemon_executor.extend_env(d.env.clone());
+            }
+            Daemon::new(d.clone(), daemon_executor)
+        })
+        .collect();
+
+    let daemon_count = daemons.len();
+    ManagedGroup {
+        config: group.clone(),
+        executor,
+        daemons,
+        state: build_group_state(group),
+        daemons_started: false,
+        pending_restarts: vec![None; daemon_count],
+    }
+}
+
 /// Filter affected groups to only root groups (groups with no affected dependencies).
 ///
 /// When multiple groups are affected by file changes, we only want to trigger the "root"
@@ -2599,15 +2557,12 @@ fn calculate_group_status_from_tasks(
     })
 }
 
-/// Compute changes between old and new group configurations.
-///
-/// Returns (added, removed, modified) group names.
-fn compute_config_changes(
-    old_groups: &[Group],
-    new_groups: &[Group],
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+/// Compute changes between the current and new configurations.
+fn compute_config_diff(old_config: &Config, new_config: &Config) -> ConfigDiff {
     use std::collections::HashSet;
 
+    let old_groups = &old_config.groups;
+    let new_groups = &new_config.groups;
     let old_names: HashSet<_> = old_groups.iter().map(|g| &g.name).collect();
     let new_names: HashSet<_> = new_groups.iter().map(|g| &g.name).collect();
 
@@ -2620,19 +2575,26 @@ fn compute_config_changes(
         .map(|s| (*s).clone())
         .collect();
 
-    // Check for modifications (compare serialized versions)
     let mut modified = Vec::new();
+    let mut unchanged = Vec::new();
+    let all_groups_modified = old_config.settings != new_config.settings;
+
     for new_group in new_groups {
         if let Some(old_group) = old_groups.iter().find(|g| g.name == new_group.name) {
-            let old_json = serde_json::to_string(old_group).unwrap_or_default();
-            let new_json = serde_json::to_string(new_group).unwrap_or_default();
-            if old_json != new_json {
+            if all_groups_modified || old_group != new_group {
                 modified.push(new_group.name.clone());
+            } else {
+                unchanged.push(new_group.name.clone());
             }
         }
     }
 
-    (added, removed, modified)
+    ConfigDiff {
+        added,
+        removed,
+        modified,
+        unchanged,
+    }
 }
 
 /// Topologically sort groups based on dependencies.
@@ -2723,6 +2685,14 @@ mod tests {
         engine
     }
 
+    fn test_config(groups: Vec<Group>) -> Config {
+        Config {
+            settings: zaz_config::Settings::default(),
+            variables: HashMap::new(),
+            groups,
+        }
+    }
+
     /// Create a test group with specified tasks.
     fn test_group(name: &str, task_names: &[&str]) -> Group {
         Group {
@@ -2741,6 +2711,15 @@ mod tests {
         let mut group = test_group(name, task_names);
         group.depends_on = depends_on.iter().map(|s| s.to_string()).collect();
         group
+    }
+
+    fn test_daemon_group(name: &str, command: &str) -> Group {
+        Group {
+            name: name.to_string(),
+            patterns: vec!["*.test".to_string()],
+            daemons: vec![DaemonCommand::new("daemon", command)],
+            ..Default::default()
+        }
     }
 
     /// Create a TaskCompletion for testing.
@@ -3410,11 +3389,11 @@ mod tests {
     }
 
     // =========================================================================
-    // compute_config_changes() tests
+    // compute_config_diff() tests
     // =========================================================================
 
     #[test]
-    fn test_compute_config_changes_no_changes() {
+    fn test_compute_config_diff_no_changes() {
         let groups = vec![
             Group {
                 name: "a".to_string(),
@@ -3426,14 +3405,15 @@ mod tests {
             },
         ];
 
-        let (added, removed, modified) = compute_config_changes(&groups, &groups);
-        assert!(added.is_empty());
-        assert!(removed.is_empty());
-        assert!(modified.is_empty());
+        let diff = compute_config_diff(&test_config(groups.clone()), &test_config(groups));
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.modified.is_empty());
+        assert_eq!(diff.unchanged, vec!["a", "b"]);
     }
 
     #[test]
-    fn test_compute_config_changes_added_groups() {
+    fn test_compute_config_diff_added_groups() {
         let old = vec![Group {
             name: "a".to_string(),
             ..Default::default()
@@ -3449,14 +3429,15 @@ mod tests {
             },
         ];
 
-        let (added, removed, modified) = compute_config_changes(&old, &new);
-        assert_eq!(added, vec!["b"]);
-        assert!(removed.is_empty());
-        assert!(modified.is_empty());
+        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        assert_eq!(diff.added, vec!["b"]);
+        assert!(diff.removed.is_empty());
+        assert!(diff.modified.is_empty());
+        assert_eq!(diff.unchanged, vec!["a"]);
     }
 
     #[test]
-    fn test_compute_config_changes_removed_groups() {
+    fn test_compute_config_diff_removed_groups() {
         let old = vec![
             Group {
                 name: "a".to_string(),
@@ -3472,14 +3453,15 @@ mod tests {
             ..Default::default()
         }];
 
-        let (added, removed, modified) = compute_config_changes(&old, &new);
-        assert!(added.is_empty());
-        assert_eq!(removed, vec!["b"]);
-        assert!(modified.is_empty());
+        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        assert!(diff.added.is_empty());
+        assert_eq!(diff.removed, vec!["b"]);
+        assert!(diff.modified.is_empty());
+        assert_eq!(diff.unchanged, vec!["a"]);
     }
 
     #[test]
-    fn test_compute_config_changes_modified_patterns() {
+    fn test_compute_config_diff_modified_patterns() {
         let old = vec![Group {
             name: "a".to_string(),
             patterns: vec!["*.rs".to_string()],
@@ -3491,14 +3473,15 @@ mod tests {
             ..Default::default()
         }];
 
-        let (added, removed, modified) = compute_config_changes(&old, &new);
-        assert!(added.is_empty());
-        assert!(removed.is_empty());
-        assert_eq!(modified, vec!["a"]);
+        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert_eq!(diff.modified, vec!["a"]);
+        assert!(diff.unchanged.is_empty());
     }
 
     #[test]
-    fn test_compute_config_changes_modified_depends_on() {
+    fn test_compute_config_diff_modified_depends_on() {
         let old = vec![Group {
             name: "a".to_string(),
             depends_on: vec!["b".to_string()],
@@ -3510,14 +3493,15 @@ mod tests {
             ..Default::default()
         }];
 
-        let (added, removed, modified) = compute_config_changes(&old, &new);
-        assert!(added.is_empty());
-        assert!(removed.is_empty());
-        assert_eq!(modified, vec!["a"]);
+        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert_eq!(diff.modified, vec!["a"]);
+        assert!(diff.unchanged.is_empty());
     }
 
     #[test]
-    fn test_compute_config_changes_all_operations() {
+    fn test_compute_config_diff_all_operations() {
         let old = vec![
             Group {
                 name: "keep".to_string(),
@@ -3549,14 +3533,15 @@ mod tests {
             },
         ];
 
-        let (added, removed, modified) = compute_config_changes(&old, &new);
-        assert_eq!(added, vec!["add"]);
-        assert_eq!(removed, vec!["remove"]);
-        assert_eq!(modified, vec!["modify"]);
+        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        assert_eq!(diff.added, vec!["add"]);
+        assert_eq!(diff.removed, vec!["remove"]);
+        assert_eq!(diff.modified, vec!["modify"]);
+        assert_eq!(diff.unchanged, vec!["keep"]);
     }
 
     #[test]
-    fn test_compute_config_changes_empty_to_groups() {
+    fn test_compute_config_diff_empty_to_groups() {
         let old: Vec<Group> = vec![];
         let new = vec![
             Group {
@@ -3569,16 +3554,17 @@ mod tests {
             },
         ];
 
-        let (added, removed, modified) = compute_config_changes(&old, &new);
-        assert_eq!(added.len(), 2);
-        assert!(added.contains(&"a".to_string()));
-        assert!(added.contains(&"b".to_string()));
-        assert!(removed.is_empty());
-        assert!(modified.is_empty());
+        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        assert_eq!(diff.added.len(), 2);
+        assert!(diff.added.contains(&"a".to_string()));
+        assert!(diff.added.contains(&"b".to_string()));
+        assert!(diff.removed.is_empty());
+        assert!(diff.modified.is_empty());
+        assert!(diff.unchanged.is_empty());
     }
 
     #[test]
-    fn test_compute_config_changes_groups_to_empty() {
+    fn test_compute_config_diff_groups_to_empty() {
         let old = vec![
             Group {
                 name: "a".to_string(),
@@ -3591,12 +3577,49 @@ mod tests {
         ];
         let new: Vec<Group> = vec![];
 
-        let (added, removed, modified) = compute_config_changes(&old, &new);
-        assert!(added.is_empty());
-        assert_eq!(removed.len(), 2);
-        assert!(removed.contains(&"a".to_string()));
-        assert!(removed.contains(&"b".to_string()));
-        assert!(modified.is_empty());
+        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        assert!(diff.added.is_empty());
+        assert_eq!(diff.removed.len(), 2);
+        assert!(diff.removed.contains(&"a".to_string()));
+        assert!(diff.removed.contains(&"b".to_string()));
+        assert!(diff.modified.is_empty());
+        assert!(diff.unchanged.is_empty());
+    }
+
+    #[test]
+    fn test_compute_config_diff_global_shell_change_marks_common_groups_modified() {
+        let groups = vec![Group {
+            name: "a".to_string(),
+            ..Default::default()
+        }];
+        let mut old_config = test_config(groups.clone());
+        let mut new_config = test_config(groups);
+        old_config.settings.shell = Some("bash".to_string());
+        new_config.settings.shell = Some("zsh".to_string());
+
+        let diff = compute_config_diff(&old_config, &new_config);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert_eq!(diff.modified, vec!["a"]);
+        assert!(diff.unchanged.is_empty());
+    }
+
+    #[test]
+    fn test_compute_config_diff_task_change_marks_group_modified() {
+        let old = vec![Group {
+            name: "a".to_string(),
+            tasks: vec![TaskCommand::new("build", "echo old")],
+            ..Default::default()
+        }];
+        let new = vec![Group {
+            name: "a".to_string(),
+            tasks: vec![TaskCommand::new("build", "echo new")],
+            ..Default::default()
+        }];
+
+        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        assert_eq!(diff.modified, vec!["a"]);
+        assert!(diff.unchanged.is_empty());
     }
 
     // =========================================================================
@@ -4280,6 +4303,111 @@ mod tests {
             engine.groups.get("a").unwrap().state.status,
             GroupStatus::Skipped
         );
+    }
+
+    #[test]
+    fn test_rebuild_groups_preserves_unchanged_runtime_state() {
+        let unchanged = test_daemon_group("keep", "sleep 30");
+        let modified = test_group("change", &["task1"]);
+        let mut engine = create_test_engine(vec![unchanged.clone(), modified.clone()]);
+
+        {
+            let keep = engine.groups.get_mut("keep").unwrap();
+            keep.daemons_started = true;
+            keep.state.status = GroupStatus::Ready;
+            keep.state.daemons[0].status = ProcessStatus::Running;
+            keep.state.daemons[0].pid = Some(4242);
+            keep.pending_restarts[0] = Some(Instant::now() + Duration::from_secs(5));
+        }
+
+        let mut updated_modified = modified.clone();
+        updated_modified.patterns = vec!["*.rs".to_string()];
+        let new_config = test_config(vec![unchanged, updated_modified]);
+        let diff = compute_config_diff(&engine.config, &new_config);
+
+        engine.config = new_config;
+        engine.rebuild_groups(diff).unwrap();
+
+        let keep = engine.groups.get("keep").unwrap();
+        assert!(keep.daemons_started);
+        assert_eq!(keep.state.status, GroupStatus::Ready);
+        assert_eq!(keep.state.daemons[0].status, ProcessStatus::Running);
+        assert_eq!(keep.state.daemons[0].pid, Some(4242));
+        assert!(keep.pending_restarts[0].is_some());
+
+        let change = engine.groups.get("change").unwrap();
+        assert!(!change.daemons_started);
+        assert_eq!(change.state.status, GroupStatus::Pending);
+        assert!(change.pending_restarts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reload_config_preserves_unchanged_daemon_pid() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let initial_config = r#"
+[[group]]
+name = "server"
+patterns = ["server.txt"]
+
+[[group.daemon]]
+name = "server"
+command = "sleep 30"
+
+[[group]]
+name = "build"
+patterns = ["build.txt"]
+
+[[group.task]]
+name = "build"
+command = "true"
+"#;
+        std::fs::write(&config_path, initial_config).unwrap();
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let original_pid = engine.groups["server"].state.daemons[0].pid.unwrap();
+
+        let updated_config = r#"
+[[group]]
+name = "server"
+patterns = ["server.txt"]
+
+[[group.daemon]]
+name = "server"
+command = "sleep 30"
+
+[[group]]
+name = "build"
+patterns = ["build-changed.txt"]
+
+[[group.task]]
+name = "build"
+command = "true"
+"#;
+        std::fs::write(&config_path, updated_config).unwrap();
+
+        let result = engine.reload_config().await;
+        match result {
+            ReloadResult::Success {
+                added,
+                removed,
+                modified,
+            } => {
+                assert!(added.is_empty());
+                assert!(removed.is_empty());
+                assert_eq!(modified, vec!["build"]);
+            }
+            other => panic!("expected reload success, got {:?}", other),
+        }
+
+        let reloaded_pid = engine.groups["server"].state.daemons[0].pid.unwrap();
+        assert_eq!(reloaded_pid, original_pid);
+
+        engine.shutdown().await.unwrap();
     }
 
     // =========================================================================
