@@ -83,11 +83,7 @@ fn start_fake_server(
             .expect("failed to read request line");
 
         let request: ApiRequest = serde_json::from_str(&line).expect("request should deserialize");
-        match (request, expected_request) {
-            (ApiRequest::Shutdown, ApiRequest::Shutdown) => {}
-            (ApiRequest::Status, ApiRequest::Status) => {}
-            (actual, expected) => panic!("unexpected request: got {actual:?}, expected {expected:?}"),
-        }
+        assert_request_matches(&request, &expected_request);
 
         to_writer(&mut stream, &response).expect("failed to serialize response");
         stream
@@ -97,6 +93,22 @@ fn start_fake_server(
         drop(stream);
         std::fs::remove_file(&socket_path).expect("failed to remove fake socket");
     })
+}
+
+fn assert_request_matches(actual: &ApiRequest, expected: &ApiRequest) {
+    match (actual, expected) {
+        (ApiRequest::Shutdown, ApiRequest::Shutdown)
+        | (ApiRequest::Status, ApiRequest::Status)
+        | (ApiRequest::RestartAll, ApiRequest::RestartAll)
+        | (ApiRequest::ReloadConfig, ApiRequest::ReloadConfig) => {}
+        (
+            ApiRequest::RestartGroup { name: actual },
+            ApiRequest::RestartGroup { name: expected },
+        ) => {
+            assert_eq!(actual, expected, "restart group name should match");
+        }
+        _ => panic!("unexpected request: got {actual:?}, expected {expected:?}"),
+    }
 }
 
 #[test]
@@ -166,6 +178,35 @@ fn stop_returns_nonzero_on_api_error() {
 }
 
 #[test]
+fn stop_returns_zero_when_daemon_is_not_running() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("missing.sock");
+    let socket = socket_path.to_str().unwrap();
+
+    let output = run_zaz(temp.path(), &["--socket", socket, "stop"]);
+    let stdout = stdout_string(&output);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.contains("No daemon running"));
+}
+
+#[test]
+fn stop_returns_nonzero_on_unexpected_response() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("daemon.sock");
+    let server = start_fake_server(&socket_path, ApiRequest::Shutdown, ApiResponse::EndOfStream);
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "stop"]);
+    let stderr = stderr_string(&output);
+
+    server.join().expect("fake server thread should finish");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("Unexpected response"));
+}
+
+#[test]
 fn status_returns_exit_code_3_when_daemon_is_not_running() {
     let temp = TempDir::new().unwrap();
     let socket_path = temp.path().join("missing.sock");
@@ -202,6 +243,22 @@ fn status_returns_nonzero_on_api_error_response() {
 }
 
 #[test]
+fn status_returns_nonzero_on_unexpected_response() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("daemon.sock");
+    let server = start_fake_server(&socket_path, ApiRequest::Status, ApiResponse::EndOfStream);
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "status"]);
+    let stderr = stderr_string(&output);
+
+    server.join().expect("fake server thread should finish");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("status request returned unexpected response"));
+}
+
+#[test]
 fn check_json_returns_nonzero_on_validation_error() {
     let temp = TempDir::new().unwrap();
     let config_path = temp.path().join("zaz.toml");
@@ -233,6 +290,82 @@ command = ""
         .as_array()
         .is_some_and(|errors| !errors.is_empty()));
     assert!(stderr.contains("configuration validation failed"));
+}
+
+#[test]
+fn restart_returns_nonzero_on_unexpected_response() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("daemon.sock");
+    let server = start_fake_server(
+        &socket_path,
+        ApiRequest::RestartAll,
+        ApiResponse::EndOfStream,
+    );
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "restart"]);
+    let stderr = stderr_string(&output);
+
+    server.join().expect("fake server thread should finish");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("Unexpected response"));
+}
+
+#[test]
+fn reload_returns_nonzero_when_daemon_is_not_running() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("missing.sock");
+    let socket = socket_path.to_str().unwrap();
+
+    let output = run_zaz(temp.path(), &["--socket", socket, "reload"]);
+    let stderr = stderr_string(&output);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("No daemon running (could not connect to"));
+    assert!(stderr.contains(socket));
+}
+
+#[test]
+fn reload_returns_nonzero_on_api_error() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("daemon.sock");
+    let server = start_fake_server(
+        &socket_path,
+        ApiRequest::ReloadConfig,
+        ApiResponse::Error {
+            message: "reload failed".to_string(),
+        },
+    );
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "reload"]);
+    let stderr = stderr_string(&output);
+
+    server.join().expect("fake server thread should finish");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("Error: reload failed"));
+}
+
+#[test]
+fn reload_returns_nonzero_on_unexpected_response() {
+    let temp = TempDir::new().unwrap();
+    let socket_path = temp.path().join("daemon.sock");
+    let server = start_fake_server(
+        &socket_path,
+        ApiRequest::ReloadConfig,
+        ApiResponse::EndOfStream,
+    );
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "reload"]);
+    let stderr = stderr_string(&output);
+
+    server.join().expect("fake server thread should finish");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("Unexpected response"));
 }
 
 #[test]
