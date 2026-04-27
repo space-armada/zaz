@@ -560,6 +560,13 @@ fn resolve_command_socket(
     Ok(resolve_socket(None, start_dir)?)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonAvailability {
+    Running,
+    StaleSocket,
+    Unreachable,
+}
+
 async fn run_tasks(config_path: &Path) -> Result<()> {
     tracing::info!(config = %config_path.display(), "running task commands");
 
@@ -971,14 +978,51 @@ fn show_ignores() -> Result<()> {
 }
 
 async fn is_daemon_responsive(socket_path: &Path, timeout: Duration) -> bool {
+    matches!(
+        check_daemon_availability(socket_path, timeout).await,
+        DaemonAvailability::Running
+    )
+}
+
+async fn check_daemon_availability(socket_path: &Path, timeout: Duration) -> DaemonAvailability {
     match tokio::time::timeout(timeout, Client::connect(socket_path)).await {
         Ok(Ok(mut client)) => {
-            matches!(
-                tokio::time::timeout(timeout, client.request(&ApiRequest::Status)).await,
-                Ok(Ok(_))
-            )
+            match tokio::time::timeout(timeout, client.request(&ApiRequest::Status)).await {
+                Ok(Ok(_)) => DaemonAvailability::Running,
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        socket = %socket_path.display(),
+                        error = %e,
+                        "socket accepted connection but daemon status request failed"
+                    );
+                    DaemonAvailability::StaleSocket
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        socket = %socket_path.display(),
+                        timeout_ms = timeout.as_millis(),
+                        "socket accepted connection but daemon status request timed out"
+                    );
+                    DaemonAvailability::StaleSocket
+                }
+            }
         }
-        _ => false,
+        Ok(Err(e)) => {
+            tracing::debug!(
+                socket = %socket_path.display(),
+                error = %e,
+                "failed to connect to daemon socket"
+            );
+            DaemonAvailability::Unreachable
+        }
+        Err(_) => {
+            tracing::debug!(
+                socket = %socket_path.display(),
+                timeout_ms = timeout.as_millis(),
+                "timed out connecting to daemon socket"
+            );
+            DaemonAvailability::Unreachable
+        }
     }
 }
 
@@ -1077,30 +1121,80 @@ async fn run_tui(
         style = ?options.style,
         "starting TUI"
     );
+    tracing::debug!(
+        config = %config_path.display(),
+        socket = %socket_path.display(),
+        no_autostart = options.no_autostart,
+        stop_on_exit = options.stop_on_exit,
+        disable_animations = options.disable_animations,
+        daemon_log_file = daemon_log_file.map(|path| path.display().to_string()),
+        "resolved TUI startup options"
+    );
 
     let check_timeout = Duration::from_secs(1);
-    let daemon_running = is_daemon_responsive(socket_path, check_timeout).await;
-    if daemon_running {
-        tracing::debug!("daemon is running");
-    } else {
-        tracing::debug!("no responsive daemon running");
+    let availability = check_daemon_availability(socket_path, check_timeout).await;
+    let daemon_running = availability == DaemonAvailability::Running;
+    match availability {
+        DaemonAvailability::Running => {
+            tracing::debug!(
+                socket = %socket_path.display(),
+                "reusing existing responsive daemon"
+            );
+        }
+        DaemonAvailability::StaleSocket => {
+            tracing::debug!(
+                socket = %socket_path.display(),
+                "daemon socket exists but is not serving requests"
+            );
+        }
+        DaemonAvailability::Unreachable => {
+            tracing::debug!(
+                socket = %socket_path.display(),
+                "no responsive daemon reachable on resolved socket"
+            );
+        }
     }
 
     if !daemon_running && !options.no_autostart {
-        tracing::info!("starting daemon in background");
+        tracing::info!(
+            socket = %socket_path.display(),
+            daemon_log_file = daemon_log_file.map(|path| path.display().to_string()),
+            "auto-starting daemon in background"
+        );
 
         match start_daemon_subprocess(config_path, socket_path, debug, daemon_log_file) {
             Ok(()) => {
+                tracing::debug!(
+                    socket = %socket_path.display(),
+                    "daemon subprocess spawned, waiting for readiness"
+                );
                 let ready =
                     wait_for_daemon_ready(socket_path, 20, Duration::from_millis(100)).await;
-                if !ready {
-                    tracing::warn!("daemon may not be ready after 2s");
+                if ready {
+                    tracing::debug!(
+                        socket = %socket_path.display(),
+                        "auto-started daemon became responsive"
+                    );
+                } else {
+                    tracing::warn!(
+                        socket = %socket_path.display(),
+                        "auto-started daemon may not be ready after 2s"
+                    );
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to auto-start daemon");
+                tracing::warn!(
+                    socket = %socket_path.display(),
+                    error = %e,
+                    "failed to auto-start daemon"
+                );
             }
         }
+    } else if !daemon_running {
+        tracing::debug!(
+            socket = %socket_path.display(),
+            "daemon autostart skipped because no_autostart is enabled"
+        );
     }
 
     // Create TUI app
@@ -1124,12 +1218,22 @@ async fn run_tui(
     app.stop_on_exit = options.stop_on_exit;
 
     // Connect to daemon
+    tracing::debug!(socket = %socket_path.display(), "connecting TUI app to daemon");
     if let Err(e) = app.connect(socket_path).await {
-        tracing::warn!(error = %e, "failed to connect to daemon");
+        tracing::warn!(
+            socket = %socket_path.display(),
+            error = %e,
+            "failed to connect TUI app to daemon"
+        );
     }
 
     // Run TUI
-    app.run()?;
+    let result = app.run();
+    match &result {
+        Ok(()) => tracing::debug!("TUI exited cleanly"),
+        Err(e) => tracing::debug!(error = %e, "TUI exited with error"),
+    }
+    result?;
 
     Ok(())
 }

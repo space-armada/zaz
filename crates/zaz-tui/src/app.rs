@@ -247,7 +247,12 @@ impl App {
 
     /// Connect to the daemon.
     pub async fn connect(&mut self, socket_path: &Path) -> Result<(), TuiError> {
+        tracing::debug!(socket = %socket_path.display(), "App::connect starting");
         let connection = DaemonConnection::connect(socket_path).await?;
+        tracing::debug!(
+            socket = %connection.socket_path().display(),
+            "App::connect initialized daemon connection"
+        );
         self.daemon = Some(connection);
         Ok(())
     }
@@ -399,6 +404,14 @@ impl App {
                 for (offset, limit) in fetches {
                     self.logs.mark_pending("*", offset / PAGE_SIZE);
                     if let Some(ref daemon) = self.daemon {
+                        tracing::debug!(
+                            socket = %daemon.socket_path().display(),
+                            request = "GetLogs",
+                            name = "*",
+                            offset,
+                            limit,
+                            "scheduling full-view historical log fetch"
+                        );
                         let _ = daemon.fetch_page("*", offset, limit);
                     }
                 }
@@ -439,6 +452,15 @@ impl App {
                     for (offset, limit) in fetches {
                         self.logs.mark_pending(process_name, offset / PAGE_SIZE);
                         if let Some(ref daemon_conn) = self.daemon {
+                            tracing::debug!(
+                                socket = %daemon_conn.socket_path().display(),
+                                request = "GetLogs",
+                                name = %process_name,
+                                offset,
+                                limit,
+                                pane,
+                                "scheduling pane historical log fetch"
+                            );
                             let _ = daemon_conn.fetch_page(process_name, offset, limit);
                         }
                     }
@@ -449,6 +471,7 @@ impl App {
 
     /// Send a command to the daemon.
     pub fn send_command(&mut self, cmd: ClientCommand) {
+        tracing::debug!(request = ?cmd, "App::send_command invoked");
         if let Some(ref daemon) = self.daemon {
             if let Err(e) = daemon.send_command(cmd) {
                 self.set_status(format!("Command failed: {}", e));
@@ -476,10 +499,17 @@ impl App {
 
         // Handle quit regardless of mode
         if events::is_quit(&event) {
+            tracing::debug!(
+                stop_on_exit = self.stop_on_exit,
+                connected = self.is_connected(),
+                "quit event received"
+            );
             if self.stop_on_exit {
+                tracing::debug!("requesting daemon shutdown because stop_on_exit is enabled");
                 self.send_command(ClientCommand::Shutdown);
             }
             self.should_quit = true;
+            tracing::debug!("TUI marked for exit");
             return;
         }
 
@@ -668,11 +698,15 @@ impl App {
 
     /// Run the TUI event loop.
     pub fn run(&mut self) -> Result<(), TuiError> {
+        tracing::debug!("setting up terminal for TUI");
         let mut terminal = setup_terminal()?;
 
+        tracing::debug!("entering TUI event loop");
         let result = self.event_loop(&mut terminal);
 
+        tracing::debug!("restoring terminal after TUI event loop");
         restore_terminal(&mut terminal)?;
+        tracing::debug!("terminal restored after TUI exit");
         result
     }
 
@@ -698,6 +732,7 @@ impl App {
             }
         }
 
+        tracing::debug!(connected = self.is_connected(), "TUI event loop finished");
         Ok(())
     }
 }
