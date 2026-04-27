@@ -30,7 +30,7 @@ zaz
 ```
 
 Plain `zaz` opens the TUI. If a daemon is already running for the target
-socket, the TUI reuses it; otherwise zaz auto-starts one unless you pass
+socket, the TUI reuses it; otherwise zaz autostarts one unless you pass
 `--no-autostart`.
 
 ## Minimal Configuration
@@ -60,7 +60,7 @@ Or in JSON:
 ## Commands
 
 ```bash
-zaz                 # Open the TUI (reuses or auto-starts a daemon)
+zaz                 # Open the TUI (reuses or autostarts a daemon)
 zaz task            # Run task commands once and exit
 zaz daemon          # Run the daemon in the foreground
 zaz status          # Show daemon status
@@ -74,11 +74,19 @@ zaz ignores         # Show default ignore patterns
 ```bash
 zaz --full          # Full style: split panes with group tree + logs
 zaz --multi-pane    # Multi-pane style: one pane per task
-zaz --no-autostart  # Don't auto-start a daemon before opening the TUI
+zaz --no-autostart  # Don't autostart a daemon before opening the TUI
 zaz --stop-on-exit  # Stop the connected daemon when the TUI exits
+zaz --debug         # Write TUI debug logs to a default file and propagate debug to an autostarted daemon
+zaz --log-file /tmp/zaz.log  # Override the TUI debug log file; autostarted daemon uses a sibling *.daemon.log file
 ```
 
 Press `F1`/`F2` to switch between Full and Multi Pane styles at runtime.
+
+With `zaz --debug` in TUI mode, zaz writes debug logs to separate files for the
+TUI and any daemon it autostarts at `$XDG_STATE_HOME/zaz/` when set, otherwise
+`~/.local/state/zaz/`, as `tui-debug.log` and `daemon-debug.log`. These debug
+logs are rotated by size and old rotated files are pruned first if the debug
+log directory exceeds its storage budget.
 
 ## User Configuration
 
@@ -86,7 +94,7 @@ User preferences are stored separately from project configuration at
 `~/.config/zaz/config.toml` (following XDG Base Directory specification):
 
 ```toml
-# Don't auto-start a daemon before opening the TUI
+# Don't autostart a daemon before opening the TUI
 no_autostart = false
 
 # Disable blinking/animation effects

@@ -2,7 +2,9 @@
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -155,7 +157,11 @@ fn init_tracing(
     match (is_tui_mode, log_file) {
         // TUI mode with file logging: log to file only
         (true, Some(path)) => {
-            let file = std::fs::File::create(path).expect("Failed to create log file");
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("Failed to open log file");
             let (non_blocking, guard) = tracing_appender::non_blocking(file);
             tracing_subscriber::fmt()
                 .with_env_filter(env_filter)
@@ -166,7 +172,11 @@ fn init_tracing(
         }
         // Non-TUI mode with file logging: log to both console and file
         (false, Some(path)) => {
-            let file = std::fs::File::create(path).expect("Failed to create log file");
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("Failed to open log file");
             let (non_blocking, guard) = tracing_appender::non_blocking(file);
 
             let file_layer = tracing_subscriber::fmt::layer()
@@ -195,6 +205,203 @@ fn init_tracing(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebugLogKind {
+    Tui,
+    Daemon,
+}
+
+impl DebugLogKind {
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Tui => "tui-debug.log",
+            Self::Daemon => "daemon-debug.log",
+        }
+    }
+}
+
+const DEBUG_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+const DEBUG_LOG_ROTATE_KEEP: usize = 5;
+const DEBUG_LOG_DIR_BUDGET_BYTES: u64 = 200 * 1024 * 1024;
+
+fn user_state_dir() -> PathBuf {
+    if let Ok(xdg_state_home) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(xdg_state_home).join("zaz");
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local/state/zaz");
+    }
+
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    PathBuf::from(format!("/tmp/zaz-{}", user))
+}
+
+fn ensure_log_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    Ok(())
+}
+
+fn default_debug_log_path(kind: DebugLogKind) -> Result<PathBuf> {
+    let path = user_state_dir().join(kind.filename());
+    ensure_log_parent_dir(&path)?;
+    Ok(path)
+}
+
+fn derive_daemon_log_path(path: &Path) -> PathBuf {
+    match path.extension() {
+        Some(ext) => {
+            let mut new_ext = OsString::from("daemon.");
+            new_ext.push(ext);
+            path.with_extension(new_ext)
+        }
+        None => path.with_extension("daemon.log"),
+    }
+}
+
+fn resolve_tui_log_file(debug: bool, log_file: Option<&Path>) -> Result<Option<PathBuf>> {
+    let path = match log_file {
+        Some(path) => path.to_path_buf(),
+        None if debug => default_debug_log_path(DebugLogKind::Tui)?,
+        None => return Ok(None),
+    };
+    ensure_log_parent_dir(&path)?;
+    Ok(Some(path))
+}
+
+fn resolve_autostart_daemon_log_file(
+    debug: bool,
+    log_file: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    if !debug {
+        return Ok(None);
+    }
+
+    let path = match log_file {
+        Some(path) => derive_daemon_log_path(path),
+        None => default_debug_log_path(DebugLogKind::Daemon)?,
+    };
+    ensure_log_parent_dir(&path)?;
+    Ok(Some(path))
+}
+
+fn rotated_log_path(path: &Path, generation: usize) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .expect("log path should have a file name")
+        .to_string_lossy();
+    path.with_file_name(format!("{file_name}.{generation}"))
+}
+
+fn rotate_log_file(path: &Path) -> Result<()> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+
+    if metadata.len() < DEBUG_LOG_ROTATE_BYTES {
+        return Ok(());
+    }
+
+    let oldest = rotated_log_path(path, DEBUG_LOG_ROTATE_KEEP);
+    if oldest.exists() {
+        std::fs::remove_file(&oldest)?;
+    }
+
+    for generation in (1..DEBUG_LOG_ROTATE_KEEP).rev() {
+        let src = rotated_log_path(path, generation);
+        if src.exists() {
+            std::fs::rename(&src, rotated_log_path(path, generation + 1))?;
+        }
+    }
+
+    std::fs::rename(path, rotated_log_path(path, 1))?;
+    Ok(())
+}
+
+fn rotated_generation_for(path: &Path, active_name: &str) -> Option<usize> {
+    let file_name = path.file_name()?.to_str()?;
+    let suffix = file_name.strip_prefix(active_name)?.strip_prefix('.')?;
+    suffix.parse().ok()
+}
+
+fn prune_debug_log_dirs_with_budget(paths: &[PathBuf], budget_bytes: u64) -> Result<()> {
+    use std::collections::{BTreeMap, HashSet};
+    use std::time::SystemTime;
+
+    let mut by_dir: BTreeMap<PathBuf, HashSet<String>> = BTreeMap::new();
+    for path in paths {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        by_dir
+            .entry(parent.to_path_buf())
+            .or_default()
+            .insert(file_name.to_string());
+    }
+
+    for (dir, active_names) in by_dir {
+        let mut total_bytes = 0u64;
+        let mut rotated_files = Vec::new();
+
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            total_bytes = total_bytes.saturating_add(metadata.len());
+
+            if !metadata.is_file() {
+                continue;
+            }
+
+            for active_name in &active_names {
+                if let Some(generation) = rotated_generation_for(&path, active_name) {
+                    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    rotated_files.push((modified, generation, metadata.len(), path.clone()));
+                    break;
+                }
+            }
+        }
+
+        if total_bytes <= budget_bytes {
+            continue;
+        }
+
+        rotated_files
+            .sort_by_key(|(modified, generation, _, path)| (*modified, *generation, path.clone()));
+
+        for (_, _, size, path) in rotated_files {
+            if total_bytes <= budget_bytes {
+                break;
+            }
+            std::fs::remove_file(&path)?;
+            total_bytes = total_bytes.saturating_sub(size);
+        }
+    }
+
+    Ok(())
+}
+
+fn prune_debug_log_dirs(paths: &[PathBuf]) -> Result<()> {
+    prune_debug_log_dirs_with_budget(paths, DEBUG_LOG_DIR_BUDGET_BYTES)
+}
+
+fn prepare_log_files(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        ensure_log_parent_dir(path)?;
+        rotate_log_file(path)?;
+    }
+    prune_debug_log_dirs(paths)?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let exit_code = match try_main().await {
@@ -214,54 +421,89 @@ async fn main() {
 async fn try_main() -> Result<()> {
     let cli = Cli::parse();
     let current_dir = std::env::current_dir()?;
-
-    // Determine if we're running in TUI mode (default command with no subcommand)
-    let is_tui_mode = cli.command.is_none();
-    let _log_guard = init_tracing(cli.debug, is_tui_mode, cli.log_file.as_deref());
+    let _log_guard;
+    let explicit_log_paths = cli.log_file.iter().cloned().collect::<Vec<PathBuf>>();
 
     match cli.command {
         Some(Commands::Task) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let config_path = find_config(&cli.config)?;
             run_tasks(&config_path).await
         }
         Some(Commands::Daemon { quiet }) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let config_path = find_config(&cli.config)?;
             let socket_path =
                 resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             run_daemon(&config_path, &socket_path, quiet).await
         }
         Some(Commands::Status) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let socket_path =
                 resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             show_status(&socket_path).await
         }
         Some(Commands::Restart { group }) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let socket_path =
                 resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             restart(&socket_path, group).await
         }
         Some(Commands::Stop) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let socket_path =
                 resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             stop_daemon(&socket_path).await
         }
         Some(Commands::Reload) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let socket_path =
                 resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             reload_config(&socket_path).await
         }
         Some(Commands::Check { config, json }) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let config_path = find_config(&config.or(cli.config.clone()))?;
             check_config(&config_path, json)
         }
-        Some(Commands::Ignores) => show_ignores(),
+        Some(Commands::Ignores) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
+            show_ignores()
+        }
         None => {
             let config_path = find_config(&cli.config)?;
             let socket_path =
                 resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+            let tui_log_file = resolve_tui_log_file(cli.debug, cli.log_file.as_deref())?;
+            let daemon_log_file =
+                resolve_autostart_daemon_log_file(cli.debug, cli.log_file.as_deref())?;
+            let mut log_paths = Vec::new();
+            if let Some(path) = &tui_log_file {
+                log_paths.push(path.clone());
+            }
+            if let Some(path) = &daemon_log_file {
+                log_paths.push(path.clone());
+            }
+            prepare_log_files(&log_paths)?;
+            _log_guard = init_tracing(cli.debug, true, tui_log_file.as_deref());
             let user_config = load_user_config();
             let tui_options = TuiOptions::from_cli_and_user_config(&cli, &user_config);
-            run_tui(&config_path, &socket_path, &tui_options).await
+            run_tui(
+                &config_path,
+                &socket_path,
+                &tui_options,
+                cli.debug,
+                daemon_log_file.as_deref(),
+            )
+            .await
         }
     }
 }
@@ -760,27 +1002,55 @@ fn resolve_autostart_executable() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
-fn start_daemon_subprocess(config_path: &Path, socket_path: &Path) -> Result<()> {
+fn build_daemon_subprocess_command(
+    config_path: &Path,
+    socket_path: &Path,
+    debug: bool,
+    log_file: Option<&Path>,
+) -> Result<Command> {
     let current_exe = resolve_autostart_executable()?;
 
-    Command::new(current_exe)
-        .args([
-            "--config",
-            config_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("config path is not valid utf-8"))?,
-            "--socket",
-            socket_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("socket path is not valid utf-8"))?,
-            "daemon",
-            "--quiet",
-        ])
+    let mut command = Command::new(current_exe);
+    command.args([
+        "--config",
+        config_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("config path is not valid utf-8"))?,
+        "--socket",
+        socket_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("socket path is not valid utf-8"))?,
+    ]);
+
+    if debug {
+        command.arg("--debug");
+    }
+
+    if let Some(path) = log_file {
+        command.args([
+            "--log-file",
+            path.to_str()
+                .ok_or_else(|| anyhow::anyhow!("log file path is not valid utf-8"))?,
+        ]);
+    }
+
+    command
+        .args(["daemon", "--quiet"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
 
+    Ok(command)
+}
+
+fn start_daemon_subprocess(
+    config_path: &Path,
+    socket_path: &Path,
+    debug: bool,
+    log_file: Option<&Path>,
+) -> Result<()> {
+    let mut command = build_daemon_subprocess_command(config_path, socket_path, debug, log_file)?;
+    command.spawn()?;
     Ok(())
 }
 
@@ -795,7 +1065,13 @@ async fn wait_for_daemon_ready(socket_path: &Path, attempts: usize, delay: Durat
     false
 }
 
-async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -> Result<()> {
+async fn run_tui(
+    config_path: &Path,
+    socket_path: &Path,
+    options: &TuiOptions,
+    debug: bool,
+    daemon_log_file: Option<&Path>,
+) -> Result<()> {
     tracing::info!(
         config = %config_path.display(),
         style = ?options.style,
@@ -813,7 +1089,7 @@ async fn run_tui(config_path: &Path, socket_path: &Path, options: &TuiOptions) -
     if !daemon_running && !options.no_autostart {
         tracing::info!("starting daemon in background");
 
-        match start_daemon_subprocess(config_path, socket_path) {
+        match start_daemon_subprocess(config_path, socket_path, debug, daemon_log_file) {
             Ok(()) => {
                 let ready =
                     wait_for_daemon_ready(socket_path, 20, Duration::from_millis(100)).await;
@@ -893,6 +1169,124 @@ mod tests {
         let options = TuiOptions::from_cli_and_user_config(&cli, &UserConfig::default());
 
         assert!(options.stop_on_exit);
+    }
+
+    #[test]
+    fn derive_daemon_log_path_keeps_log_alongside_explicit_tui_log() {
+        let path = Path::new("/tmp/zaz.log");
+        assert_eq!(
+            derive_daemon_log_path(path),
+            PathBuf::from("/tmp/zaz.daemon.log")
+        );
+    }
+
+    #[test]
+    fn default_debug_log_path_uses_state_dir_filenames() -> Result<()> {
+        let tui_path = default_debug_log_path(DebugLogKind::Tui)?;
+        let daemon_path = default_debug_log_path(DebugLogKind::Daemon)?;
+
+        assert!(tui_path.ends_with("zaz/tui-debug.log"));
+        assert!(daemon_path.ends_with("zaz/daemon-debug.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_tui_log_file_defaults_in_debug_tui_mode() -> Result<()> {
+        let path = resolve_tui_log_file(true, None)?.expect("debug log path");
+        assert!(path.ends_with("tui-debug.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_tui_log_file_keeps_explicit_path_without_debug() -> Result<()> {
+        let path = resolve_tui_log_file(false, Some(Path::new("/tmp/custom.log")))?
+            .expect("explicit log path");
+        assert_eq!(path, PathBuf::from("/tmp/custom.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_autostart_daemon_log_file_uses_sibling_of_explicit_path() -> Result<()> {
+        let path = resolve_autostart_daemon_log_file(true, Some(Path::new("/tmp/custom.log")))?
+            .expect("daemon log path");
+        assert_eq!(path, PathBuf::from("/tmp/custom.daemon.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_log_file_shifts_generations() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("tui-debug.log");
+        std::fs::write(&path, vec![b'x'; DEBUG_LOG_ROTATE_BYTES as usize])?;
+        std::fs::write(rotated_log_path(&path, 1), "old-1")?;
+        std::fs::write(rotated_log_path(&path, 2), "old-2")?;
+
+        rotate_log_file(&path)?;
+
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::metadata(rotated_log_path(&path, 1))?.len(),
+            DEBUG_LOG_ROTATE_BYTES
+        );
+        assert_eq!(
+            std::fs::read_to_string(rotated_log_path(&path, 2))?,
+            "old-1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rotated_log_path(&path, 3))?,
+            "old-2"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prune_debug_log_dirs_deletes_oldest_rotated_files_first() -> Result<()> {
+        let temp = TempDir::new()?;
+        let active = temp.path().join("tui-debug.log");
+        let rotated_old = rotated_log_path(&active, 1);
+        let rotated_new = rotated_log_path(&active, 2);
+
+        std::fs::write(&active, "active")?;
+        std::fs::write(&rotated_old, vec![b'a'; 120])?;
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&rotated_new, vec![b'b'; 120])?;
+
+        prune_debug_log_dirs_with_budget(&[active.clone()], 200)?;
+
+        assert!(!rotated_old.exists());
+        assert!(rotated_new.exists());
+        assert!(active.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn build_daemon_subprocess_command_propagates_debug_only_when_enabled() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config_path = temp.path().join("zaz.toml");
+        let socket_path = temp.path().join("daemon.sock");
+        let log_path = temp.path().join("daemon.log");
+        std::fs::write(&config_path, "")?;
+
+        let command =
+            build_daemon_subprocess_command(&config_path, &socket_path, true, Some(&log_path))?;
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(args.contains(&"--debug".to_string()));
+        let log_path_string = log_path.to_string_lossy().to_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--log-file" && pair[1] == log_path_string));
+
+        let command = build_daemon_subprocess_command(&config_path, &socket_path, false, None)?;
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(!args.contains(&"--debug".to_string()));
+        assert!(!args.contains(&"--log-file".to_string()));
+        Ok(())
     }
 
     #[test]
@@ -1066,7 +1460,7 @@ command = "true"
         )
         .unwrap();
 
-        start_daemon_subprocess(&config_path, &socket_path).unwrap();
+        start_daemon_subprocess(&config_path, &socket_path, false, None).unwrap();
 
         assert!(wait_for_daemon_ready(&socket_path, 50, Duration::from_millis(100)).await);
         assert!(is_daemon_responsive(&socket_path, Duration::from_secs(1)).await);
