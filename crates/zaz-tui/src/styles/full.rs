@@ -172,8 +172,9 @@ impl StyleRenderer for FullStyle {
             }
             KeyCode::Char('R') => KeyResult::RestartAll,
             KeyCode::Char('c') => {
-                app.logs.clear_all();
+                app.logs.clear_view("*");
                 app.log_scroll = 0;
+                app.log_loading = false;
                 KeyResult::SetStatus("Logs cleared".to_string())
             }
 

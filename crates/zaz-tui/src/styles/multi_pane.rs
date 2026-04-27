@@ -319,8 +319,11 @@ impl StyleRenderer for MultiPaneStyle {
             }
             KeyCode::Char('R') => KeyResult::RestartAll,
             KeyCode::Char('c') => {
-                app.logs.clear_all();
-                app.pane_scroll.clear();
+                if let Some(process) = self.get_process_at_index(app, app.selected_pane) {
+                    app.logs.clear_view(&process.name);
+                }
+                app.set_pane_scroll(app.selected_pane, 0);
+                app.pane_loading.insert(app.selected_pane, false);
                 KeyResult::SetStatus("Logs cleared".to_string())
             }
 

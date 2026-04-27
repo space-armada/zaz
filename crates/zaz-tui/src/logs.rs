@@ -411,6 +411,20 @@ pub struct LogBuffer {
     page_caches: HashMap<String, PageCache>,
     /// Total log counts reported by the daemon (per name).
     daemon_total_counts: HashMap<String, usize>,
+    /// Total streamed log counts seen by this TUI client (per process).
+    local_received_counts: HashMap<String, usize>,
+    /// Total streamed log count seen by this TUI client across all processes.
+    local_received_total: usize,
+    /// Local clear cutoffs keyed by view name (`"*"` for combined view).
+    clear_cutoffs: HashMap<String, ClearCutoff>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ClearCutoff {
+    /// Absolute daemon/log index hidden by this clear, when known.
+    daemon_base: Option<usize>,
+    /// Absolute locally streamed index hidden by this clear.
+    local_base: usize,
 }
 
 impl Default for LogBuffer {
@@ -431,6 +445,9 @@ impl LogBuffer {
             selected_process: None,
             page_caches: HashMap::new(),
             daemon_total_counts: HashMap::new(),
+            local_received_counts: HashMap::new(),
+            local_received_total: 0,
+            clear_cutoffs: HashMap::new(),
         }
     }
 
@@ -445,11 +462,20 @@ impl LogBuffer {
             selected_process: None,
             page_caches: HashMap::new(),
             daemon_total_counts: HashMap::new(),
+            local_received_counts: HashMap::new(),
+            local_received_total: 0,
+            clear_cutoffs: HashMap::new(),
         }
     }
 
     /// Add a log line for a process.
     pub fn push(&mut self, log: LogLine) {
+        self.local_received_total += 1;
+        *self
+            .local_received_counts
+            .entry(log.process.clone())
+            .or_default() += 1;
+
         let buffer = self.logs.entry(log.process).or_default();
         buffer.push_back(StoredLog {
             timestamp: log.timestamp,
@@ -465,6 +491,12 @@ impl LogBuffer {
 
     /// Add a log line with process, content, timestamp, and source directly.
     pub fn push_line(&mut self, process: &str, content: String, timestamp: u64, source: LogSource) {
+        self.local_received_total += 1;
+        *self
+            .local_received_counts
+            .entry(process.to_string())
+            .or_default() += 1;
+
         let buffer = self.logs.entry(process.to_string()).or_default();
         buffer.push_back(StoredLog {
             timestamp,
@@ -483,6 +515,9 @@ impl LogBuffer {
         self.logs.clear();
         self.page_caches.clear();
         self.daemon_total_counts.clear();
+        self.local_received_counts.clear();
+        self.local_received_total = 0;
+        self.clear_cutoffs.clear();
     }
 
     /// Clear logs for a specific process.
@@ -492,6 +527,26 @@ impl LogBuffer {
         }
         self.page_caches.remove(process);
         self.daemon_total_counts.remove(process);
+        self.local_received_counts.remove(process);
+        self.clear_cutoffs.remove(process);
+    }
+
+    /// Clear a view locally for this TUI client without mutating daemon state.
+    pub fn clear_view(&mut self, name: &str) {
+        let daemon_base = if name == "*" || self.daemon_total_counts.contains_key(name) {
+            Some(self.raw_total_count(name))
+        } else {
+            None
+        };
+
+        self.clear_cutoffs.insert(
+            name.to_string(),
+            ClearCutoff {
+                daemon_base,
+                local_base: self.local_received_count(name),
+            },
+        );
+        self.page_caches.remove(name);
     }
 
     /// Get all process names with logs.
@@ -528,13 +583,22 @@ impl LogBuffer {
             return Vec::new();
         };
 
+        let local_start = self.local_buffer_start(process, buffer.len());
+        let cutoff = self.clear_cutoffs.get(process).map(|c| c.local_base).unwrap_or(0);
+
         match &self.filter {
             Some(regex) => buffer
                 .iter()
                 .enumerate()
-                .filter(|(_, log)| regex.is_match(&log.content))
+                .filter(|(idx, log)| {
+                    local_start + *idx >= cutoff && regex.is_match(&log.content)
+                })
                 .collect(),
-            None => buffer.iter().enumerate().collect(),
+            None => buffer
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| local_start + *idx >= cutoff)
+                .collect(),
         }
     }
 
@@ -542,24 +606,26 @@ impl LogBuffer {
     ///
     /// Returns (process, line_index, StoredLog) tuples sorted by timestamp.
     pub fn all_logs_combined(&self) -> Vec<(&str, usize, &StoredLog)> {
-        let mut result = Vec::new();
-
-        for (process, buffer) in &self.logs {
-            for (idx, log) in buffer.iter().enumerate() {
+        let local_start = self.local_received_total.saturating_sub(self.total_len());
+        let cutoff = self.clear_cutoffs.get("*").map(|c| c.local_base).unwrap_or(0);
+        let mut result = self.all_logs_combined_raw();
+        result.sort_by_key(|(_, _, log)| log.timestamp);
+        result
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, (process, _raw_idx, log))| {
                 let filtered = match &self.filter {
                     Some(regex) => regex.is_match(&log.content),
                     None => true,
                 };
-                if filtered {
-                    result.push((process.as_str(), idx, log));
+                let absolute_idx = local_start + idx;
+                if filtered && absolute_idx >= cutoff {
+                    Some((process, absolute_idx, log))
+                } else {
+                    None
                 }
-            }
-        }
-
-        // Sort by timestamp for chronological display
-        result.sort_by_key(|(_, _, log)| log.timestamp);
-
-        result
+            })
+            .collect()
     }
 
     /// Set a filter pattern.
@@ -697,13 +763,16 @@ impl LogBuffer {
                 self.filtered_logs(name).len()
             }
         } else {
-            let local_len = if name == "*" {
-                self.total_len()
+            let clear = self.clear_cutoffs.get(name);
+            if let Some(clear) = clear {
+                if let Some(daemon_base) = clear.daemon_base {
+                    self.raw_total_count(name).saturating_sub(daemon_base)
+                } else {
+                    self.local_received_count(name).saturating_sub(clear.local_base)
+                }
             } else {
-                self.len_for(name)
-            };
-            let daemon_count = self.daemon_total_counts.get(name).copied().unwrap_or(0);
-            daemon_count.max(local_len)
+                self.raw_total_count(name)
+            }
         }
     }
 
@@ -724,12 +793,17 @@ impl LogBuffer {
             return self.get_filtered_display_lines(name, start, count);
         }
 
+        let Some(daemon_start) = self.visible_to_daemon_offset(name, start) else {
+            return self.get_local_only_display_lines(name, start, count);
+        };
+
         let total = self.total_count(name);
+        let raw_total = self.raw_total_count(name);
         let cache = self.page_caches.get(name);
 
         // Compute tail data
         let tail_data: Vec<(&str, &StoredLog)> = if name == "*" {
-            self.all_logs_combined()
+            self.all_logs_combined_raw()
                 .into_iter()
                 .map(|(proc, _idx, log)| (proc, log))
                 .collect()
@@ -740,14 +814,16 @@ impl LogBuffer {
                 .unwrap_or_default()
         };
         let tail_len = tail_data.len();
-        let tail_start = total.saturating_sub(tail_len);
+        let tail_start = raw_total.saturating_sub(tail_len);
 
         let mut result = Vec::with_capacity(count);
 
-        for offset in start..start + count {
-            if offset >= total {
+        for visible_offset in start..start + count {
+            if visible_offset >= total {
                 break;
             }
+
+            let offset = daemon_start + (visible_offset - start);
 
             if offset >= tail_start {
                 // In tail range — serve from local buffer
@@ -817,6 +893,47 @@ impl LogBuffer {
         }
     }
 
+    fn get_local_only_display_lines(
+        &self,
+        name: &str,
+        start: usize,
+        count: usize,
+    ) -> Vec<Option<PagedLogEntry>> {
+        if name == "*" {
+            self.all_logs_combined()
+                .into_iter()
+                .skip(start)
+                .take(count)
+                .map(|(proc, _idx, log)| {
+                    Some(PagedLogEntry {
+                        log: log.clone(),
+                        process: proc.to_string(),
+                    })
+                })
+                .collect()
+        } else {
+            let Some(buffer) = self.logs.get(name) else {
+                return Vec::new();
+            };
+            let local_start = self.local_buffer_start(name, buffer.len());
+            let cutoff = self.clear_cutoffs.get(name).map(|c| c.local_base).unwrap_or(0);
+
+            buffer
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| local_start + *idx >= cutoff)
+                .skip(start)
+                .take(count)
+                .map(|(_, log)| {
+                    Some(PagedLogEntry {
+                        log: log.clone(),
+                        process: name.to_string(),
+                    })
+                })
+                .collect()
+        }
+    }
+
     /// Insert a fetched page of log lines into the cache.
     pub fn insert_page(
         &mut self,
@@ -859,7 +976,14 @@ impl LogBuffer {
             return vec![];
         }
 
-        let total = self.total_count(name);
+        let Some(actual_start) = self.visible_to_daemon_offset(name, start) else {
+            return vec![];
+        };
+        let Some(actual_end) = self.visible_to_daemon_offset(name, end) else {
+            return vec![];
+        };
+
+        let total = self.raw_total_count(name);
         let tail_len = if name == "*" {
             self.total_len()
         } else {
@@ -869,8 +993,8 @@ impl LogBuffer {
 
         let cache = self.page_caches.get(name);
 
-        let first_page = start / PAGE_SIZE;
-        let last_page = (end.saturating_sub(1)) / PAGE_SIZE;
+        let first_page = actual_start / PAGE_SIZE;
+        let last_page = (actual_end.saturating_sub(1)) / PAGE_SIZE;
 
         let mut fetches = Vec::new();
 
@@ -910,6 +1034,48 @@ impl LogBuffer {
         if let Some(cache) = self.page_caches.get_mut(name) {
             cache.clear_pending(page);
         }
+    }
+
+    fn raw_total_count(&self, name: &str) -> usize {
+        let local_len = if name == "*" {
+            self.total_len()
+        } else {
+            self.len_for(name)
+        };
+        let daemon_count = self.daemon_total_counts.get(name).copied().unwrap_or(0);
+        daemon_count.max(local_len)
+    }
+
+    fn local_received_count(&self, name: &str) -> usize {
+        if name == "*" {
+            self.local_received_total
+        } else {
+            self.local_received_counts.get(name).copied().unwrap_or(0)
+        }
+    }
+
+    fn local_buffer_start(&self, name: &str, len: usize) -> usize {
+        self.local_received_count(name).saturating_sub(len)
+    }
+
+    fn visible_to_daemon_offset(&self, name: &str, visible_offset: usize) -> Option<usize> {
+        match self.clear_cutoffs.get(name) {
+            Some(cutoff) => cutoff.daemon_base.map(|base| base + visible_offset),
+            None => Some(visible_offset),
+        }
+    }
+
+    fn all_logs_combined_raw(&self) -> Vec<(&str, usize, &StoredLog)> {
+        let mut result = Vec::new();
+
+        for (process, buffer) in &self.logs {
+            for (idx, log) in buffer.iter().enumerate() {
+                result.push((process.as_str(), idx, log));
+            }
+        }
+
+        result.sort_by_key(|(_, _, log)| log.timestamp);
+        result
     }
 }
 
@@ -1109,6 +1275,72 @@ mod tests {
 
         buffer.clear_all();
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_clear_view_combined_hides_old_logs_and_accepts_new_ones() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "old 1".to_string(), 1000, LogSource::Process);
+        buffer.push_line("worker", "old 2".to_string(), 2000, LogSource::Process);
+        buffer.set_total_count("*", 1000);
+
+        buffer.clear_view("*");
+
+        assert_eq!(buffer.total_count("*"), 0);
+        assert!(buffer.get_display_lines("*", 0, 5).is_empty());
+        assert!(buffer.needs_fetch("*", 0, 5).is_empty());
+
+        buffer.push_line("server", "new 1".to_string(), 3000, LogSource::Process);
+        buffer.push_line("worker", "new 2".to_string(), 4000, LogSource::Process);
+        buffer.set_total_count("*", 1002);
+
+        let lines = buffer.get_display_lines("*", 0, 5);
+        assert_eq!(buffer.total_count("*"), 2);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].as_ref().unwrap().log.content, "new 1");
+        assert_eq!(lines[1].as_ref().unwrap().log.content, "new 2");
+        assert!(buffer.needs_fetch("*", 0, 2).is_empty());
+    }
+
+    #[test]
+    fn test_clear_view_process_hides_old_logs_without_daemon_total() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "old 1".to_string(), 1000, LogSource::Process);
+        buffer.push_line("server", "old 2".to_string(), 2000, LogSource::Process);
+        buffer.push_line("worker", "worker old".to_string(), 3000, LogSource::Process);
+
+        buffer.clear_view("server");
+
+        assert_eq!(buffer.total_count("server"), 0);
+        assert!(buffer.get_display_lines("server", 0, 5).is_empty());
+        assert!(buffer.needs_fetch("server", 0, 5).is_empty());
+        assert_eq!(buffer.total_count("worker"), 1);
+
+        buffer.push_line("server", "new 1".to_string(), 4000, LogSource::Process);
+        buffer.push_line("server", "new 2".to_string(), 5000, LogSource::Process);
+
+        let lines = buffer.get_display_lines("server", 0, 5);
+        assert_eq!(buffer.total_count("server"), 2);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].as_ref().unwrap().log.content, "new 1");
+        assert_eq!(lines[1].as_ref().unwrap().log.content, "new 2");
+    }
+
+    #[test]
+    fn test_clear_view_combined_filter_uses_post_clear_subset() {
+        let mut buffer = LogBuffer::new();
+        buffer.push_line("server", "INFO old".to_string(), 1000, LogSource::Process);
+        buffer.push_line("worker", "INFO old worker".to_string(), 2000, LogSource::Process);
+        buffer.clear_view("*");
+        buffer.push_line("server", "INFO new".to_string(), 3000, LogSource::Process);
+        buffer.push_line("worker", "DEBUG new".to_string(), 4000, LogSource::Process);
+
+        buffer.set_filter("INFO").unwrap();
+
+        let combined = buffer.all_logs_combined();
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].2.content, "INFO new");
+        assert_eq!(buffer.total_count("*"), 1);
     }
 
     #[test]
