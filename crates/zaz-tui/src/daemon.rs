@@ -355,15 +355,6 @@ async fn background_task(
                         search: None,
                     }).await {
                         Ok(ApiResponse::Logs { lines, total_count, .. }) => {
-                            tracing::debug!(
-                                socket = %socket_path.display(),
-                                request = "GetLogs",
-                                name = "*",
-                                returned_lines = lines.len(),
-                                total_count,
-                                previous_timestamp = last_log_timestamp,
-                                "received daemon log poll response"
-                            );
                             // Find max timestamp first, then send all new logs
                             // This avoids dropping logs with the same timestamp
                             let mut max_ts = last_log_timestamp;
