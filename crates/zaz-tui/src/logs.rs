@@ -584,15 +584,17 @@ impl LogBuffer {
         };
 
         let local_start = self.local_buffer_start(process, buffer.len());
-        let cutoff = self.clear_cutoffs.get(process).map(|c| c.local_base).unwrap_or(0);
+        let cutoff = self
+            .clear_cutoffs
+            .get(process)
+            .map(|c| c.local_base)
+            .unwrap_or(0);
 
         match &self.filter {
             Some(regex) => buffer
                 .iter()
                 .enumerate()
-                .filter(|(idx, log)| {
-                    local_start + *idx >= cutoff && regex.is_match(&log.content)
-                })
+                .filter(|(idx, log)| local_start + *idx >= cutoff && regex.is_match(&log.content))
                 .collect(),
             None => buffer
                 .iter()
@@ -607,7 +609,11 @@ impl LogBuffer {
     /// Returns (process, line_index, StoredLog) tuples sorted by timestamp.
     pub fn all_logs_combined(&self) -> Vec<(&str, usize, &StoredLog)> {
         let local_start = self.local_received_total.saturating_sub(self.total_len());
-        let cutoff = self.clear_cutoffs.get("*").map(|c| c.local_base).unwrap_or(0);
+        let cutoff = self
+            .clear_cutoffs
+            .get("*")
+            .map(|c| c.local_base)
+            .unwrap_or(0);
         let mut result = self.all_logs_combined_raw();
         result.sort_by_key(|(_, _, log)| log.timestamp);
         result
@@ -768,7 +774,8 @@ impl LogBuffer {
                 if let Some(daemon_base) = clear.daemon_base {
                     self.raw_total_count(name).saturating_sub(daemon_base)
                 } else {
-                    self.local_received_count(name).saturating_sub(clear.local_base)
+                    self.local_received_count(name)
+                        .saturating_sub(clear.local_base)
                 }
             } else {
                 self.raw_total_count(name)
@@ -916,7 +923,11 @@ impl LogBuffer {
                 return Vec::new();
             };
             let local_start = self.local_buffer_start(name, buffer.len());
-            let cutoff = self.clear_cutoffs.get(name).map(|c| c.local_base).unwrap_or(0);
+            let cutoff = self
+                .clear_cutoffs
+                .get(name)
+                .map(|c| c.local_base)
+                .unwrap_or(0);
 
             buffer
                 .iter()
@@ -1330,7 +1341,12 @@ mod tests {
     fn test_clear_view_combined_filter_uses_post_clear_subset() {
         let mut buffer = LogBuffer::new();
         buffer.push_line("server", "INFO old".to_string(), 1000, LogSource::Process);
-        buffer.push_line("worker", "INFO old worker".to_string(), 2000, LogSource::Process);
+        buffer.push_line(
+            "worker",
+            "INFO old worker".to_string(),
+            2000,
+            LogSource::Process,
+        );
         buffer.clear_view("*");
         buffer.push_line("server", "INFO new".to_string(), 3000, LogSource::Process);
         buffer.push_line("worker", "DEBUG new".to_string(), 4000, LogSource::Process);

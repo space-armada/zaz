@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/zaz-config",
     "crates/zaz-daemon",
+    "crates/zaz-mcp",
     "crates/zaz-process",
     "crates/zaz-tui",
     "crates/zaz-vars",
@@ -71,9 +72,13 @@ notify-rust = "4"
 # Human-readable durations
 humantime = "2"
 
+# MCP tool server
+rmcp = { version = "1.6", default-features = false, features = ["server", "macros", "transport-io"] }
+
 # Internal crates
 zaz-config = { path = "crates/zaz-config" }
 zaz-daemon = { path = "crates/zaz-daemon" }
+zaz-mcp = { path = "crates/zaz-mcp" }
 zaz-process = { path = "crates/zaz-process" }
 zaz-tui = { path = "crates/zaz-tui" }
 zaz-vars = { path = "crates/zaz-vars" }
@@ -103,6 +108,7 @@ tracing-subscriber.workspace = true
 yansi.workspace = true
 zaz-config.workspace = true
 zaz-daemon.workspace = true
+zaz-mcp.workspace = true
 zaz-process.workspace = true
 zaz-tui.workspace = true
 zaz-vars.workspace = true

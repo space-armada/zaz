@@ -1,0 +1,12 @@
+[package]
+name = "zaz-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP tool server for zaz"
+
+[dependencies]
+rmcp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

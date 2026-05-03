@@ -113,6 +113,9 @@ enum Commands {
 
     /// Show default ignore patterns
     Ignores,
+
+    /// Run the MCP tool server over stdio
+    Mcp,
 }
 
 /// Effective TUI options after merging CLI flags with user config.
@@ -207,6 +210,55 @@ fn init_tracing(
         }
         // Otherwise, no logging
         (true, None) => None,
+    }
+}
+
+/// Initialize tracing for `zaz mcp` mode.
+///
+/// The MCP server uses stdout as its JSON-RPC channel, so log output must
+/// never touch it. Console logs are written to stderr; an optional file
+/// receives logs alongside.
+fn init_tracing_stderr(
+    debug: bool,
+    log_file: Option<&Path>,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::prelude::*;
+
+    let filter = if debug { "debug,globset=info" } else { "info" };
+    let env_filter = tracing_subscriber::EnvFilter::new(filter);
+
+    match log_file {
+        Some(path) => {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("Failed to open log file");
+            let (non_blocking, guard) = tracing_appender::non_blocking(file);
+
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false);
+
+            let stderr_layer = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(false);
+
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(stderr_layer)
+                .with(file_layer)
+                .init();
+            Some(guard)
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(std::io::stderr)
+                .with_target(false)
+                .init();
+            None
+        }
     }
 }
 
@@ -531,6 +583,11 @@ async fn try_main() -> Result<()> {
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             show_ignores()
         }
+        Some(Commands::Mcp) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing_stderr(cli.debug, cli.log_file.as_deref());
+            zaz_mcp::run().await.map_err(anyhow::Error::from)
+        }
         None => {
             let config_path = find_config(&cli.config)?;
             let socket_path =
@@ -752,10 +809,7 @@ async fn start_daemon_command(
         check_daemon_availability(socket_path, check_timeout).await,
         DaemonAvailability::Running
     ) {
-        println!(
-            "daemon already running (socket {})",
-            socket_path.display()
-        );
+        println!("daemon already running (socket {})", socket_path.display());
         return Ok(());
     }
 
@@ -1802,9 +1856,7 @@ command = "true"
             .await
             .unwrap_or_else(|e| {
                 let log_contents = std::fs::read_to_string(&output_log).unwrap_or_default();
-                panic!(
-                    "start_daemon_command failed: {e}; daemon-output.log: {log_contents}"
-                );
+                panic!("start_daemon_command failed: {e}; daemon-output.log: {log_contents}");
             });
 
         assert!(is_daemon_responsive(&socket_path, Duration::from_secs(1)).await);
