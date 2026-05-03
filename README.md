@@ -63,6 +63,7 @@ Or in JSON:
 zaz                 # Open the TUI (reuses or autostarts a daemon)
 zaz task            # Run task commands once and exit
 zaz daemon          # Run the daemon in the foreground
+zaz start           # Start the daemon in the background and exit
 zaz status          # Show daemon status
 zaz restart [group] # Restart a group (or all)
 zaz stop            # Stop the running daemon
@@ -82,11 +83,14 @@ zaz --log-file /tmp/zaz.log  # Override the TUI debug log file; autostarted daem
 
 Press `F1`/`F2` to switch between Full and Multi Pane styles at runtime.
 
-With `zaz --debug` in TUI mode, zaz writes debug logs to separate files for the
-TUI and any daemon it autostarts at `$XDG_STATE_HOME/zaz/` when set, otherwise
-`~/.local/state/zaz/`, as `tui-debug.log` and `daemon-debug.log`. These debug
-logs are rotated by size and old rotated files are pruned first if the debug
-log directory exceeds its storage budget.
+zaz writes daemon log files to `$XDG_STATE_HOME/zaz/` when set, otherwise
+`~/.local/state/zaz/`. `daemon-output.log` is always written for daemons
+launched via TUI autostart or `zaz start`; it captures panics and pre-init
+errors that would otherwise be lost. With `zaz --debug` in TUI mode, zaz
+additionally writes structured tracing output to `tui-debug.log` and
+`daemon-debug.log` in the same directory. All three files are rotated by
+size and old rotated files are pruned first if the directory exceeds its
+storage budget.
 
 ## User Configuration
 
