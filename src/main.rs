@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::ExitStatus;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
@@ -14,6 +14,7 @@ use zaz_daemon::{
     resolve_socket, socket_path_for_config, ApiRequest, ApiResponse, Client, Engine, EngineCommand,
     Server,
 };
+use zaz_process::{DaemonLauncher, LaunchHandle};
 
 #[derive(Parser)]
 #[command(name = "zaz")]
@@ -209,6 +210,7 @@ fn init_tracing(
 enum DebugLogKind {
     Tui,
     Daemon,
+    DaemonOutput,
 }
 
 impl DebugLogKind {
@@ -216,6 +218,7 @@ impl DebugLogKind {
         match self {
             Self::Tui => "tui-debug.log",
             Self::Daemon => "daemon-debug.log",
+            Self::DaemonOutput => "daemon-output.log",
         }
     }
 }
@@ -262,6 +265,17 @@ fn derive_daemon_log_path(path: &Path) -> PathBuf {
     }
 }
 
+fn derive_daemon_output_log_path(path: &Path) -> PathBuf {
+    match path.extension() {
+        Some(ext) => {
+            let mut new_ext = OsString::from("daemon-output.");
+            new_ext.push(ext);
+            path.with_extension(new_ext)
+        }
+        None => path.with_extension("daemon-output.log"),
+    }
+}
+
 fn resolve_tui_log_file(debug: bool, log_file: Option<&Path>) -> Result<Option<PathBuf>> {
     let path = match log_file {
         Some(path) => path.to_path_buf(),
@@ -286,6 +300,15 @@ fn resolve_autostart_daemon_log_file(
     };
     ensure_log_parent_dir(&path)?;
     Ok(Some(path))
+}
+
+fn resolve_autostart_daemon_output_log(log_file: Option<&Path>) -> Result<PathBuf> {
+    let path = match log_file {
+        Some(path) => derive_daemon_output_log_path(path),
+        None => default_debug_log_path(DebugLogKind::DaemonOutput)?,
+    };
+    ensure_log_parent_dir(&path)?;
+    Ok(path)
 }
 
 fn rotated_log_path(path: &Path, generation: usize) -> PathBuf {
@@ -485,6 +508,7 @@ async fn try_main() -> Result<()> {
             let tui_log_file = resolve_tui_log_file(cli.debug, cli.log_file.as_deref())?;
             let daemon_log_file =
                 resolve_autostart_daemon_log_file(cli.debug, cli.log_file.as_deref())?;
+            let daemon_output_log = resolve_autostart_daemon_output_log(cli.log_file.as_deref())?;
             let mut log_paths = Vec::new();
             if let Some(path) = &tui_log_file {
                 log_paths.push(path.clone());
@@ -492,6 +516,7 @@ async fn try_main() -> Result<()> {
             if let Some(path) = &daemon_log_file {
                 log_paths.push(path.clone());
             }
+            log_paths.push(daemon_output_log.clone());
             prepare_log_files(&log_paths)?;
             _log_guard = init_tracing(cli.debug, true, tui_log_file.as_deref());
             let user_config = load_user_config();
@@ -502,6 +527,7 @@ async fn try_main() -> Result<()> {
                 &tui_options,
                 cli.debug,
                 daemon_log_file.as_deref(),
+                &daemon_output_log,
             )
             .await
         }
@@ -1046,67 +1072,78 @@ fn resolve_autostart_executable() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
-fn build_daemon_subprocess_command(
+fn build_daemon_args(
     config_path: &Path,
     socket_path: &Path,
     debug: bool,
     log_file: Option<&Path>,
-) -> Result<Command> {
-    let current_exe = resolve_autostart_executable()?;
+) -> Result<Vec<OsString>> {
+    let mut args: Vec<OsString> = Vec::new();
 
-    let mut command = Command::new(current_exe);
-    command.args([
-        "--config",
-        config_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("config path is not valid utf-8"))?,
-        "--socket",
-        socket_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("socket path is not valid utf-8"))?,
-    ]);
+    args.push(OsString::from("--config"));
+    args.push(OsString::from(config_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!("config path is not valid utf-8")
+    })?));
+    args.push(OsString::from("--socket"));
+    args.push(OsString::from(socket_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!("socket path is not valid utf-8")
+    })?));
 
     if debug {
-        command.arg("--debug");
+        args.push(OsString::from("--debug"));
     }
 
     if let Some(path) = log_file {
-        command.args([
-            "--log-file",
-            path.to_str()
-                .ok_or_else(|| anyhow::anyhow!("log file path is not valid utf-8"))?,
-        ]);
+        args.push(OsString::from("--log-file"));
+        args.push(OsString::from(path.to_str().ok_or_else(|| {
+            anyhow::anyhow!("log file path is not valid utf-8")
+        })?));
     }
 
-    command
-        .args(["daemon", "--quiet"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    args.push(OsString::from("daemon"));
+    args.push(OsString::from("--quiet"));
 
-    Ok(command)
+    Ok(args)
 }
 
-fn start_daemon_subprocess(
+fn start_daemon_via_launcher(
     config_path: &Path,
     socket_path: &Path,
     debug: bool,
     log_file: Option<&Path>,
-) -> Result<()> {
-    let mut command = build_daemon_subprocess_command(config_path, socket_path, debug, log_file)?;
-    command.spawn()?;
-    Ok(())
+    output_log: &Path,
+) -> Result<LaunchHandle> {
+    let exe = resolve_autostart_executable()?;
+    let args = build_daemon_args(config_path, socket_path, debug, log_file)?;
+    let mut launcher = DaemonLauncher::new(exe, output_log);
+    launcher.args(args);
+    Ok(launcher.launch()?)
 }
 
-async fn wait_for_daemon_ready(socket_path: &Path, attempts: usize, delay: Duration) -> bool {
+#[derive(Debug)]
+enum DaemonReadyOutcome {
+    Ready,
+    Crashed(ExitStatus),
+    Timeout,
+}
+
+async fn wait_for_daemon_ready(
+    socket_path: &Path,
+    handle: &mut LaunchHandle,
+    attempts: usize,
+    delay: Duration,
+) -> Result<DaemonReadyOutcome> {
     for _ in 0..attempts {
         tokio::time::sleep(delay).await;
+        if let Some(status) = handle.try_wait()? {
+            return Ok(DaemonReadyOutcome::Crashed(status));
+        }
         if is_daemon_responsive(socket_path, Duration::from_secs(1)).await {
-            return true;
+            return Ok(DaemonReadyOutcome::Ready);
         }
     }
 
-    false
+    Ok(DaemonReadyOutcome::Timeout)
 }
 
 async fn run_tui(
@@ -1115,6 +1152,7 @@ async fn run_tui(
     options: &TuiOptions,
     debug: bool,
     daemon_log_file: Option<&Path>,
+    daemon_output_log: &Path,
 ) -> Result<()> {
     tracing::info!(
         config = %config_path.display(),
@@ -1128,6 +1166,7 @@ async fn run_tui(
         stop_on_exit = options.stop_on_exit,
         disable_animations = options.disable_animations,
         daemon_log_file = daemon_log_file.map(|path| path.display().to_string()),
+        daemon_output_log = %daemon_output_log.display(),
         "resolved TUI startup options"
     );
 
@@ -1159,27 +1198,59 @@ async fn run_tui(
         tracing::info!(
             socket = %socket_path.display(),
             daemon_log_file = daemon_log_file.map(|path| path.display().to_string()),
+            daemon_output_log = %daemon_output_log.display(),
             "auto-starting daemon in background"
         );
 
-        match start_daemon_subprocess(config_path, socket_path, debug, daemon_log_file) {
-            Ok(()) => {
+        match start_daemon_via_launcher(
+            config_path,
+            socket_path,
+            debug,
+            daemon_log_file,
+            daemon_output_log,
+        ) {
+            Ok(mut handle) => {
                 tracing::debug!(
                     socket = %socket_path.display(),
+                    pid = handle.id(),
                     "daemon subprocess spawned, waiting for readiness"
                 );
-                let ready =
-                    wait_for_daemon_ready(socket_path, 20, Duration::from_millis(100)).await;
-                if ready {
-                    tracing::debug!(
-                        socket = %socket_path.display(),
-                        "auto-started daemon became responsive"
-                    );
-                } else {
-                    tracing::warn!(
-                        socket = %socket_path.display(),
-                        "auto-started daemon may not be ready after 2s"
-                    );
+                match wait_for_daemon_ready(
+                    socket_path,
+                    &mut handle,
+                    20,
+                    Duration::from_millis(100),
+                )
+                .await
+                {
+                    Ok(DaemonReadyOutcome::Ready) => {
+                        tracing::debug!(
+                            socket = %socket_path.display(),
+                            "auto-started daemon became responsive"
+                        );
+                    }
+                    Ok(DaemonReadyOutcome::Crashed(status)) => {
+                        tracing::warn!(
+                            socket = %socket_path.display(),
+                            exit_status = %status,
+                            output_log = %daemon_output_log.display(),
+                            "auto-started daemon exited before becoming responsive"
+                        );
+                    }
+                    Ok(DaemonReadyOutcome::Timeout) => {
+                        tracing::warn!(
+                            socket = %socket_path.display(),
+                            output_log = %daemon_output_log.display(),
+                            "auto-started daemon may not be ready after 2s"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            socket = %socket_path.display(),
+                            error = %e,
+                            "error while waiting for auto-started daemon"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -1288,9 +1359,11 @@ mod tests {
     fn default_debug_log_path_uses_state_dir_filenames() -> Result<()> {
         let tui_path = default_debug_log_path(DebugLogKind::Tui)?;
         let daemon_path = default_debug_log_path(DebugLogKind::Daemon)?;
+        let daemon_output_path = default_debug_log_path(DebugLogKind::DaemonOutput)?;
 
         assert!(tui_path.ends_with("zaz/tui-debug.log"));
         assert!(daemon_path.ends_with("zaz/daemon-debug.log"));
+        assert!(daemon_output_path.ends_with("zaz/daemon-output.log"));
         Ok(())
     }
 
@@ -1315,6 +1388,18 @@ mod tests {
             .expect("daemon log path");
         assert_eq!(path, PathBuf::from("/tmp/custom.daemon.log"));
         Ok(())
+    }
+
+    #[test]
+    fn derive_daemon_output_log_path_uses_sibling_of_explicit_path() {
+        assert_eq!(
+            derive_daemon_output_log_path(Path::new("/tmp/zaz.log")),
+            PathBuf::from("/tmp/zaz.daemon-output.log")
+        );
+        assert_eq!(
+            derive_daemon_output_log_path(Path::new("/tmp/zaz")),
+            PathBuf::from("/tmp/zaz.daemon-output.log")
+        );
     }
 
     #[test]
@@ -1364,17 +1449,16 @@ mod tests {
     }
 
     #[test]
-    fn build_daemon_subprocess_command_propagates_debug_only_when_enabled() -> Result<()> {
+    fn build_daemon_args_propagates_debug_only_when_enabled() -> Result<()> {
         let temp = TempDir::new()?;
         let config_path = temp.path().join("zaz.toml");
         let socket_path = temp.path().join("daemon.sock");
         let log_path = temp.path().join("daemon.log");
         std::fs::write(&config_path, "")?;
 
-        let command =
-            build_daemon_subprocess_command(&config_path, &socket_path, true, Some(&log_path))?;
-        let args = command
-            .get_args()
+        let args = build_daemon_args(&config_path, &socket_path, true, Some(&log_path))?;
+        let args = args
+            .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
         assert!(args.contains(&"--debug".to_string()));
@@ -1382,10 +1466,11 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--log-file" && pair[1] == log_path_string));
+        assert!(args.windows(2).any(|pair| pair == ["daemon", "--quiet"]));
 
-        let command = build_daemon_subprocess_command(&config_path, &socket_path, false, None)?;
-        let args = command
-            .get_args()
+        let args = build_daemon_args(&config_path, &socket_path, false, None)?;
+        let args = args
+            .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
         assert!(!args.contains(&"--debug".to_string()));
@@ -1545,10 +1630,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_daemon_subprocess_starts_reachable_daemon() {
+    async fn start_daemon_via_launcher_starts_reachable_daemon() {
         let temp = TempDir::new().unwrap();
         let config_path = temp.path().join("zaz.toml");
         let socket_path = temp.path().join("daemon.sock");
+        let output_log = temp.path().join("daemon-output.log");
 
         std::fs::write(
             &config_path,
@@ -1564,13 +1650,49 @@ command = "true"
         )
         .unwrap();
 
-        start_daemon_subprocess(&config_path, &socket_path, false, None).unwrap();
+        let mut handle =
+            start_daemon_via_launcher(&config_path, &socket_path, false, None, &output_log)
+                .unwrap();
+        assert!(handle.id() > 0);
 
-        assert!(wait_for_daemon_ready(&socket_path, 50, Duration::from_millis(100)).await);
+        let outcome =
+            wait_for_daemon_ready(&socket_path, &mut handle, 50, Duration::from_millis(100))
+                .await
+                .unwrap();
+        match outcome {
+            DaemonReadyOutcome::Ready => {}
+            other => {
+                let log_contents = std::fs::read_to_string(&output_log).unwrap_or_default();
+                panic!(
+                    "expected Ready, got {:?}; daemon-output.log: {}",
+                    other, log_contents
+                );
+            }
+        }
         assert!(is_daemon_responsive(&socket_path, Duration::from_secs(1)).await);
 
         let mut client = Client::connect(&socket_path).await.unwrap();
         let response = client.request(&ApiRequest::Shutdown).await.unwrap();
         assert!(matches!(response, ApiResponse::Ok { .. }));
+    }
+
+    #[tokio::test]
+    async fn wait_for_daemon_ready_reports_crash_when_daemon_exits_immediately() {
+        let temp = TempDir::new().unwrap();
+        let socket_path = temp.path().join("never-bound.sock");
+        let output_log = temp.path().join("daemon-output.log");
+
+        let mut launcher = DaemonLauncher::new("/bin/sh", &output_log);
+        launcher.args(["-c", "exit 1"]);
+        let mut handle = launcher.launch().unwrap();
+
+        let outcome =
+            wait_for_daemon_ready(&socket_path, &mut handle, 50, Duration::from_millis(20))
+                .await
+                .unwrap();
+        match outcome {
+            DaemonReadyOutcome::Crashed(status) => assert!(!status.success()),
+            other => panic!("expected crash outcome, got {:?}", other),
+        }
     }
 }
