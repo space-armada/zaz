@@ -506,6 +506,182 @@ patterns = ["**/*.rs"
     assert!(stderr.contains("configuration parse failed"));
 }
 
+fn write_lifecycle_config(temp: &TempDir, group: &str) -> std::path::PathBuf {
+    let config_path = temp.path().join("zaz.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[[group]]
+name = "{group}"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "noop"
+command = "true"
+"#
+        ),
+    )
+    .unwrap();
+    config_path
+}
+
+struct StartedDaemon<'a> {
+    current_dir: &'a Path,
+    socket: String,
+}
+
+impl<'a> StartedDaemon<'a> {
+    fn launch(current_dir: &'a Path, config_path: &Path, socket_path: &Path) -> Self {
+        let log_path = current_dir.join("zaz.log");
+        let socket = socket_path
+            .to_str()
+            .expect("socket path should be utf-8")
+            .to_string();
+        let output = run_zaz(
+            current_dir,
+            &[
+                "--config",
+                config_path.to_str().expect("config path should be utf-8"),
+                "--socket",
+                &socket,
+                "--log-file",
+                log_path.to_str().expect("log path should be utf-8"),
+                "start",
+            ],
+        );
+        let stdout = stdout_string(&output);
+        let stderr = stderr_string(&output);
+        assert!(
+            output.status.success(),
+            "zaz start exited with {:?}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status.code()
+        );
+        wait_for_daemon(current_dir, socket_path);
+
+        Self {
+            current_dir,
+            socket,
+        }
+    }
+}
+
+impl Drop for StartedDaemon<'_> {
+    fn drop(&mut self) {
+        let _ = run_zaz(self.current_dir, &["--socket", &self.socket, "stop"]);
+    }
+}
+
+#[test]
+fn start_then_status_reports_running() {
+    let temp = TempDir::new().unwrap();
+    let config_path = write_lifecycle_config(&temp, "backend");
+    let socket_path = temp.path().join("daemon.sock");
+
+    let _guard = StartedDaemon::launch(temp.path(), &config_path, &socket_path);
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "status"]);
+    let stdout = stdout_string(&output);
+
+    assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("Daemon Status:"));
+    assert!(stdout.contains("backend"));
+}
+
+#[test]
+fn start_then_stop_brings_status_back_to_not_running() {
+    let temp = TempDir::new().unwrap();
+    let config_path = write_lifecycle_config(&temp, "backend");
+    let socket_path = temp.path().join("daemon.sock");
+
+    let guard = StartedDaemon::launch(temp.path(), &config_path, &socket_path);
+    let socket = socket_path.to_str().unwrap().to_string();
+    drop(guard);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = run_zaz(temp.path(), &["--socket", &socket, "status"]);
+        if output.status.code() == Some(3) {
+            let stdout = stdout_string(&output);
+            assert!(stdout.contains("No daemon running"));
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "status did not report exit code 3 after stop; last code = {:?}",
+                output.status.code()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn start_then_restart_all_succeeds() {
+    let temp = TempDir::new().unwrap();
+    let config_path = write_lifecycle_config(&temp, "backend");
+    let socket_path = temp.path().join("daemon.sock");
+
+    let _guard = StartedDaemon::launch(temp.path(), &config_path, &socket_path);
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "restart"]);
+    let stdout = stdout_string(&output);
+    let stderr = stderr_string(&output);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("restart initiated for all groups"));
+}
+
+#[test]
+fn start_then_restart_named_group_succeeds() {
+    let temp = TempDir::new().unwrap();
+    let config_path = write_lifecycle_config(&temp, "backend");
+    let socket_path = temp.path().join("daemon.sock");
+
+    let _guard = StartedDaemon::launch(temp.path(), &config_path, &socket_path);
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "restart", "backend"]);
+    let stdout = stdout_string(&output);
+    let stderr = stderr_string(&output);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stdout.contains("restart initiated for group 'backend'"));
+}
+
+#[test]
+fn start_is_idempotent_when_daemon_already_running() {
+    let temp = TempDir::new().unwrap();
+    let config_path = write_lifecycle_config(&temp, "backend");
+    let socket_path = temp.path().join("daemon.sock");
+
+    let _guard = StartedDaemon::launch(temp.path(), &config_path, &socket_path);
+
+    let log_path = temp.path().join("zaz.log");
+    let output = run_zaz(
+        temp.path(),
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "--log-file",
+            log_path.to_str().unwrap(),
+            "start",
+        ],
+    );
+    let stdout = stdout_string(&output);
+    let stderr = stderr_string(&output);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("daemon already running"),
+        "expected idempotent start message, got: {stdout}"
+    );
+}
+
 trait ChildExt {
     fn wait_timeout(
         &mut self,
