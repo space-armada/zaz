@@ -2678,10 +2678,17 @@ dependencies = [
 name = "zaz-mcp"
 version = "0.1.0"
 dependencies = [
+ "indexmap",
  "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
+ "zaz-config",
+ "zaz-daemon",
 ]
 
 [[package]]

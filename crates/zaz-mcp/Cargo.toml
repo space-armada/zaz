@@ -7,6 +7,15 @@ description = "MCP tool server for zaz"
 
 [dependencies]
 rmcp.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zaz-config.workspace = true
+zaz-daemon.workspace = true
+
+[dev-dependencies]
+indexmap.workspace = true
+tempfile.workspace = true

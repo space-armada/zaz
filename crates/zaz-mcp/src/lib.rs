@@ -3,8 +3,16 @@
 //! Exposes a stdio-transport MCP server that AI assistants can use to query
 //! daemon state and trigger control operations.
 
+mod client;
 mod error;
 mod server;
+mod types;
 
 pub use error::McpError;
 pub use server::{run, ZazMcpServer};
+pub use types::{
+    ConfigDaemon, ConfigGroup, ConfigReport, ConfigSettings, ConfigTask, DaemonStatusReport,
+    GroupReport, GroupStatusReport, GroupSummary, GroupsReport, LogEntry, LogFormatReport,
+    LogSourceReport, LogsReport, LogsRequest, OutputKindReport, ProcessKind, ProcessReport,
+    ProcessStatusReport, SignalReport, SilenceReport, StatusReport,
+};

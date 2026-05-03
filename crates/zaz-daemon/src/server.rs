@@ -72,7 +72,11 @@ pub fn resolve_socket(
     Ok(socket_path_for_config(&config_path))
 }
 
-fn discover_config_upward(start_dir: &Path) -> Option<PathBuf> {
+/// Walk upward from `start_dir` looking for a zaz config file.
+///
+/// Returns the path of the first matching `zaz.toml` or `zaz.json` found, or
+/// `None` if the walk reaches the filesystem root without finding one.
+pub fn discover_config_upward(start_dir: &Path) -> Option<PathBuf> {
     let mut current = if start_dir.is_file() {
         start_dir.parent()?.to_path_buf()
     } else {
