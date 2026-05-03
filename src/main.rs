@@ -65,7 +65,8 @@ struct Cli {
 //   `restart` and `reload` exit 1 when no daemon is running or when the daemon
 //   API returns an error.
 // - Idempotent-mutating commands ensure a postcondition. `stop` exits 0 when
-//   the daemon is already stopped, and exits 1 for API/operational errors.
+//   the daemon is already stopped, `start` exits 0 when the daemon is already
+//   running, and both exit 1 for API/operational errors.
 //
 // New CLI commands must declare which category they belong to before
 // implementation so their exit behavior stays predictable in scripts.
@@ -80,6 +81,9 @@ enum Commands {
         #[arg(short, long)]
         quiet: bool,
     },
+
+    /// Start the daemon in the background and exit
+    Start,
 
     /// Show status of running daemon
     Status,
@@ -462,6 +466,32 @@ async fn try_main() -> Result<()> {
                 resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             run_daemon(&config_path, &socket_path, quiet).await
         }
+        Some(Commands::Start) => {
+            let config_path = find_config(&cli.config)?;
+            let socket_path =
+                resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+            let daemon_log_file =
+                resolve_autostart_daemon_log_file(cli.debug, cli.log_file.as_deref())?;
+            let daemon_output_log = resolve_autostart_daemon_output_log(cli.log_file.as_deref())?;
+
+            let mut log_paths = explicit_log_paths.clone();
+            if let Some(path) = &daemon_log_file {
+                log_paths.push(path.clone());
+            }
+            log_paths.push(daemon_output_log.clone());
+            prepare_log_files(&log_paths)?;
+
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
+
+            start_daemon_command(
+                &config_path,
+                &socket_path,
+                cli.debug,
+                daemon_log_file.as_deref(),
+                &daemon_output_log,
+            )
+            .await
+        }
         Some(Commands::Status) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
@@ -708,6 +738,57 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
     }
 
     Ok(())
+}
+
+async fn start_daemon_command(
+    config_path: &Path,
+    socket_path: &Path,
+    debug: bool,
+    daemon_log_file: Option<&Path>,
+    daemon_output_log: &Path,
+) -> Result<()> {
+    let check_timeout = Duration::from_secs(1);
+    if matches!(
+        check_daemon_availability(socket_path, check_timeout).await,
+        DaemonAvailability::Running
+    ) {
+        println!(
+            "daemon already running (socket {})",
+            socket_path.display()
+        );
+        return Ok(());
+    }
+
+    tracing::info!(
+        config = %config_path.display(),
+        socket = %socket_path.display(),
+        daemon_output_log = %daemon_output_log.display(),
+        "starting daemon in background"
+    );
+
+    let mut handle = start_daemon_via_launcher(
+        config_path,
+        socket_path,
+        debug,
+        daemon_log_file,
+        daemon_output_log,
+    )?;
+
+    match wait_for_daemon_ready(socket_path, &mut handle, 20, Duration::from_millis(100)).await? {
+        DaemonReadyOutcome::Ready => {
+            println!("daemon started (pid {})", handle.id());
+            Ok(())
+        }
+        DaemonReadyOutcome::Crashed(status) => bail!(
+            "daemon exited before becoming ready (status: {}); see {} for details",
+            status,
+            daemon_output_log.display()
+        ),
+        DaemonReadyOutcome::Timeout => bail!(
+            "daemon did not become ready within 2s; see {} for details",
+            daemon_output_log.display()
+        ),
+    }
 }
 
 async fn show_status(socket_path: &Path) -> Result<()> {
@@ -1440,7 +1521,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(&rotated_new, vec![b'b'; 120])?;
 
-        prune_debug_log_dirs_with_budget(&[active.clone()], 200)?;
+        prune_debug_log_dirs_with_budget(std::slice::from_ref(&active), 200)?;
 
         assert!(!rotated_old.exists());
         assert!(rotated_new.exists());
@@ -1694,5 +1775,87 @@ command = "true"
             DaemonReadyOutcome::Crashed(status) => assert!(!status.success()),
             other => panic!("expected crash outcome, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn start_daemon_command_launches_responsive_daemon() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("zaz.toml");
+        let socket_path = temp.path().join("daemon.sock");
+        let output_log = temp.path().join("daemon-output.log");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[[group]]
+name = "backend"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "noop"
+command = "true"
+"#,
+        )
+        .unwrap();
+
+        start_daemon_command(&config_path, &socket_path, false, None, &output_log)
+            .await
+            .unwrap_or_else(|e| {
+                let log_contents = std::fs::read_to_string(&output_log).unwrap_or_default();
+                panic!(
+                    "start_daemon_command failed: {e}; daemon-output.log: {log_contents}"
+                );
+            });
+
+        assert!(is_daemon_responsive(&socket_path, Duration::from_secs(1)).await);
+
+        let mut client = Client::connect(&socket_path).await.unwrap();
+        let response = client.request(&ApiRequest::Shutdown).await.unwrap();
+        assert!(matches!(response, ApiResponse::Ok { .. }));
+    }
+
+    #[tokio::test]
+    async fn start_daemon_command_returns_ok_when_daemon_already_running() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+        use zaz_daemon::DaemonState;
+
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("zaz.toml");
+        let socket_path = temp.path().join("daemon.sock");
+        let output_log = temp.path().join("daemon-output.log");
+
+        // Config exists but is otherwise unused — the early-return path must
+        // never spawn a child or touch the daemon binary.
+        std::fs::write(&config_path, "").unwrap();
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handler = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+
+            let request: ApiRequest = serde_json::from_str(&line).unwrap();
+            assert!(matches!(request, ApiRequest::Status));
+
+            let response = ApiResponse::Status {
+                state: DaemonState::default(),
+            };
+            let body = serde_json::to_string(&response).unwrap();
+            writer.write_all(body.as_bytes()).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        });
+
+        start_daemon_command(&config_path, &socket_path, false, None, &output_log)
+            .await
+            .expect("start_daemon_command should report success when daemon already running");
+
+        handler.await.unwrap();
+
+        // No daemon was launched, so the output log should never have been
+        // written to.
+        assert!(!output_log.exists());
     }
 }
