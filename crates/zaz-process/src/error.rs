@@ -25,4 +25,8 @@ pub enum ProcessError {
     /// Failed to send signal to process.
     #[error("failed to send signal: {0}")]
     SendSignal(#[from] nix::Error),
+
+    /// Failed to launch daemon process.
+    #[error("failed to launch daemon: {0}")]
+    LaunchDaemon(String),
 }
