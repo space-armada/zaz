@@ -86,7 +86,7 @@ fn mcp_initialize_handshake_completes() {
 }
 
 #[test]
-fn mcp_tools_list_advertises_read_only_tools() {
+fn mcp_tools_list_advertises_all_tools() {
     let mut child = Command::new(zaz_bin())
         .arg("mcp")
         .stdin(Stdio::piped())
@@ -144,13 +144,30 @@ fn mcp_tools_list_advertises_read_only_tools() {
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
 
-    for expected in ["zaz_status", "zaz_list_groups", "zaz_logs", "zaz_config"] {
+    for expected in [
+        "zaz_status",
+        "zaz_list_groups",
+        "zaz_logs",
+        "zaz_config",
+        "zaz_restart_group",
+        "zaz_restart_process",
+        "zaz_restart_all",
+        "zaz_reload_config",
+    ] {
         assert!(
             names.contains(&expected),
             "tools/list missing {expected}; got {names:?}"
         );
     }
-    assert_eq!(names.len(), 4, "expected exactly four tools, got {names:?}");
+    assert!(
+        !names.iter().any(|n| n.contains("shutdown")),
+        "shutdown tool must not be advertised; got {names:?}"
+    );
+    assert_eq!(
+        names.len(),
+        8,
+        "expected exactly eight tools, got {names:?}"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

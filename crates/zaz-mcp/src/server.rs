@@ -1,8 +1,9 @@
-//! Stdio-transport MCP server for zaz, with read-only diagnostic tools.
+//! Stdio-transport MCP server for zaz, with diagnostic and control tools.
 //!
 //! Tools dispatch to the running daemon via the Unix socket API, except for
-//! `zaz_config` which loads the project config directly from disk. Mutation
-//! tools and CLI flag overrides are added in subsequent milestones.
+//! `zaz_config` which loads the project config directly from disk. CLI flag
+//! overrides for socket and config paths are added in a later milestone;
+//! `zaz_shutdown` is intentionally not exposed.
 
 use std::path::PathBuf;
 
@@ -14,7 +15,10 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt
 
 use crate::client;
 use crate::error::McpError;
-use crate::types::{ConfigReport, GroupsReport, LogsReport, LogsRequest, StatusReport};
+use crate::types::{
+    ConfigReport, GroupsReport, LogsReport, LogsRequest, MutationReport, RestartGroupRequest,
+    RestartProcessRequest, StatusReport,
+};
 
 /// MCP server handler for zaz.
 #[derive(Clone)]
@@ -89,6 +93,58 @@ impl ZazMcpServer {
             .map_err(into_error)?;
         Ok(Json(ConfigReport::from_config(&path, &config)))
     }
+
+    /// Restart every process in a single group.
+    #[tool(
+        name = "zaz_restart_group",
+        description = "Restart all tasks and daemons in the named group. Reversible: equivalent to a file-change-triggered restart. Use after editing code that the group watches when you want to skip the file event and restart immediately."
+    )]
+    async fn zaz_restart_group(
+        &self,
+        Parameters(req): Parameters<RestartGroupRequest>,
+    ) -> Result<Json<MutationReport>, ErrorData> {
+        let message = client::restart_group(&self.cwd, &req.name)
+            .await
+            .map_err(into_error)?;
+        Ok(Json(MutationReport { message }))
+    }
+
+    /// Restart a single task or daemon within a group.
+    #[tool(
+        name = "zaz_restart_process",
+        description = "Restart a single process inside a group. `group` is the group name and `process` is the task or daemon `name` field as declared in the config. Reversible: starts a fresh instance the same way a file change would."
+    )]
+    async fn zaz_restart_process(
+        &self,
+        Parameters(req): Parameters<RestartProcessRequest>,
+    ) -> Result<Json<MutationReport>, ErrorData> {
+        let message = client::restart_process(&self.cwd, &req.group, &req.process)
+            .await
+            .map_err(into_error)?;
+        Ok(Json(MutationReport { message }))
+    }
+
+    /// Restart every group managed by the daemon.
+    #[tool(
+        name = "zaz_restart_all",
+        description = "Restart every configured group, respecting `depends_on` ordering. Reversible. Use sparingly; prefer `zaz_restart_group` when the change is scoped to one group."
+    )]
+    async fn zaz_restart_all(&self) -> Result<Json<MutationReport>, ErrorData> {
+        let message = client::restart_all(&self.cwd).await.map_err(into_error)?;
+        Ok(Json(MutationReport { message }))
+    }
+
+    /// Reload the project config from disk and apply additions, removals, and modifications.
+    #[tool(
+        name = "zaz_reload_config",
+        description = "Re-read `zaz.toml`/`zaz.json` from disk. Added groups start, removed groups stop, and modified groups restart. The response message summarises counts; on parse or validation failure the daemon's error message is surfaced verbatim."
+    )]
+    async fn zaz_reload_config(&self) -> Result<Json<MutationReport>, ErrorData> {
+        let message = client::reload_config(&self.cwd)
+            .await
+            .map_err(into_error)?;
+        Ok(Json(MutationReport { message }))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -148,23 +204,40 @@ mod tests {
     }
 
     #[test]
-    fn tool_router_lists_all_read_tools() {
+    fn tool_router_lists_all_tools() {
+        let router = ZazMcpServer::tool_router();
+        let tools = router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        for expected in [
+            "zaz_status",
+            "zaz_list_groups",
+            "zaz_logs",
+            "zaz_config",
+            "zaz_restart_group",
+            "zaz_restart_process",
+            "zaz_restart_all",
+            "zaz_reload_config",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing {expected} in {names:?}"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            8,
+            "expected exactly eight tools, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn tool_router_does_not_expose_shutdown() {
         let router = ZazMcpServer::tool_router();
         let tools = router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert!(
-            names.contains(&"zaz_status"),
-            "missing zaz_status in {names:?}"
+            !names.iter().any(|n| n.contains("shutdown")),
+            "shutdown tool must not be exposed; got {names:?}"
         );
-        assert!(
-            names.contains(&"zaz_list_groups"),
-            "missing zaz_list_groups in {names:?}"
-        );
-        assert!(names.contains(&"zaz_logs"), "missing zaz_logs in {names:?}");
-        assert!(
-            names.contains(&"zaz_config"),
-            "missing zaz_config in {names:?}"
-        );
-        assert_eq!(names.len(), 4, "expected exactly four tools, got {names:?}");
     }
 }

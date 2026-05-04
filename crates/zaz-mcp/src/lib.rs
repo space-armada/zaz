@@ -13,6 +13,7 @@ pub use server::{run, ZazMcpServer};
 pub use types::{
     ConfigDaemon, ConfigGroup, ConfigReport, ConfigSettings, ConfigTask, DaemonStatusReport,
     GroupReport, GroupStatusReport, GroupSummary, GroupsReport, LogEntry, LogFormatReport,
-    LogSourceReport, LogsReport, LogsRequest, OutputKindReport, ProcessKind, ProcessReport,
-    ProcessStatusReport, SignalReport, SilenceReport, StatusReport,
+    LogSourceReport, LogsReport, LogsRequest, MutationReport, OutputKindReport, ProcessKind,
+    ProcessReport, ProcessStatusReport, RestartGroupRequest, RestartProcessRequest, SignalReport,
+    SilenceReport, StatusReport,
 };

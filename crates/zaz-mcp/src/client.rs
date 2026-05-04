@@ -74,6 +74,60 @@ pub async fn fetch_logs(cwd: &Path, req: &LogsRequest) -> Result<LogsPage, McpEr
     }
 }
 
+/// Restart a single group by name.
+pub async fn restart_group(cwd: &Path, name: &str) -> Result<String, McpError> {
+    send_mutation(
+        cwd,
+        ApiRequest::RestartGroup {
+            name: name.to_string(),
+        },
+        "restart_group",
+    )
+    .await
+}
+
+/// Restart a single process within a group.
+pub async fn restart_process(
+    cwd: &Path,
+    group: &str,
+    process: &str,
+) -> Result<String, McpError> {
+    send_mutation(
+        cwd,
+        ApiRequest::RestartProcess {
+            group: group.to_string(),
+            process: process.to_string(),
+        },
+        "restart_process",
+    )
+    .await
+}
+
+/// Restart every configured group.
+pub async fn restart_all(cwd: &Path) -> Result<String, McpError> {
+    send_mutation(cwd, ApiRequest::RestartAll, "restart_all").await
+}
+
+/// Reload the project configuration from disk.
+pub async fn reload_config(cwd: &Path) -> Result<String, McpError> {
+    send_mutation(cwd, ApiRequest::ReloadConfig, "reload_config").await
+}
+
+async fn send_mutation(
+    cwd: &Path,
+    request: ApiRequest,
+    operation: &'static str,
+) -> Result<String, McpError> {
+    let mut client = open_client(cwd).await?;
+    match client.request(&request).await? {
+        ApiResponse::Ok { message } => Ok(message.unwrap_or_else(|| "ok".to_string())),
+        ApiResponse::Error { message } => Err(McpError::DaemonRefused { operation, message }),
+        other => Err(McpError::UnexpectedResponse(format!(
+            "expected Ok for {operation}, got {other:?}"
+        ))),
+    }
+}
+
 /// Discover and load the project config file by walking upward from `cwd`.
 pub fn discover_config(cwd: &Path) -> Result<(PathBuf, Config), McpError> {
     let path = discover_config_upward(cwd).ok_or_else(|| McpError::NoConfig {
@@ -134,6 +188,52 @@ mod tests {
         assert!(
             msg.contains("could not resolve daemon socket") || msg.contains("no zaz config found"),
             "expected actionable message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_group_returns_daemon_not_running_when_socket_absent() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("zaz.toml"), "[settings]\n").unwrap();
+        let err = restart_group(tmp.path(), "backend").await.unwrap_err();
+        assert!(
+            matches!(err, McpError::DaemonNotRunning { .. }),
+            "expected DaemonNotRunning, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_process_returns_daemon_not_running_when_socket_absent() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("zaz.toml"), "[settings]\n").unwrap();
+        let err = restart_process(tmp.path(), "backend", "server")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, McpError::DaemonNotRunning { .. }),
+            "expected DaemonNotRunning, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_all_returns_daemon_not_running_when_socket_absent() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("zaz.toml"), "[settings]\n").unwrap();
+        let err = restart_all(tmp.path()).await.unwrap_err();
+        assert!(
+            matches!(err, McpError::DaemonNotRunning { .. }),
+            "expected DaemonNotRunning, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_config_returns_daemon_not_running_when_socket_absent() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("zaz.toml"), "[settings]\n").unwrap();
+        let err = reload_config(tmp.path()).await.unwrap_err();
+        assert!(
+            matches!(err, McpError::DaemonNotRunning { .. }),
+            "expected DaemonNotRunning, got: {err:?}"
         );
     }
 

@@ -119,6 +119,33 @@ pub struct LogsRequest {
     pub search: Option<String>,
 }
 
+/// Input parameters for the `zaz_restart_group` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RestartGroupRequest {
+    /// Name of the group to restart. Must match a group declared in `zaz.toml`/`zaz.json`.
+    pub name: String,
+}
+
+/// Input parameters for the `zaz_restart_process` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RestartProcessRequest {
+    /// Group the process belongs to.
+    pub group: String,
+    /// Process name. Matches the `name` field of a task or daemon entry inside the group.
+    pub process: String,
+}
+
+/// Confirmation response returned by all mutation tools.
+///
+/// Carries the daemon's free-form acknowledgement string so the agent can
+/// surface it verbatim. Daemon-side failures are returned as MCP errors, not
+/// as a `MutationReport` with an error flag.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MutationReport {
+    /// Human-readable summary of the operation, e.g. "restart initiated for group 'backend'".
+    pub message: String,
+}
+
 /// Paginated log query response for the `zaz_logs` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LogsReport {
@@ -594,5 +621,8 @@ mod tests {
         let _ = schemars::schema_for!(LogsReport);
         let _ = schemars::schema_for!(LogsRequest);
         let _ = schemars::schema_for!(ConfigReport);
+        let _ = schemars::schema_for!(RestartGroupRequest);
+        let _ = schemars::schema_for!(RestartProcessRequest);
+        let _ = schemars::schema_for!(MutationReport);
     }
 }

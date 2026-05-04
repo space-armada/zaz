@@ -39,4 +39,12 @@ pub enum McpError {
     /// The daemon returned a response shape the client did not expect.
     #[error("unexpected daemon response: {0}")]
     UnexpectedResponse(String),
+
+    /// The daemon understood the request but refused to perform the operation,
+    /// e.g. an unknown group name or a config reload that fails to parse.
+    #[error("daemon refused {operation}: {message}")]
+    DaemonRefused {
+        operation: &'static str,
+        message: String,
+    },
 }
