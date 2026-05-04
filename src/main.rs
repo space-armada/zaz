@@ -115,7 +115,11 @@ enum Commands {
     Ignores,
 
     /// Run the MCP tool server over stdio
-    Mcp,
+    Mcp {
+        /// Spawn a background daemon at startup if one is not already running
+        #[arg(long)]
+        autostart: bool,
+    },
 }
 
 /// Effective TUI options after merging CLI flags with user config.
@@ -583,10 +587,75 @@ async fn try_main() -> Result<()> {
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             show_ignores()
         }
-        Some(Commands::Mcp) => {
-            prepare_log_files(&explicit_log_paths)?;
-            _log_guard = init_tracing_stderr(cli.debug, cli.log_file.as_deref());
-            zaz_mcp::run().await.map_err(anyhow::Error::from)
+        Some(Commands::Mcp { autostart }) => {
+            let socket_path =
+                resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+
+            if autostart {
+                let config_path = find_config(&cli.config)?;
+                let daemon_log_file =
+                    resolve_autostart_daemon_log_file(cli.debug, cli.log_file.as_deref())?;
+                let daemon_output_log =
+                    resolve_autostart_daemon_output_log(cli.log_file.as_deref())?;
+
+                let mut log_paths = explicit_log_paths.clone();
+                if let Some(path) = &daemon_log_file {
+                    log_paths.push(path.clone());
+                }
+                log_paths.push(daemon_output_log.clone());
+                prepare_log_files(&log_paths)?;
+
+                _log_guard = init_tracing_stderr(cli.debug, cli.log_file.as_deref());
+
+                let check_timeout = Duration::from_secs(1);
+                if !matches!(
+                    check_daemon_availability(&socket_path, check_timeout).await,
+                    DaemonAvailability::Running
+                ) {
+                    tracing::info!(
+                        socket = %socket_path.display(),
+                        daemon_output_log = %daemon_output_log.display(),
+                        "auto-starting daemon for MCP session"
+                    );
+                    let mut handle = start_daemon_via_launcher(
+                        &config_path,
+                        &socket_path,
+                        cli.debug,
+                        daemon_log_file.as_deref(),
+                        &daemon_output_log,
+                    )?;
+                    match wait_for_daemon_ready(
+                        &socket_path,
+                        &mut handle,
+                        20,
+                        Duration::from_millis(100),
+                    )
+                    .await?
+                    {
+                        DaemonReadyOutcome::Ready => {}
+                        DaemonReadyOutcome::Crashed(status) => bail!(
+                            "daemon exited before becoming ready (status: {}); see {} for details",
+                            status,
+                            daemon_output_log.display()
+                        ),
+                        DaemonReadyOutcome::Timeout => bail!(
+                            "daemon did not become ready within 2s; see {} for details",
+                            daemon_output_log.display()
+                        ),
+                    }
+                }
+            } else {
+                prepare_log_files(&explicit_log_paths)?;
+                _log_guard = init_tracing_stderr(cli.debug, cli.log_file.as_deref());
+            }
+
+            zaz_mcp::run(zaz_mcp::McpRunOptions {
+                cwd: current_dir.clone(),
+                socket_path,
+                explicit_config: cli.config.clone(),
+            })
+            .await
+            .map_err(anyhow::Error::from)
         }
         None => {
             let config_path = find_config(&cli.config)?;

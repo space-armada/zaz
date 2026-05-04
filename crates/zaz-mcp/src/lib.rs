@@ -9,7 +9,7 @@ mod server;
 mod types;
 
 pub use error::McpError;
-pub use server::{run, ZazMcpServer};
+pub use server::{run, McpRunOptions, ZazMcpServer};
 pub use types::{
     ConfigDaemon, ConfigGroup, ConfigReport, ConfigSettings, ConfigTask, DaemonStatusReport,
     GroupReport, GroupStatusReport, GroupSummary, GroupsReport, LogEntry, LogFormatReport,
