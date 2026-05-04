@@ -67,6 +67,7 @@ zaz start           # Start the daemon in the background and exit
 zaz status          # Show daemon status
 zaz restart [group] # Restart a group (or all)
 zaz stop            # Stop the running daemon
+zaz mcp             # Run the MCP tool server over stdio
 zaz ignores         # Show default ignore patterns
 ```
 
@@ -91,6 +92,16 @@ additionally writes structured tracing output to `tui-debug.log` and
 `daemon-debug.log` in the same directory. All three files are rotated by
 size and old rotated files are pruned first if the directory exceeds its
 storage budget.
+
+## MCP Tool Server
+
+`zaz mcp` exposes the daemon's status, log, and restart operations as MCP
+tools so AI assistants like Claude Code and Cursor can drive zaz directly.
+The server reuses the daemon's existing Unix socket API and the same
+CWD-based discovery as every other zaz subcommand.
+
+See [`docs/mcp.md`](docs/mcp.md) for the tool list, client configuration
+examples, and `--autostart` / `--socket` / `--config` overrides.
 
 ## User Configuration
 
