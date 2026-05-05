@@ -5,7 +5,30 @@ zaz :: putting the zaz in pizzazz
 A modern file-watching task runner and process manager for development
 environments, heavily inspired by `modd`.
 
-## Quick Start
+## Overview
+
+zaz watches files, runs tasks, and supervises long-running daemons. A
+background daemon owns process state and exposes a Unix socket API; the TUI,
+one-shot CLI, and MCP tool server are all clients of that daemon.
+
+## Install
+
+From a clone of this repo:
+
+```bash
+cargo install --path .   # or: make install
+```
+
+Build without installing:
+
+```bash
+cargo build --release    # or: make release
+```
+
+The `Makefile` lists the common dev targets (`build`, `test`, `lint`, `fmt`,
+`ci`, `watch`).
+
+## Quick start
 
 Create a `zaz.toml` in your project root:
 
@@ -30,143 +53,44 @@ zaz
 ```
 
 Plain `zaz` opens the TUI. If a daemon is already running for the target
-socket, the TUI reuses it; otherwise zaz autostarts one unless you pass
-`--no-autostart`.
+socket, the TUI reuses it; otherwise zaz autostarts one. Both `zaz.toml` and
+`zaz.json` are accepted; see [docs/configuration.md](docs/configuration.md)
+for the full schema.
 
-## Minimal Configuration
+## Core concepts
 
-The simplest valid configuration requires at least one group with a name and
-either patterns or commands:
+- **Groups** bind a set of file patterns to one or more commands. When a
+  watched file changes, the group's tasks and daemons are re-run.
+- **Tasks** run to completion. Use them for builds, tests, codegen, or any
+  step that finishes.
+- **Daemons** are long-running processes. zaz starts them on launch and
+  signals them on change so they restart cleanly.
+- **Patterns** are glob expressions over the working tree; a group can also
+  list `ignore` patterns.
+- **`depends_on`** orders groups so one group's tasks can complete before
+  another starts (for example, build before serve).
 
-```toml
-[[group]]
-name = "example"
-patterns = ["**/*.txt"]
-```
+## Lifecycle
 
-Or in JSON:
+The daemon is the source of truth for process state. Plain `zaz` autostarts a
+daemon if needed and opens the TUI against it. `zaz start` launches a daemon
+in the background; `zaz stop` and `zaz status` manage and inspect it. `zaz
+daemon` runs the daemon in the foreground for direct supervision. `zaz task`
+runs the configured tasks once and exits without starting a daemon. Full
+command, flag, and exit-code reference lives in
+[docs/cli.md](docs/cli.md).
 
-```json
-{
-  "groups": [
-    {
-      "name": "example",
-      "patterns": ["**/*.txt"]
-    }
-  ]
-}
-```
+## Documentation
 
-## Commands
-
-```bash
-zaz                 # Open the TUI (reuses or autostarts a daemon)
-zaz task            # Run task commands once and exit
-zaz daemon          # Run the daemon in the foreground
-zaz start           # Start the daemon in the background and exit
-zaz status          # Show daemon status
-zaz restart [group] # Restart a group (or all)
-zaz stop            # Stop the running daemon
-zaz mcp             # Run the MCP tool server over stdio
-zaz ignores         # Show default ignore patterns
-```
-
-## TUI Options
-
-```bash
-zaz --full          # Full style: split panes with group tree + logs
-zaz --multi-pane    # Multi-pane style: one pane per task
-zaz --no-autostart  # Don't autostart a daemon before opening the TUI
-zaz --stop-on-exit  # Stop the connected daemon when the TUI exits
-zaz --debug         # Write TUI debug logs to a default file and propagate debug to an autostarted daemon
-zaz --log-file /tmp/zaz.log  # Override the TUI debug log file; autostarted daemon uses a sibling *.daemon.log file
-```
-
-Press `F1`/`F2` to switch between Full and Multi Pane styles at runtime.
-
-zaz writes daemon log files to `$XDG_STATE_HOME/zaz/` when set, otherwise
-`~/.local/state/zaz/`. `daemon-output.log` is always written for daemons
-launched via TUI autostart or `zaz start`; it captures panics and pre-init
-errors that would otherwise be lost. With `zaz --debug` in TUI mode, zaz
-additionally writes structured tracing output to `tui-debug.log` and
-`daemon-debug.log` in the same directory. All three files are rotated by
-size and old rotated files are pruned first if the directory exceeds its
-storage budget.
-
-## MCP Tool Server
-
-`zaz mcp` exposes the daemon's status, log, and restart operations as MCP
-tools so AI assistants like Claude Code and Cursor can drive zaz directly.
-The server reuses the daemon's existing Unix socket API and the same
-CWD-based discovery as every other zaz subcommand.
-
-See [`docs/mcp.md`](docs/mcp.md) for the tool list, client configuration
-examples, and `--autostart` / `--socket` / `--config` overrides.
-
-## User Configuration
-
-User preferences are stored separately from project configuration at
-`~/.config/zaz/config.toml` (following XDG Base Directory specification):
-
-```toml
-# Don't autostart a daemon before opening the TUI
-no_autostart = false
-
-# Disable blinking/animation effects
-disable_animations = false
-
-# Default TUI style: "full" or "multi_pane"
-tui_style = "full"
-```
-
-These settings are optional - zaz works fine without a user config file.
-CLI flags take precedence over user config values. The legacy value
-`"minimal"` is still accepted as an alias for `"multi_pane"`.
-
-## Keyboard Shortcuts
-
-### Navigation
-
-| Key | Action |
-|-----|--------|
-| `j`/`k`, `↓`/`↑` | Move down/up |
-| `h`/`l`, `←`/`→` | Move left/right |
-| `Tab` | Switch focus/pane |
-| `g`/`G` | Go to top/bottom of logs |
-| `PgUp`/`PgDn` | Scroll logs by page |
-
-### Actions
-
-| Key | Action |
-|-----|--------|
-| `r` | Restart selected group |
-| `R` | Restart all groups |
-| `c` | Clear logs |
-| `F` | Toggle follow mode |
-
-### Search & Filter
-
-| Key | Action |
-|-----|--------|
-| `/` | Start search |
-| `f` | Start filter |
-| `n`/`N` | Next/previous match |
-| `Esc` | Clear search/filter |
-
-### Style
-
-| Key | Action |
-|-----|--------|
-| `F1` | Switch to Full style |
-| `F2` | Switch to Multi Pane style |
-| `[`/`]` | Previous/next page (Multi Pane, >6 tasks) |
-
-### General
-
-| Key | Action |
-|-----|--------|
-| `q` | Quit |
-| `?` | Toggle help overlay |
+- [docs/configuration.md](docs/configuration.md) — project config
+  (`zaz.toml`/`zaz.json`) reference.
+- [docs/user-configuration.md](docs/user-configuration.md) — per-user
+  preferences and XDG paths.
+- [docs/cli.md](docs/cli.md) — CLI command, flag, exit-code, and log-file
+  reference.
+- [docs/tui.md](docs/tui.md) — TUI styles, modes, and keyboard shortcuts.
+- [docs/mcp.md](docs/mcp.md) — MCP tool server (`zaz mcp`) and client
+  configuration.
 
 ## License
 
