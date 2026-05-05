@@ -2,6 +2,8 @@
 //!
 //! This crate re-exports the main components from the zaz workspace.
 
+pub mod cli;
+
 pub use zaz_config as config;
 pub use zaz_daemon as daemon;
 pub use zaz_process as process;

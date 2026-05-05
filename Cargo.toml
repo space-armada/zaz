@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/xtask",
     "crates/zaz-config",
     "crates/zaz-daemon",
     "crates/zaz-mcp",

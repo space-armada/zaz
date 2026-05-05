@@ -1,4 +1,4 @@
-.PHONY: all build check clean fmt fmt-check lint lint-md lint-rust test
+.PHONY: all build check ci clean docs-check docs-cli fmt fmt-check lint lint-md lint-rust test
 
 # Default target
 all: check
@@ -31,7 +31,13 @@ fmt-check:
 	cargo fmt --check
 	bin/rumdl check .
 
-ci: fmt-check lint build test
+ci: fmt-check lint build test docs-check
+
+docs-cli:
+	cargo run --quiet -p xtask -- docs-cli --write
+
+docs-check:
+	cargo run --quiet -p xtask -- docs-cli
 
 clean:
 	cargo clean
