@@ -33,7 +33,7 @@ fn restart_discovers_project_socket_from_nested_directory() {
     let expected_socket = zaz_dir.join("daemon.sock");
 
     assert!(!output.status.success());
-    assert!(stderr.contains("No daemon running (could not connect to"));
+    assert!(stderr.contains("no daemon running at"));
     assert!(stderr.contains(expected_socket.to_string_lossy().as_ref()));
     assert!(!stderr.contains("could not resolve daemon socket"));
 }
@@ -53,7 +53,7 @@ fn restart_uses_explicit_socket_outside_any_project() {
     let stderr = stderr_string(&output);
 
     assert!(!output.status.success());
-    assert!(stderr.contains("No daemon running (could not connect to"));
+    assert!(stderr.contains("no daemon running at"));
     assert!(stderr.contains(&explicit_socket_string));
     assert!(!stderr.contains("could not resolve daemon socket"));
 }
@@ -88,7 +88,7 @@ fn restart_discovers_json_project_when_toml_is_absent() {
     let stderr = stderr_string(&output);
 
     assert!(!output.status.success());
-    assert!(stderr.contains("No daemon running (could not connect to"));
+    assert!(stderr.contains("no daemon running at"));
     assert!(stderr.contains(expected_socket.to_string_lossy().as_ref()));
     assert!(!stderr.contains("could not resolve daemon socket"));
 }

@@ -212,8 +212,6 @@ pub enum ValidationErrorKind {
         group: String,
         /// The duplicated name.
         name: String,
-        /// Whether the name was explicitly set.
-        is_explicit: bool,
     },
     /// Daemon has empty command.
     EmptyDaemonCommand {
@@ -228,8 +226,6 @@ pub enum ValidationErrorKind {
         group: String,
         /// The duplicated name.
         name: String,
-        /// Whether the name was explicitly set.
-        is_explicit: bool,
     },
 }
 
@@ -311,21 +307,8 @@ impl fmt::Display for ValidationErrorKind {
             Self::EmptyTaskCommand { group, task } => {
                 write!(f, "group '{}': task '{}' has empty command", group, task)
             }
-            Self::DuplicateTaskName {
-                group,
-                name,
-                is_explicit,
-            } => {
-                let hint = if *is_explicit {
-                    ""
-                } else {
-                    " (use explicit 'name' field to disambiguate)"
-                };
-                write!(
-                    f,
-                    "group '{}': duplicate task name '{}'{}",
-                    group, name, hint
-                )
+            Self::DuplicateTaskName { group, name } => {
+                write!(f, "group '{}': duplicate task name '{}'", group, name)
             }
             Self::EmptyDaemonCommand { group, daemon } => {
                 write!(
@@ -334,21 +317,8 @@ impl fmt::Display for ValidationErrorKind {
                     group, daemon
                 )
             }
-            Self::DuplicateDaemonName {
-                group,
-                name,
-                is_explicit,
-            } => {
-                let hint = if *is_explicit {
-                    ""
-                } else {
-                    " (use explicit 'name' field to disambiguate)"
-                };
-                write!(
-                    f,
-                    "group '{}': duplicate daemon name '{}'{}",
-                    group, name, hint
-                )
+            Self::DuplicateDaemonName { group, name } => {
+                write!(f, "group '{}': duplicate daemon name '{}'", group, name)
             }
         }
     }

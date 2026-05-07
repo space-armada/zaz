@@ -12,9 +12,10 @@ use tokio::sync::mpsc;
 use zaz::cli::{Cli, Commands};
 use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
 use zaz_daemon::{
-    resolve_socket, socket_path_for_config, ApiRequest, ApiResponse, Client, Engine, EngineCommand,
-    Server,
+    resolve_socket, socket_path_for_config, ApiRequest, ApiResponse, Client, DaemonError, Engine,
+    EngineCommand, Server,
 };
+use zaz_mcp::McpError;
 use zaz_process::{DaemonLauncher, LaunchHandle};
 
 /// Effective TUI options after merging CLI flags with user config.
@@ -386,13 +387,59 @@ async fn main() {
         Ok(()) => 0,
         Err(err) if err.downcast_ref::<StatusNotRunning>().is_some() => 3,
         Err(err) => {
-            eprintln!("Error: {err}");
+            report_error(&err);
             1
         }
     };
 
     if exit_code != 0 {
         std::process::exit(exit_code);
+    }
+}
+
+/// Walk an `anyhow::Error` chain and return the first structured recovery hint
+/// it carries, if any. Recognized error types: [`DaemonError`], [`McpError`],
+/// [`NoDaemon`], and `zaz_config::ValidationError`.
+fn error_hint(err: &anyhow::Error) -> Option<String> {
+    for cause in err.chain() {
+        if let Some(de) = cause.downcast_ref::<DaemonError>() {
+            if let Some(h) = de.hint() {
+                return Some(h.to_string());
+            }
+        }
+        if let Some(me) = cause.downcast_ref::<McpError>() {
+            if let Some(h) = me.hint() {
+                return Some(h.to_string());
+            }
+        }
+        if let Some(nd) = cause.downcast_ref::<NoDaemon>() {
+            return Some(nd.hint().to_string());
+        }
+    }
+    None
+}
+
+/// Print an operator-facing error to stderr in the same shape as
+/// `check_config`'s validation printer: an `Error: <message>` line, and a
+/// `       hint: <recovery>` line indented underneath when the underlying
+/// error type provides one. Labels are styled when stderr is a TTY and emitted
+/// as plain text otherwise so the output remains substring-searchable for
+/// scripted consumers.
+fn report_error(err: &anyhow::Error) {
+    use std::io::IsTerminal;
+    use yansi::Paint;
+
+    let hint = error_hint(err);
+    if std::io::stderr().is_terminal() {
+        eprintln!("{}: {}", "Error".red().bold(), err);
+        if let Some(hint) = hint {
+            eprintln!("       {}: {}", "hint".cyan().bold(), hint);
+        }
+    } else {
+        eprintln!("Error: {err}");
+        if let Some(hint) = hint {
+            eprintln!("       hint: {hint}");
+        }
     }
 }
 
@@ -595,6 +642,62 @@ impl fmt::Display for StatusNotRunning {
 }
 
 impl std::error::Error for StatusNotRunning {}
+
+/// Operator-facing error raised when a daemon-API verb cannot reach the daemon
+/// because no socket is listening. Carries the socket path that was tried and
+/// exposes a structured recovery hint for the top-level error printer.
+#[derive(Debug, Clone)]
+struct NoDaemon {
+    socket_path: PathBuf,
+}
+
+impl NoDaemon {
+    fn new(socket_path: &Path) -> Self {
+        Self {
+            socket_path: socket_path.to_path_buf(),
+        }
+    }
+
+    fn hint(&self) -> &'static str {
+        "start a daemon with `zaz start`, or set --socket <PATH> if the daemon is running on a different socket"
+    }
+}
+
+impl fmt::Display for NoDaemon {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no daemon running at {}", self.socket_path.display())
+    }
+}
+
+impl std::error::Error for NoDaemon {}
+
+/// Connect to the daemon at `socket_path`. On connection failure, returns a
+/// `NoDaemon` error wrapped via `anyhow::Error` so the top-level printer can
+/// surface its recovery hint.
+async fn connect_or_no_daemon(socket_path: &Path) -> Result<Client> {
+    Client::connect(socket_path)
+        .await
+        .map_err(|_| anyhow::Error::from(NoDaemon::new(socket_path)))
+}
+
+/// Render the daemon's response to a control-plane verb: print the success
+/// message on the `Ok` arm, fail with `"{verb} failed: {message}"` on the
+/// `Error` arm, and fail with `"{verb} returned unexpected response"` for any
+/// other shape. `default_ok` is used when `ApiResponse::Ok` carries no message.
+fn handle_daemon_response(response: ApiResponse, verb: &str, default_ok: &str) -> Result<()> {
+    match response {
+        ApiResponse::Ok { message } => {
+            println!("{}", message.unwrap_or_else(|| default_ok.to_string()));
+            Ok(())
+        }
+        ApiResponse::Error { message } => {
+            bail!("{verb} failed: {message}");
+        }
+        _ => {
+            bail!("{verb} returned unexpected response");
+        }
+    }
+}
 
 /// Find the configuration file.
 fn find_config(explicit: &Option<PathBuf>) -> Result<PathBuf> {
@@ -813,10 +916,14 @@ async fn show_status(socket_path: &Path) -> Result<()> {
     let mut client = match Client::connect(socket_path).await {
         Ok(c) => c,
         Err(_) => {
-            println!(
-                "No daemon running (could not connect to {})",
-                socket_path.display()
-            );
+            // Status's "no daemon" path bypasses the top-level error printer so
+            // the message lands on stdout (per ZAZ-005 query-command semantics)
+            // and the process exits 3 via `StatusNotRunning`. Render the same
+            // bare message + indented hint shape the printer produces for
+            // stderr-routed errors.
+            let no_daemon = NoDaemon::new(socket_path);
+            println!("{}", no_daemon);
+            println!("       hint: {}", no_daemon.hint());
             return Err(StatusNotRunning.into());
         }
     };
@@ -846,28 +953,14 @@ async fn show_status(socket_path: &Path) -> Result<()> {
             if let Some(ts) = state.last_change {
                 println!("Last change: {} ms ago", now_ms() - ts);
             }
+            Ok(())
         }
-        ApiResponse::Error { message } => {
-            bail!("status request failed: {}", message);
-        }
-        _ => {
-            bail!("status request returned unexpected response");
-        }
+        other => handle_daemon_response(other, "status request", ""),
     }
-
-    Ok(())
 }
 
 async fn restart(socket_path: &Path, group: Option<String>) -> Result<()> {
-    let mut client = match Client::connect(socket_path).await {
-        Ok(c) => c,
-        Err(_) => {
-            anyhow::bail!(
-                "No daemon running (could not connect to {})",
-                socket_path.display()
-            );
-        }
-    };
+    let mut client = connect_or_no_daemon(socket_path).await?;
 
     let request = match group {
         Some(name) => ApiRequest::RestartGroup { name },
@@ -875,77 +968,27 @@ async fn restart(socket_path: &Path, group: Option<String>) -> Result<()> {
     };
 
     let response = client.request(&request).await?;
-    match response {
-        ApiResponse::Ok { message } => {
-            println!("{}", message.unwrap_or_else(|| "OK".to_string()));
-        }
-        ApiResponse::Error { message } => {
-            anyhow::bail!("Error: {}", message);
-        }
-        _ => {
-            anyhow::bail!("Unexpected response");
-        }
-    }
-
-    Ok(())
+    handle_daemon_response(response, "restart", "OK")
 }
 
 async fn stop_daemon(socket_path: &Path) -> Result<()> {
     let mut client = match Client::connect(socket_path).await {
         Ok(c) => c,
         Err(_) => {
+            // Idempotent: a stop that finds no daemon exits 0.
             println!("No daemon running");
             return Ok(());
         }
     };
 
     let response = client.request(&ApiRequest::Shutdown).await?;
-    match response {
-        ApiResponse::Ok { message } => {
-            println!(
-                "{}",
-                message.unwrap_or_else(|| "Shutdown initiated".to_string())
-            );
-        }
-        ApiResponse::Error { message } => {
-            anyhow::bail!("Error: {}", message);
-        }
-        _ => {
-            anyhow::bail!("Unexpected response");
-        }
-    }
-
-    Ok(())
+    handle_daemon_response(response, "stop", "Shutdown initiated")
 }
 
 async fn reload_config(socket_path: &Path) -> Result<()> {
-    let mut client = match Client::connect(socket_path).await {
-        Ok(c) => c,
-        Err(_) => {
-            anyhow::bail!(
-                "No daemon running (could not connect to {})",
-                socket_path.display()
-            );
-        }
-    };
-
+    let mut client = connect_or_no_daemon(socket_path).await?;
     let response = client.request(&ApiRequest::ReloadConfig).await?;
-    match response {
-        ApiResponse::Ok { message } => {
-            println!(
-                "{}",
-                message.unwrap_or_else(|| "Configuration reloaded".to_string())
-            );
-        }
-        ApiResponse::Error { message } => {
-            anyhow::bail!("Error: {}", message);
-        }
-        _ => {
-            anyhow::bail!("Unexpected response");
-        }
-    }
-
-    Ok(())
+    handle_daemon_response(response, "reload", "Configuration reloaded")
 }
 
 fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
@@ -1438,6 +1481,81 @@ mod tests {
     }
 
     #[test]
+    fn no_daemon_display_includes_socket_path() {
+        let nd = NoDaemon::new(Path::new("/tmp/zaz.sock"));
+        assert_eq!(nd.to_string(), "no daemon running at /tmp/zaz.sock");
+    }
+
+    #[test]
+    fn no_daemon_hint_points_at_zaz_start_and_socket_flag() {
+        let nd = NoDaemon::new(Path::new("/tmp/zaz.sock"));
+        assert_eq!(
+            nd.hint(),
+            "start a daemon with `zaz start`, or set --socket <PATH> if the daemon is running on a different socket"
+        );
+    }
+
+    #[test]
+    fn error_hint_surfaces_daemon_error_recovery() {
+        let err: anyhow::Error = DaemonError::SocketResolution {
+            start_dir: PathBuf::from("/tmp/outside"),
+        }
+        .into();
+        assert_eq!(
+            error_hint(&err).as_deref(),
+            Some("run this command from a zaz project directory or pass --socket <PATH>")
+        );
+    }
+
+    #[test]
+    fn error_hint_surfaces_no_daemon_recovery() {
+        let err: anyhow::Error = NoDaemon::new(Path::new("/tmp/zaz.sock")).into();
+        assert_eq!(
+            error_hint(&err).as_deref(),
+            Some("start a daemon with `zaz start`, or set --socket <PATH> if the daemon is running on a different socket")
+        );
+    }
+
+    #[test]
+    fn error_hint_returns_none_when_no_structured_error_in_chain() {
+        let err = anyhow::anyhow!("some plain error");
+        assert_eq!(error_hint(&err), None);
+    }
+
+    #[test]
+    fn handle_daemon_response_ok_prints_message_and_succeeds() {
+        let result = handle_daemon_response(
+            ApiResponse::Ok {
+                message: Some("done".into()),
+            },
+            "restart",
+            "OK",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn handle_daemon_response_error_uses_verb_failed_template() {
+        let result = handle_daemon_response(
+            ApiResponse::Error {
+                message: "group 'foo' not found".into(),
+            },
+            "restart",
+            "OK",
+        );
+        let err = result.expect_err("error arm should bail");
+        assert_eq!(err.to_string(), "restart failed: group 'foo' not found");
+    }
+
+    #[test]
+    fn handle_daemon_response_unexpected_uses_verb_returned_unexpected_template() {
+        let result =
+            handle_daemon_response(ApiResponse::EndOfStream, "reload", "Configuration reloaded");
+        let err = result.expect_err("unexpected arm should bail");
+        assert_eq!(err.to_string(), "reload returned unexpected response");
+    }
+
+    #[test]
     fn tui_options_include_cli_stop_on_exit_flag() {
         let cli = parse_cli(&["zaz", "--stop-on-exit"]);
         let options = TuiOptions::from_cli_and_user_config(&cli, &UserConfig::default());
@@ -1660,8 +1778,11 @@ mod tests {
         }
 
         let message = err.to_string();
-        assert!(message.contains("--socket <PATH>"));
-        assert!(message.contains("zaz project directory"));
+        assert!(message.contains("could not resolve daemon socket from"));
+        assert_eq!(
+            daemon_err.hint(),
+            Some("run this command from a zaz project directory or pass --socket <PATH>")
+        );
         Ok(())
     }
 
@@ -1715,8 +1836,11 @@ mod tests {
         }
 
         let message = err.to_string();
-        assert!(message.contains("--socket <PATH>"));
-        assert!(message.contains("zaz project directory"));
+        assert!(message.contains("could not resolve daemon socket from"));
+        assert_eq!(
+            daemon_err.hint(),
+            Some("run this command from a zaz project directory or pass --socket <PATH>")
+        );
         Ok(())
     }
 

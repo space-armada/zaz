@@ -273,7 +273,7 @@ fn stop_returns_nonzero_on_unexpected_response() {
     server.join().expect("fake server thread should finish");
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr.contains("Unexpected response"));
+    assert!(stderr.contains("stop returned unexpected response"));
 }
 
 #[test]
@@ -286,8 +286,9 @@ fn status_returns_exit_code_3_when_daemon_is_not_running() {
     let stdout = stdout_string(&output);
 
     assert_eq!(output.status.code(), Some(3));
-    assert!(stdout.contains("No daemon running (could not connect to"));
+    assert!(stdout.contains("no daemon running at"));
     assert!(stdout.contains(socket));
+    assert!(stdout.contains("hint: start a daemon with `zaz start`"));
 }
 
 #[test]
@@ -379,7 +380,7 @@ fn restart_returns_nonzero_on_unexpected_response() {
     server.join().expect("fake server thread should finish");
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr.contains("Unexpected response"));
+    assert!(stderr.contains("restart returned unexpected response"));
 }
 
 #[test]
@@ -392,8 +393,9 @@ fn reload_returns_nonzero_when_daemon_is_not_running() {
     let stderr = stderr_string(&output);
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr.contains("No daemon running (could not connect to"));
+    assert!(stderr.contains("no daemon running at"));
     assert!(stderr.contains(socket));
+    assert!(stderr.contains("hint: start a daemon with `zaz start`"));
 }
 
 #[test]
@@ -415,7 +417,7 @@ fn reload_returns_nonzero_on_api_error() {
     server.join().expect("fake server thread should finish");
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr.contains("Error: reload failed"));
+    assert!(stderr.contains("reload failed: reload failed"));
 }
 
 #[test]
@@ -435,7 +437,7 @@ fn reload_returns_nonzero_on_unexpected_response() {
     server.join().expect("fake server thread should finish");
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr.contains("Unexpected response"));
+    assert!(stderr.contains("reload returned unexpected response"));
 }
 
 #[test]
@@ -604,7 +606,7 @@ fn start_then_stop_brings_status_back_to_not_running() {
         let output = run_zaz(temp.path(), &["--socket", &socket, "status"]);
         if output.status.code() == Some(3) {
             let stdout = stdout_string(&output);
-            assert!(stdout.contains("No daemon running"));
+            assert!(stdout.contains("no daemon running at"));
             return;
         }
         if Instant::now() >= deadline {

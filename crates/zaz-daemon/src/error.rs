@@ -43,9 +43,53 @@ pub enum DaemonError {
     TaskFailed { task: String, error: String },
 
     /// Socket target could not be resolved from the current location.
-    #[error(
-        "could not resolve daemon socket from {}: run this command from a zaz project directory or pass --socket <PATH>",
-        start_dir.display()
-    )]
+    #[error("could not resolve daemon socket from {}", start_dir.display())]
     SocketResolution { start_dir: PathBuf },
+}
+
+impl DaemonError {
+    /// Recovery suggestion for variants where a concrete next step exists.
+    /// Returns `None` for terminal errors with no actionable recovery.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::SocketResolution { .. } => {
+                Some("run this command from a zaz project directory or pass --socket <PATH>")
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_resolution_display_omits_recovery_prose() {
+        let err = DaemonError::SocketResolution {
+            start_dir: PathBuf::from("/tmp/outside"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("could not resolve daemon socket from"));
+        assert!(msg.contains("/tmp/outside"));
+        assert!(!msg.contains("--socket"));
+        assert!(!msg.contains("zaz project directory"));
+    }
+
+    #[test]
+    fn socket_resolution_hint_returns_recovery_prose() {
+        let err = DaemonError::SocketResolution {
+            start_dir: PathBuf::from("/tmp/outside"),
+        };
+        assert_eq!(
+            err.hint(),
+            Some("run this command from a zaz project directory or pass --socket <PATH>")
+        );
+    }
+
+    #[test]
+    fn other_variants_have_no_hint() {
+        assert_eq!(DaemonError::GroupNotFound("x".into()).hint(), None);
+        assert_eq!(DaemonError::CyclicDependency("y".into()).hint(), None);
+    }
 }

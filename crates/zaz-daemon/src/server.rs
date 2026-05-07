@@ -405,7 +405,10 @@ mod tests {
         }
 
         let message = err.to_string();
-        assert!(message.contains("--socket <PATH>"));
-        assert!(message.contains("zaz project directory"));
+        assert!(message.contains("could not resolve daemon socket from"));
+        assert_eq!(
+            err.hint(),
+            Some("run this command from a zaz project directory or pass --socket <PATH>")
+        );
     }
 }

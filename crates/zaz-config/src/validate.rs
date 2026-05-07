@@ -282,13 +282,14 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
                 ));
             }
             if task_names.contains(name) {
-                errors.push(ValidationError::new(
-                    ValidationErrorKind::DuplicateTaskName {
-                        group: group.name.clone(),
-                        name: name.to_string(),
-                        is_explicit: task.has_explicit_name(),
-                    },
-                ));
+                let mut error = ValidationError::new(ValidationErrorKind::DuplicateTaskName {
+                    group: group.name.clone(),
+                    name: name.to_string(),
+                });
+                if !task.has_explicit_name() {
+                    error = error.with_hint("use explicit 'name' field to disambiguate");
+                }
+                errors.push(error);
             }
             task_names.insert(name);
         }
@@ -306,13 +307,14 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
                 ));
             }
             if daemon_names.contains(name) {
-                errors.push(ValidationError::new(
-                    ValidationErrorKind::DuplicateDaemonName {
-                        group: group.name.clone(),
-                        name: name.to_string(),
-                        is_explicit: daemon.has_explicit_name(),
-                    },
-                ));
+                let mut error = ValidationError::new(ValidationErrorKind::DuplicateDaemonName {
+                    group: group.name.clone(),
+                    name: name.to_string(),
+                });
+                if !daemon.has_explicit_name() {
+                    error = error.with_hint("use explicit 'name' field to disambiguate");
+                }
+                errors.push(error);
             }
             daemon_names.insert(name);
         }
