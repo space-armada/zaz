@@ -379,3 +379,17 @@ Current defaults:
 This subcommand takes no arguments or flags.
 
 <!-- END: zaz ignores -->
+
+### zaz completions
+
+Print a shell completion script to stdout for the requested shell. Pipe the
+output into the appropriate completion location for your shell.
+
+<!-- BEGIN: zaz completions -->
+**Positional arguments**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `SHELL` | yes | Shell to generate completions for |
+
+<!-- END: zaz completions -->

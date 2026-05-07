@@ -599,6 +599,11 @@ async fn try_main() -> Result<()> {
             .await
             .map_err(anyhow::Error::from)
         }
+        Some(Commands::Completions { shell }) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
+            generate_completions(shell)
+        }
         None => {
             let config_path = find_config(&cli.config)?;
             let socket_path =
@@ -1142,6 +1147,15 @@ fn show_ignores() -> Result<()> {
         println!("  {}", pattern);
     }
 
+    Ok(())
+}
+
+fn generate_completions(shell: clap_complete::Shell) -> Result<()> {
+    use clap::CommandFactory;
+
+    let mut cmd = Cli::command();
+    let bin_name = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
     Ok(())
 }
 

@@ -111,4 +111,11 @@ pub enum Commands {
         #[arg(long)]
         autostart: bool,
     },
+
+    /// Print a shell completion script to stdout
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }

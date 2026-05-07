@@ -684,6 +684,42 @@ fn start_is_idempotent_when_daemon_already_running() {
     );
 }
 
+#[test]
+fn completions_emits_script_for_each_shell() {
+    let temp = TempDir::new().unwrap();
+    for shell in ["bash", "zsh", "fish"] {
+        let output = run_zaz(temp.path(), &["completions", shell]);
+        assert!(
+            output.status.success(),
+            "completions {shell} failed: stderr={}",
+            stderr_string(&output)
+        );
+        let stdout = stdout_string(&output);
+        assert!(
+            !stdout.is_empty(),
+            "completions {shell} produced empty output"
+        );
+        assert!(
+            stdout.contains("zaz"),
+            "completions {shell} did not reference binary name; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn completions_help_lists_supported_shells() {
+    let temp = TempDir::new().unwrap();
+    let output = run_zaz(temp.path(), &["completions", "--help"]);
+    assert!(output.status.success());
+    let stdout = stdout_string(&output);
+    for shell in ["bash", "zsh", "fish"] {
+        assert!(
+            stdout.contains(shell),
+            "completions --help did not mention {shell}; got: {stdout}"
+        );
+    }
+}
+
 trait ChildExt {
     fn wait_timeout(
         &mut self,
