@@ -1,0 +1,25 @@
+# Node/TypeScript dev server: typecheck on change, vite as a daemon.
+#
+# A custom debounce smooths bursty editor saves. The shared port lives in
+# `[variables]` so the daemon command and any companion task can reference
+# it without drifting.
+
+[settings]
+debounce = "200ms"
+
+[variables]
+port = "5173"
+
+[[group]]
+name = "web"
+patterns = ["src/**/*.ts", "src/**/*.tsx", "src/**/*.css"]
+ignore = ["**/*.test.ts", "**/*.test.tsx", "dist/**", "node_modules/**"]
+
+  [[group.task]]
+  name = "typecheck"
+  command = "npx tsc --noEmit"
+
+  [[group.daemon]]
+  name = "vite"
+  command = "npx vite --port ${port}"
+  signal = "SIGTERM"

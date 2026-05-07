@@ -11,6 +11,7 @@ material.
 | [cli.md](cli.md) | CLI command and flag reference. |
 | [tui.md](tui.md) | TUI styles, modes, and keyboard shortcuts. |
 | [mcp.md](mcp.md) | MCP tool server (`zaz mcp`). |
+| [examples/](examples/README.md) | Worked configurations for common development workflows. |
 
-Examples and migration guides land alongside phase 24 under `examples/` and
-`migration/`.
+Migration guides for users coming from `modd` and adjacent process managers
+will land under `migration/`.

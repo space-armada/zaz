@@ -1,0 +1,29 @@
+# Headless / CI-friendly setup: no PTY, structured JSON logs.
+#
+# `no_pty = true` disables PTY allocation for environments that lack a TTY
+# (containers, systemd units, CI). `delay` gives the migration task a
+# brief grace period before the worker connects. JSON log format is
+# friendly to log aggregators.
+
+[settings]
+log_format = "json"
+
+[[group]]
+name = "worker"
+patterns = ["src/**/*.py", "pyproject.toml"]
+ignore = ["**/__pycache__/**", ".venv/**"]
+
+  [[group.task]]
+  name = "migrate"
+  command = "python -m app.migrate"
+
+  [[group.daemon]]
+  name = "worker"
+  command = "python -m app.worker"
+  signal = "SIGINT"
+  no_pty = true
+  delay = "500ms"
+
+    [group.daemon.env]
+    PYTHONUNBUFFERED = "1"
+    APP_ENV = "production"

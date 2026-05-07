@@ -1,0 +1,27 @@
+# Go dev server: format, test, build, run.
+#
+# Tasks run sequentially before the daemon starts. The daemon receives
+# SIGTERM on restart and runs under a PTY (the default).
+
+[[group]]
+name = "server"
+patterns = ["**/*.go", "go.mod", "go.sum"]
+ignore = ["**/*_test.go", "**/testdata/**", "build/**"]
+
+  [[group.task]]
+  name = "fmt"
+  command = "gofmt -l ./..."
+
+  [[group.task]]
+  name = "test"
+  command = "go test ${zaz:dirs}"
+  on_change_only = true
+
+  [[group.task]]
+  name = "build"
+  command = "go build -o build/server ./cmd/server"
+
+  [[group.daemon]]
+  name = "server"
+  command = "./build/server"
+  signal = "SIGTERM"

@@ -1,0 +1,24 @@
+# Task-only loop: lint, typecheck, test. No daemons.
+#
+# Useful for pre-commit-style local feedback or CI dry-runs via `zaz check`.
+# `silence = "stdout"` keeps the noisy passing output out of the TUI while
+# still capturing it on disk for later inspection.
+
+[[group]]
+name = "checks"
+patterns = ["**/*.rs", "Cargo.toml", "Cargo.lock"]
+ignore = ["target/**"]
+
+  [[group.task]]
+  name = "fmt"
+  command = "cargo fmt --check"
+
+  [[group.task]]
+  name = "clippy"
+  command = "cargo clippy --all-targets --all-features -- -D warnings"
+  silence = "stdout"
+
+  [[group.task]]
+  name = "test"
+  command = "cargo test --workspace"
+  silence = "stdout"
