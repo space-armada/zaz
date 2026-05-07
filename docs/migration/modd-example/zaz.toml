@@ -1,0 +1,70 @@
+# Worked example for the modd migration guide.
+#
+# This config is the converted form of the multi-block modd.conf in
+# ../modd.md, "Complete example". It is parsed by tests/example_configs.rs
+# against the live schema, so the guide and the schema stay aligned.
+
+# Standalone daemon: empty patterns, no file watching, just keeps running.
+[[group]]
+name = "cloud-sql-proxy"
+patterns = []
+
+  [[group.daemon]]
+  name = "cloud-sql-proxy"
+  command = "cloud-sql-proxy"
+
+# Run the test suite scoped to whichever directories changed.
+[[group]]
+name = "go-test"
+patterns = ["**/*.go"]
+
+  [[group.task]]
+  name = "test"
+  command = "go test ${zaz:dirs}"
+
+# Build and run the servers. Depends on go-test so tests are gated before
+# the binary is rebuilt; signal = "SIGTERM" mirrors the modd `+sigterm`
+# blocks.
+[[group]]
+name = "go-build"
+patterns = ["**/*.go"]
+ignore = ["**/*_test.go"]
+depends_on = ["go-test"]
+
+  [[group.task]]
+  name = "build"
+  command = "make build"
+
+  [[group.daemon]]
+  name = "ems-server"
+  command = "bin/ems server"
+  signal = "SIGTERM"
+
+  [[group.daemon]]
+  name = "ems-testfeeds"
+  command = "bin/ems testfeeds"
+  signal = "SIGTERM"
+
+# Regenerate sqlc bindings whenever the schema changes.
+[[group]]
+name = "sqlc"
+patterns = ["db/manual.sql"]
+
+  [[group.task]]
+  name = "generate"
+  command = "make generate-sqlc"
+
+# UI: install on lockfile change, run the dev server in the same group.
+# `working_dir` replaces modd's `indir` directive.
+[[group]]
+name = "ui"
+patterns = ["ui/package.json"]
+working_dir = "./ui"
+
+  [[group.task]]
+  name = "install"
+  command = "pnpm install"
+
+  [[group.daemon]]
+  name = "dev"
+  command = "pnpm run dev"

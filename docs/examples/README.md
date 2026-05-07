@@ -15,4 +15,4 @@ test, so the examples cannot silently fall out of sync.
 For the full schema, see [../configuration.md](../configuration.md). For
 subcommand and flag reference, see [../cli.md](../cli.md). Migration
 guides for users coming from `modd` and process-manager-adjacent tools
-land separately under `../migration/`.
+live under [../migration/](../migration/README.md).

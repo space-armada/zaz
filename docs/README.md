@@ -12,6 +12,4 @@ material.
 | [tui.md](tui.md) | TUI styles, modes, and keyboard shortcuts. |
 | [mcp.md](mcp.md) | MCP tool server (`zaz mcp`). |
 | [examples/](examples/README.md) | Worked configurations for common development workflows. |
-
-Migration guides for users coming from `modd` and adjacent process managers
-will land under `migration/`.
+| [migration/](migration/README.md) | Migration guides from `modd` and Procfile-style runners. |
