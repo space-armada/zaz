@@ -118,4 +118,11 @@ pub enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+
+    /// Print a roff-formatted man page to stdout
+    Man {
+        /// Subcommand to render (omit for the root `zaz` page)
+        #[arg(value_name = "COMMAND")]
+        command: Option<String>,
+    },
 }

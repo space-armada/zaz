@@ -43,6 +43,7 @@ crossterm = "0.28"
 # CLI
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+clap_mangen = "0.2"
 
 # Error handling
 thiserror = "2"
@@ -103,6 +104,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
+clap_mangen.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

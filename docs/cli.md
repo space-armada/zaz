@@ -393,3 +393,19 @@ output into the appropriate completion location for your shell.
 | `SHELL` | yes | Shell to generate completions for |
 
 <!-- END: zaz completions -->
+
+### zaz man
+
+Print a roff-formatted man page to stdout. Without arguments, the page covers
+the root `zaz` command; pass a subcommand name to render that subcommand's
+page (header `ZAZ-<NAME>(1)`). Pipe the output to a file or to `man -l -` to
+preview.
+
+<!-- BEGIN: zaz man -->
+**Positional arguments**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `COMMAND` | no | Subcommand to render (omit for the root `zaz` page) |
+
+<!-- END: zaz man -->

@@ -720,6 +720,70 @@ fn completions_help_lists_supported_shells() {
     }
 }
 
+#[test]
+fn man_emits_roff_for_root() {
+    let temp = TempDir::new().unwrap();
+    let output = run_zaz(temp.path(), &["man"]);
+    assert!(
+        output.status.success(),
+        "zaz man failed: stderr={}",
+        stderr_string(&output)
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.starts_with(".ie"),
+        "expected roff prelude; got: {stdout}"
+    );
+    assert!(
+        stdout.contains(".TH ZAZ "),
+        "expected .TH ZAZ header; got: {stdout}"
+    );
+    assert!(
+        stdout.contains(".SH NAME"),
+        "expected NAME section; got: {stdout}"
+    );
+}
+
+#[test]
+fn man_emits_roff_for_named_subcommand() {
+    let temp = TempDir::new().unwrap();
+    let output = run_zaz(temp.path(), &["man", "status"]);
+    assert!(
+        output.status.success(),
+        "zaz man status failed: stderr={}",
+        stderr_string(&output)
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains(".TH ZAZ-STATUS "),
+        "expected .TH ZAZ-STATUS header; got: {stdout}"
+    );
+}
+
+#[test]
+fn man_rejects_unknown_subcommand() {
+    let temp = TempDir::new().unwrap();
+    let output = run_zaz(temp.path(), &["man", "satus"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr_string(&output).contains("unknown subcommand: satus"),
+        "expected unknown-subcommand error; got: {}",
+        stderr_string(&output)
+    );
+}
+
+#[test]
+fn man_help_describes_command_argument() {
+    let temp = TempDir::new().unwrap();
+    let output = run_zaz(temp.path(), &["man", "--help"]);
+    assert!(output.status.success());
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("[COMMAND]"),
+        "man --help did not list COMMAND positional; got: {stdout}"
+    );
+}
+
 trait ChildExt {
     fn wait_timeout(
         &mut self,

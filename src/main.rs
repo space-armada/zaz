@@ -604,6 +604,11 @@ async fn try_main() -> Result<()> {
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             generate_completions(shell)
         }
+        Some(Commands::Man { command }) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
+            generate_man(command.as_deref())
+        }
         None => {
             let config_path = find_config(&cli.config)?;
             let socket_path =
@@ -1156,6 +1161,28 @@ fn generate_completions(shell: clap_complete::Shell) -> Result<()> {
     let mut cmd = Cli::command();
     let bin_name = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+    Ok(())
+}
+
+fn generate_man(command: Option<&str>) -> Result<()> {
+    use clap::CommandFactory;
+
+    let root = Cli::command();
+    let bin_name = root.get_name().to_string();
+    let (cmd, title) = match command {
+        None => (root, bin_name),
+        Some(name) => {
+            let title = format!("{bin_name}-{name}");
+            let Some(sub) = root.find_subcommand(name) else {
+                bail!("unknown subcommand: {name}");
+            };
+            (sub.clone(), title)
+        }
+    };
+
+    clap_mangen::Man::new(cmd)
+        .title(title.to_uppercase())
+        .render(&mut std::io::stdout())?;
     Ok(())
 }
 
