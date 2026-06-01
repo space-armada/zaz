@@ -1208,6 +1208,18 @@ impl Engine {
         let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
             Vec::new();
 
+        // Build expansion context up front so the mutable borrow on `self.groups`
+        // below does not conflict with reads of `self.config` / `self.config_path`.
+        let config_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let var_context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir);
+        let expander = zaz_vars::Expander::new(&var_context);
+
         if let Some(group) = self.groups.get_mut(group_name) {
             for (idx, daemon) in group.daemons.iter_mut().enumerate() {
                 // Check if daemon is actually running before deciding what to do
@@ -1234,9 +1246,21 @@ impl Engine {
                         tokio::time::sleep(delay).await;
                     }
 
+                    let command = match expander.expand(daemon.command_template()) {
+                        Ok(cmd) => cmd,
+                        Err(e) => {
+                            tracing::error!(
+                                daemon = %daemon.name(),
+                                error = %e,
+                                "variable expansion failed; skipping daemon start"
+                            );
+                            continue;
+                        }
+                    };
+
                     // Start daemon
                     tracing::info!(daemon = %daemon.name(), "starting daemon");
-                    daemon.start().map_err(DaemonError::Process)?;
+                    daemon.start(&command).map_err(DaemonError::Process)?;
 
                     // Get PTY reader for streaming output
                     if let Some(reader) = daemon.try_clone_reader() {
@@ -1319,14 +1343,38 @@ impl Engine {
         let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
             Vec::new();
 
+        // Build expansion context up front so the mutable borrow on `self.groups`
+        // below does not conflict with reads of `self.config` / `self.config_path`.
+        let config_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let var_context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir);
+        let expander = zaz_vars::Expander::new(&var_context);
+
         let now = Instant::now();
         for (group_name, group) in self.groups.iter_mut() {
             for (idx, daemon) in group.daemons.iter_mut().enumerate() {
                 // First, check if there's a pending restart that's ready
                 if let Some(restart_at) = group.pending_restarts[idx] {
                     if now >= restart_at {
+                        let command = match expander.expand(daemon.command_template()) {
+                            Ok(cmd) => cmd,
+                            Err(e) => {
+                                tracing::error!(
+                                    daemon = %daemon.name(),
+                                    error = %e,
+                                    "variable expansion failed; skipping daemon restart"
+                                );
+                                group.pending_restarts[idx] = None;
+                                continue;
+                            }
+                        };
                         tracing::info!(daemon = %daemon.name(), "restarting daemon");
-                        daemon.start().map_err(DaemonError::Process)?;
+                        daemon.start(&command).map_err(DaemonError::Process)?;
 
                         if let Some(reader) = daemon.try_clone_reader() {
                             pty_readers.push((
@@ -4597,6 +4645,61 @@ command = "sleep 30"
         // b's immediate dependents should be just c
         let dependents_of_b = engine.dependency_resolver.get_dependents("b");
         assert_eq!(dependents_of_b, vec!["c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_daemon_command_expands_user_variables() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let output_path = temp_dir.path().join("daemon-out");
+
+        // The daemon writes the expanded value of `${sentinel}` to a file.
+        // If expansion is broken, the shell sees an unset variable and the file
+        // is empty. `no_pty` is required for environments where openpty is
+        // disallowed.
+        let config = format!(
+            r#"
+[variables]
+sentinel = "expansion-worked"
+
+[[group]]
+name = "writer"
+patterns = ["*.never-matches"]
+
+[[group.daemon]]
+name = "writer"
+command = "printf '${{sentinel}}' > '{output}'; sleep 30"
+no_pty = true
+"#,
+            output = output_path.display(),
+        );
+        std::fs::write(&config_path, config).unwrap();
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        // The shell's printf races with the test; poll until non-empty.
+        let mut contents = String::new();
+        for _ in 0..200 {
+            if let Ok(read) = std::fs::read_to_string(&output_path) {
+                if !read.is_empty() {
+                    contents = read;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            contents, "expansion-worked",
+            "daemon command was not expanded; file contained {:?}",
+            contents
+        );
     }
 
     #[tokio::test]

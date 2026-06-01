@@ -68,6 +68,11 @@ impl Daemon {
         self.config.name()
     }
 
+    /// Get the configured command template, before variable expansion.
+    pub fn command_template(&self) -> &str {
+        &self.config.command
+    }
+
     /// Get the current state.
     pub fn state(&self) -> DaemonState {
         self.state
@@ -78,17 +83,18 @@ impl Daemon {
         self.child.as_ref().and_then(|c| c.id())
     }
 
-    /// Start the daemon.
-    pub fn start(&mut self) -> Result<(), ProcessError> {
+    /// Start the daemon with the given fully expanded command.
+    ///
+    /// Variable expansion happens at the caller layer so the daemon does not
+    /// need to know about `zaz_vars` or the engine's expansion context.
+    pub fn start(&mut self, command: &str) -> Result<(), ProcessError> {
         if self.state == DaemonState::Running {
             return Ok(());
         }
 
         tracing::info!(name = %self.config.name(), "starting daemon");
 
-        let child = self
-            .executor
-            .spawn(&self.config.command, !self.config.no_pty)?;
+        let child = self.executor.spawn(command, !self.config.no_pty)?;
         self.child = Some(child);
         self.state = DaemonState::Running;
         self.last_start = Some(Instant::now());
