@@ -14,8 +14,8 @@ pub use schema::{
 };
 pub use toml_spanned::SpanInfo;
 pub use user::{
-    load_user_config, user_config_path, ColorRule, LogColorConfig, LogStorageConfig,
-    NotificationConfig, TuiStylePreference, UserConfig,
+    load_user_config, user_config_path, ColorRule, LogColorConfig, LogStorageBackend,
+    LogStorageConfig, NotificationConfig, SqliteStorageConfig, TuiStylePreference, UserConfig,
 };
 pub use validate::validate;
 

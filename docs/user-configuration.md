@@ -114,21 +114,44 @@ on_group_complete = true
 
 ## `[log_storage]`
 
-Bounds on the in-memory log buffer used by the daemon and the TUI.
+Bounds on the in-memory log buffer used by the daemon and the TUI, and
+selection of the optional persistent backend.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `memory_limit` | size string | `"100MB"` | Total memory across all process logs; oldest evicted when approached. |
-| `max_lines_per_process` | integer | `100000` | Hard cap on retained lines per process. |
+| `backend` | enum | `"memory"` | Storage backend: `"memory"` or `"sqlite"`. The SQLite backend is opt-in. |
+| `hot_memory_limit` | size string | `"100MB"` | Total in-memory budget across all process logs; oldest evicted when approached. Accepts the legacy alias `memory_limit`. |
+| `hot_max_lines_per_process` | integer | `100000` | Hard cap on lines retained in the hot buffer per process. Accepts the legacy alias `max_lines_per_process`. |
 
-`memory_limit` accepts case-insensitive `B`, `KB`, `MB`, and `GB`
+Size strings accept case-insensitive `B`, `KB`, `MB`, and `GB`
 suffixes — all 1024-based — as well as fractional values like `"1.5MB"`.
 A bare integer is interpreted as a byte count. Whitespace between the
 number and the suffix is allowed (`"100 MB"`). Unparseable values fall
-back to the 100 MB default.
+back to the documented default.
 
 ```toml
 [log_storage]
-memory_limit = "200MB"
-max_lines_per_process = 50000
+backend = "memory"
+hot_memory_limit = "200MB"
+hot_max_lines_per_process = 50000
+```
+
+### `[log_storage.sqlite]`
+
+Persistent retention bounds for the SQLite backend. These fields are
+honored when `backend = "sqlite"`; they are parsed but ignored under
+`backend = "memory"`.
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `max_size` | size string | `"512MB"` | Maximum on-disk database size; oldest rows pruned when approached. |
+| `max_lines_per_process` | integer | `250000` | Hard cap on persisted lines per process. |
+
+```toml
+[log_storage]
+backend = "sqlite"
+
+[log_storage.sqlite]
+max_size = "1GB"
+max_lines_per_process = 500000
 ```

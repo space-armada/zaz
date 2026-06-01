@@ -540,8 +540,8 @@ impl Engine {
         // Create log store with user config settings
         let log_store = {
             let mut store = crate::log_store::LogStore::new()
-                .with_memory_limit(user_config.log_storage.memory_limit_bytes())
-                .with_max_lines_per_process(user_config.log_storage.max_lines_per_process);
+                .with_memory_limit(user_config.log_storage.hot_memory_limit_bytes())
+                .with_max_lines_per_process(user_config.log_storage.hot_max_lines_per_process);
 
             if verbose_output {
                 store = store.with_verbose_callback(|log| {
