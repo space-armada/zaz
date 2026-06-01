@@ -836,7 +836,9 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
             // Handle API commands
             Some(cmd) = command_rx.recv() => {
                 // Drain log channel before handling request (ensures GetLogs returns fresh data)
-                engine.process_incoming_logs();
+                if let Err(e) = engine.process_incoming_logs() {
+                    tracing::error!(error = %e, "log drain error");
+                }
 
                 let response = engine.handle_request(cmd.request).await;
                 let _ = cmd.response_tx.send(response);
@@ -851,7 +853,9 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
             // Poll for file changes and check daemons
             _ = async {
                 // Process incoming logs from PTY readers
-                engine.process_incoming_logs();
+                if let Err(e) = engine.process_incoming_logs() {
+                    tracing::error!(error = %e, "log drain error");
+                }
 
                 if let Err(e) = engine.poll().await {
                     tracing::error!(error = %e, "poll error");

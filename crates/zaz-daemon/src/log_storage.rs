@@ -15,6 +15,7 @@
 //!   and persistent storage backends.
 
 use crate::api::LogLine;
+use crate::error::LogStorageError;
 
 /// Query parameters for retrieving logs.
 ///
@@ -170,6 +171,27 @@ pub struct LogStorageStats {
 /// This trait defines the interface for storing and querying logs.
 /// Implementations can use in-memory storage, SQLite, or other backends.
 ///
+/// # Fallibility
+///
+/// All read and write methods return `Result<_, LogStorageError>`. The
+/// in-memory backend never fails, but a persistent backend can fail on open,
+/// schema init, write, query, lock timeout, or retention. Callers must
+/// propagate or surface the error rather than silently dropping it.
+///
+/// # Lifecycle hooks
+///
+/// - [`push_batch`](LogStorage::push_batch) is the primary write extension.
+///   Persistent backends commit the batch inside one transaction so a partial
+///   write does not leak.
+/// - [`flush`](LogStorage::flush) is the periodic-cadence hook the runtime
+///   calls between batches.
+/// - [`flush_now`](LogStorage::flush_now) is the shutdown hook. Persistent
+///   backends must commit and checkpoint before returning; the memory backend
+///   is a no-op.
+/// - [`enforce_retention`](LogStorage::enforce_retention) runs an explicit
+///   retention sweep. The memory backend enforces its limits inline on push
+///   and treats this as a no-op.
+///
 /// # Thread Safety
 ///
 /// The trait requires `Send` to allow moving between threads. Implementations
@@ -181,7 +203,7 @@ pub struct LogStorageStats {
 /// use crate::log_storage::{LogQuery, LogQueryResult};
 ///
 /// // Simple query (backward compatible)
-/// let logs = storage.get("web", Some(10));
+/// let logs = storage.get("web", Some(10))?;
 ///
 /// // Advanced query with pagination and search
 /// let result = storage.query(
@@ -189,7 +211,7 @@ pub struct LogStorageStats {
 ///         .with_search("error")
 ///         .with_limit(50)
 ///         .with_offset(100)
-/// );
+/// )?;
 ///
 /// println!("Showing {}/{} logs", result.logs.len(), result.total_count);
 /// ```
@@ -197,7 +219,13 @@ pub trait LogStorage: Send {
     /// Push a log line to storage.
     ///
     /// The storage may apply eviction policies if limits are exceeded.
-    fn push(&mut self, log: LogLine);
+    fn push(&mut self, log: LogLine) -> Result<(), LogStorageError>;
+
+    /// Push a batch of log lines in one operation.
+    ///
+    /// Persistent backends commit the batch atomically; in-memory backends
+    /// may apply per-line eviction inside the loop.
+    fn push_batch(&mut self, logs: Vec<LogLine>) -> Result<(), LogStorageError>;
 
     /// Get logs for a process (backward compatible simple interface).
     ///
@@ -213,22 +241,39 @@ pub trait LogStorage: Send {
     ///
     /// Logs sorted by timestamp ascending (oldest first), with the most
     /// recent `limit` logs if a limit is specified.
-    fn get(&self, name: &str, limit: Option<usize>) -> Vec<LogLine>;
+    fn get(&self, name: &str, limit: Option<usize>) -> Result<Vec<LogLine>, LogStorageError>;
 
     /// Query logs with advanced filtering and pagination.
     ///
     /// This is the primary method for retrieving logs with full control
     /// over filtering, pagination, and sorting.
-    fn query(&self, query: LogQuery) -> LogQueryResult;
+    fn query(&self, query: LogQuery) -> Result<LogQueryResult, LogStorageError>;
 
     /// Get statistics about the storage.
-    fn stats(&self) -> LogStorageStats;
+    fn stats(&self) -> Result<LogStorageStats, LogStorageError>;
 
     /// Clear all logs.
-    fn clear(&mut self);
+    fn clear(&mut self) -> Result<(), LogStorageError>;
 
     /// Clear logs for a specific process.
-    fn clear_process(&mut self, name: &str);
+    fn clear_process(&mut self, name: &str) -> Result<(), LogStorageError>;
+
+    /// Periodic flush hook called between drain cycles.
+    ///
+    /// In-memory backends are a no-op. Persistent backends should ensure any
+    /// pending writes are durable up to the call site.
+    fn flush(&mut self) -> Result<(), LogStorageError>;
+
+    /// Shutdown flush hook. Implementations must guarantee durability before
+    /// returning so the daemon can exit without losing buffered history.
+    fn flush_now(&mut self) -> Result<(), LogStorageError>;
+
+    /// Run an explicit retention sweep.
+    ///
+    /// The memory backend enforces retention inline on every push and treats
+    /// this call as a no-op. Persistent backends prune outside the write path
+    /// to keep batch latency bounded.
+    fn enforce_retention(&mut self) -> Result<(), LogStorageError>;
 
     /// Get the current memory limit in bytes, if set.
     fn memory_limit(&self) -> Option<usize>;

@@ -10,6 +10,7 @@
 //! via `get()` after calling `drain()`.
 
 use crate::api::{LogLine, LogSource};
+use crate::error::LogStorageError;
 use crate::log_storage::{LogQuery, LogQueryResult, LogStorage, LogStorageStats};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::{broadcast, mpsc};
@@ -112,15 +113,28 @@ impl LogStore {
     /// spawned tasks are visible. Call this:
     /// - Before handling any API request
     /// - Periodically in the main loop
-    pub fn drain(&mut self) {
+    ///
+    /// The drained lines are written through `push_batch` so persistent
+    /// backends can commit the residual set inside a single transaction.
+    pub fn drain(&mut self) -> Result<(), LogStorageError> {
+        let mut batch = Vec::new();
         while let Ok(log) = self.rx.try_recv() {
-            self.push_internal(log);
+            batch.push(log);
         }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.push_batch(batch)
     }
 
-    /// Push a log directly to storage (for synchronous code paths).
-    pub fn push(&mut self, log: LogLine) {
-        self.push_internal(log);
+    /// Drain the channel and run the shutdown-time flush hook.
+    ///
+    /// This is the contract invoked from `Engine::shutdown` so persistent
+    /// backends can commit and checkpoint before exit. The memory backend's
+    /// `flush_now` is a no-op.
+    pub fn drain_and_flush_now(&mut self) -> Result<(), LogStorageError> {
+        self.drain()?;
+        self.flush_now()
     }
 
     /// Internal push that handles storage, trimming, and broadcast.
@@ -294,19 +308,28 @@ impl Default for LogStore {
 }
 
 impl LogStorage for LogStore {
-    fn push(&mut self, log: LogLine) {
+    fn push(&mut self, log: LogLine) -> Result<(), LogStorageError> {
         self.push_internal(log);
+        Ok(())
     }
 
-    fn get(&self, name: &str, limit: Option<usize>) -> Vec<LogLine> {
-        if name == "*" {
+    fn push_batch(&mut self, logs: Vec<LogLine>) -> Result<(), LogStorageError> {
+        for log in logs {
+            self.push_internal(log);
+        }
+        Ok(())
+    }
+
+    fn get(&self, name: &str, limit: Option<usize>) -> Result<Vec<LogLine>, LogStorageError> {
+        let logs = if name == "*" {
             self.get_all_internal(limit)
         } else {
             self.get_process_internal(name, limit)
-        }
+        };
+        Ok(logs)
     }
 
-    fn query(&self, query: LogQuery) -> LogQueryResult {
+    fn query(&self, query: LogQuery) -> Result<LogQueryResult, LogStorageError> {
         let (logs, _) = self.query_internal(&query);
         let total_count = logs.len();
 
@@ -319,15 +342,15 @@ impl LogStorage for LogStore {
 
         let has_more = offset + paginated.len() < total_count;
 
-        LogQueryResult {
+        Ok(LogQueryResult {
             logs: paginated,
             total_count,
             has_more,
             offset,
-        }
+        })
     }
 
-    fn stats(&self) -> LogStorageStats {
+    fn stats(&self) -> Result<LogStorageStats, LogStorageError> {
         let total_lines: usize = self.buffers.values().map(|b| b.len()).sum();
         let process_count = self.buffers.len();
 
@@ -347,7 +370,7 @@ impl LogStorage for LogStore {
                 (oldest, newest)
             });
 
-        LogStorageStats {
+        Ok(LogStorageStats {
             total_lines,
             process_count,
             memory_bytes: self.estimated_memory,
@@ -355,19 +378,33 @@ impl LogStorage for LogStore {
             newest_timestamp: newest,
             memory_limit: self.memory_limit,
             max_lines_per_process: self.max_lines_per_process,
-        }
+        })
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self) -> Result<(), LogStorageError> {
         self.buffers.clear();
         self.estimated_memory = 0;
+        Ok(())
     }
 
-    fn clear_process(&mut self, name: &str) {
+    fn clear_process(&mut self, name: &str) -> Result<(), LogStorageError> {
         if let Some(buffer) = self.buffers.remove(name) {
             let memory_freed: usize = buffer.iter().map(Self::estimate_log_size).sum();
             self.estimated_memory = self.estimated_memory.saturating_sub(memory_freed);
         }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), LogStorageError> {
+        Ok(())
+    }
+
+    fn flush_now(&mut self) -> Result<(), LogStorageError> {
+        Ok(())
+    }
+
+    fn enforce_retention(&mut self) -> Result<(), LogStorageError> {
+        Ok(())
     }
 
     fn memory_limit(&self) -> Option<usize> {
@@ -433,10 +470,10 @@ mod tests {
     fn test_push_and_get() {
         let mut store = LogStore::new();
 
-        store.push(make_log("task1", "line 1", 100));
-        store.push(make_log("task1", "line 2", 200));
+        store.push(make_log("task1", "line 1", 100)).unwrap();
+        store.push(make_log("task1", "line 2", 200)).unwrap();
 
-        let logs = store.get("task1", None);
+        let logs = store.get("task1", None).unwrap();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].content, "line 1");
         assert_eq!(logs[1].content, "line 2");
@@ -445,7 +482,7 @@ mod tests {
     #[test]
     fn test_get_nonexistent_process() {
         let store = LogStore::new();
-        let logs = store.get("nonexistent", None);
+        let logs = store.get("nonexistent", None).unwrap();
         assert!(logs.is_empty());
     }
 
@@ -454,10 +491,12 @@ mod tests {
         let mut store = LogStore::new();
 
         for i in 0..10 {
-            store.push(make_log("task1", &format!("line {}", i), i as u64 * 100));
+            store
+                .push(make_log("task1", &format!("line {}", i), i as u64 * 100))
+                .unwrap();
         }
 
-        let logs = store.get("task1", Some(3));
+        let logs = store.get("task1", Some(3)).unwrap();
         assert_eq!(logs.len(), 3);
         // Should get the LAST 3 lines
         assert_eq!(logs[0].content, "line 7");
@@ -470,12 +509,12 @@ mod tests {
         let mut store = LogStore::new();
 
         // Push logs out of timestamp order
-        store.push(make_log("task1", "task1 line 1", 300));
-        store.push(make_log("task2", "task2 line 1", 100));
-        store.push(make_log("task1", "task1 line 2", 400));
-        store.push(make_log("task2", "task2 line 2", 200));
+        store.push(make_log("task1", "task1 line 1", 300)).unwrap();
+        store.push(make_log("task2", "task2 line 1", 100)).unwrap();
+        store.push(make_log("task1", "task1 line 2", 400)).unwrap();
+        store.push(make_log("task2", "task2 line 2", 200)).unwrap();
 
-        let logs = store.get("*", None);
+        let logs = store.get("*", None).unwrap();
         assert_eq!(logs.len(), 4);
 
         // Should be sorted by timestamp
@@ -497,10 +536,12 @@ mod tests {
         let mut store = LogStore::new().with_max_lines(5);
 
         for i in 0..10 {
-            store.push(make_log("task1", &format!("line {}", i), i as u64 * 100));
+            store
+                .push(make_log("task1", &format!("line {}", i), i as u64 * 100))
+                .unwrap();
         }
 
-        let logs = store.get("task1", None);
+        let logs = store.get("task1", None).unwrap();
         assert_eq!(logs.len(), 5);
         // Should keep the most recent 5
         assert_eq!(logs[0].content, "line 5");
@@ -523,13 +564,13 @@ mod tests {
             .unwrap();
 
         // Logs should NOT be visible yet
-        assert!(store.get("task1", None).is_empty());
+        assert!(store.get("task1", None).unwrap().is_empty());
 
         // Drain the channel
-        store.drain();
+        store.drain().unwrap();
 
         // Now logs should be visible
-        let logs = store.get("task1", None);
+        let logs = store.get("task1", None).unwrap();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].content, "async line 1");
         assert_eq!(logs[1].content, "async line 2");
@@ -544,21 +585,21 @@ mod tests {
         sender.send(make_log("task1", "line 1", 100)).await.unwrap();
 
         // Without drain, logs are not visible
-        assert!(store.get("task1", None).is_empty());
+        assert!(store.get("task1", None).unwrap().is_empty());
 
         // Drain and get
-        store.drain();
-        assert_eq!(store.get("task1", None).len(), 1);
+        store.drain().unwrap();
+        assert_eq!(store.get("task1", None).unwrap().len(), 1);
 
         // Send more logs
         sender.send(make_log("task1", "line 2", 200)).await.unwrap();
 
         // Still only 1 visible (haven't drained)
-        assert_eq!(store.get("task1", None).len(), 1);
+        assert_eq!(store.get("task1", None).unwrap().len(), 1);
 
         // Drain again
-        store.drain();
-        assert_eq!(store.get("task1", None).len(), 2);
+        store.drain().unwrap();
+        assert_eq!(store.get("task1", None).unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -567,7 +608,7 @@ mod tests {
         let sender = store.sender();
 
         // Direct push
-        store.push(make_log("task1", "direct 1", 100));
+        store.push(make_log("task1", "direct 1", 100)).unwrap();
 
         // Channel send
         sender
@@ -576,17 +617,17 @@ mod tests {
             .unwrap();
 
         // Direct push again
-        store.push(make_log("task1", "direct 2", 300));
+        store.push(make_log("task1", "direct 2", 300)).unwrap();
 
         // Only direct pushes visible
-        let logs = store.get("task1", None);
+        let logs = store.get("task1", None).unwrap();
         assert_eq!(logs.len(), 2);
 
         // Drain
-        store.drain();
+        store.drain().unwrap();
 
         // Now all 3 visible
-        let logs = store.get("task1", None);
+        let logs = store.get("task1", None).unwrap();
         assert_eq!(logs.len(), 3);
     }
 
@@ -609,15 +650,15 @@ mod tests {
             .await
             .unwrap();
 
-        store.drain();
+        store.drain().unwrap();
 
         // Each process has its logs
-        assert_eq!(store.get("task1", None).len(), 1);
-        assert_eq!(store.get("task2", None).len(), 1);
-        assert_eq!(store.get("task3", None).len(), 1);
+        assert_eq!(store.get("task1", None).unwrap().len(), 1);
+        assert_eq!(store.get("task2", None).unwrap().len(), 1);
+        assert_eq!(store.get("task3", None).unwrap().len(), 1);
 
         // All logs sorted by timestamp
-        let all = store.get("*", None);
+        let all = store.get("*", None).unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].timestamp, 100); // task1
         assert_eq!(all[1].timestamp, 120); // task3
@@ -630,7 +671,9 @@ mod tests {
         let mut subscriber = store.subscribe();
 
         // Push a log
-        store.push(make_log("task1", "broadcast test", 100));
+        store
+            .push(make_log("task1", "broadcast test", 100))
+            .unwrap();
 
         // Subscriber should receive it
         let received = subscriber.try_recv().unwrap();
@@ -653,7 +696,7 @@ mod tests {
         assert!(subscriber.try_recv().is_err());
 
         // Drain moves to buffer AND broadcasts
-        store.drain();
+        store.drain().unwrap();
 
         // Now subscriber should have it
         let received = subscriber.try_recv().unwrap();
@@ -662,24 +705,26 @@ mod tests {
 
     #[test]
     fn test_query_pagination() {
-        use crate::log_storage::LogStorage;
-
         let mut store = LogStore::new();
 
         // Add 20 logs
         for i in 0..20 {
-            store.push(make_log("task1", &format!("line {}", i), i as u64 * 100));
+            store
+                .push(make_log("task1", &format!("line {}", i), i as u64 * 100))
+                .unwrap();
         }
 
         // Query without pagination
-        let result = store.query(LogQuery::process("task1"));
+        let result = store.query(LogQuery::process("task1")).unwrap();
         assert_eq!(result.logs.len(), 20);
         assert_eq!(result.total_count, 20);
         assert!(!result.has_more);
         assert_eq!(result.offset, 0);
 
         // Query with limit
-        let result = store.query(LogQuery::process("task1").with_limit(5));
+        let result = store
+            .query(LogQuery::process("task1").with_limit(5))
+            .unwrap();
         assert_eq!(result.logs.len(), 5);
         assert_eq!(result.total_count, 20);
         assert!(result.has_more);
@@ -687,7 +732,9 @@ mod tests {
         assert_eq!(result.logs[0].content, "line 0");
 
         // Query with offset and limit
-        let result = store.query(LogQuery::process("task1").with_offset(10).with_limit(5));
+        let result = store
+            .query(LogQuery::process("task1").with_offset(10).with_limit(5))
+            .unwrap();
         assert_eq!(result.logs.len(), 5);
         assert_eq!(result.total_count, 20);
         assert!(result.has_more);
@@ -695,7 +742,9 @@ mod tests {
         assert_eq!(result.logs[0].content, "line 10");
 
         // Query at the end
-        let result = store.query(LogQuery::process("task1").with_offset(15).with_limit(10));
+        let result = store
+            .query(LogQuery::process("task1").with_offset(15).with_limit(10))
+            .unwrap();
         assert_eq!(result.logs.len(), 5); // Only 5 remaining
         assert_eq!(result.total_count, 20);
         assert!(!result.has_more);
@@ -704,25 +753,33 @@ mod tests {
 
     #[test]
     fn test_query_search() {
-        use crate::log_storage::LogStorage;
-
         let mut store = LogStore::new();
 
-        store.push(make_log("task1", "INFO: started", 100));
-        store.push(make_log("task1", "ERROR: something failed", 200));
-        store.push(make_log("task1", "INFO: processing", 300));
-        store.push(make_log("task1", "ERROR: another failure", 400));
-        store.push(make_log("task1", "INFO: done", 500));
+        store.push(make_log("task1", "INFO: started", 100)).unwrap();
+        store
+            .push(make_log("task1", "ERROR: something failed", 200))
+            .unwrap();
+        store
+            .push(make_log("task1", "INFO: processing", 300))
+            .unwrap();
+        store
+            .push(make_log("task1", "ERROR: another failure", 400))
+            .unwrap();
+        store.push(make_log("task1", "INFO: done", 500)).unwrap();
 
         // Search for ERROR (case-insensitive)
-        let result = store.query(LogQuery::process("task1").with_search("error"));
+        let result = store
+            .query(LogQuery::process("task1").with_search("error"))
+            .unwrap();
         assert_eq!(result.logs.len(), 2);
         assert_eq!(result.total_count, 2);
         assert!(result.logs[0].content.contains("ERROR"));
         assert!(result.logs[1].content.contains("ERROR"));
 
         // Search with pagination
-        let result = store.query(LogQuery::process("task1").with_search("INFO").with_limit(2));
+        let result = store
+            .query(LogQuery::process("task1").with_search("INFO").with_limit(2))
+            .unwrap();
         assert_eq!(result.logs.len(), 2);
         assert_eq!(result.total_count, 3);
         assert!(result.has_more);
@@ -730,16 +787,14 @@ mod tests {
 
     #[test]
     fn test_query_all_processes() {
-        use crate::log_storage::LogStorage;
-
         let mut store = LogStore::new();
 
-        store.push(make_log("task1", "task1 line", 100));
-        store.push(make_log("task2", "task2 line", 200));
-        store.push(make_log("task3", "task3 line", 150));
+        store.push(make_log("task1", "task1 line", 100)).unwrap();
+        store.push(make_log("task2", "task2 line", 200)).unwrap();
+        store.push(make_log("task3", "task3 line", 150)).unwrap();
 
         // Query all processes
-        let result = store.query(LogQuery::all());
+        let result = store.query(LogQuery::all()).unwrap();
         assert_eq!(result.logs.len(), 3);
 
         // Should be sorted by timestamp
@@ -748,55 +803,137 @@ mod tests {
         assert_eq!(result.logs[2].timestamp, 200);
 
         // Pagination on all
-        let result = store.query(LogQuery::all().with_limit(2));
+        let result = store.query(LogQuery::all().with_limit(2)).unwrap();
         assert_eq!(result.logs.len(), 2);
         assert!(result.has_more);
     }
 
     #[test]
     fn test_memory_eviction() {
-        use crate::log_storage::LogStorage;
-
         // Create store with tiny memory limit
         let mut store = LogStore::new().with_memory_limit(1000); // ~1KB limit
 
         // Add logs until eviction kicks in
         for i in 0..100 {
-            store.push(make_log(
-                "task1",
-                &format!("a longer line to take up more memory {}", i),
-                i as u64 * 100,
-            ));
+            store
+                .push(make_log(
+                    "task1",
+                    &format!("a longer line to take up more memory {}", i),
+                    i as u64 * 100,
+                ))
+                .unwrap();
         }
 
         // Should have evicted some logs due to memory pressure
-        let stats = store.stats();
+        let stats = store.stats().unwrap();
         assert!(stats.memory_bytes < 1000); // Under the target (80% of limit = 800)
 
         // Logs should still be retrievable
-        let result = store.query(LogQuery::process("task1"));
+        let result = store.query(LogQuery::process("task1")).unwrap();
         assert!(result.total_count < 100); // Some were evicted
         assert!(result.total_count > 0); // But not all
     }
 
     #[test]
     fn test_max_lines_per_process_enforcement() {
-        use crate::log_storage::LogStorage;
-
         let mut store = LogStore::new();
         store.set_max_lines_per_process(10);
 
         // Add 20 logs
         for i in 0..20 {
-            store.push(make_log("task1", &format!("line {}", i), i as u64 * 100));
+            store
+                .push(make_log("task1", &format!("line {}", i), i as u64 * 100))
+                .unwrap();
         }
 
         // Should only have 10
-        let result = store.query(LogQuery::process("task1"));
+        let result = store.query(LogQuery::process("task1")).unwrap();
         assert_eq!(result.total_count, 10);
 
         // Should have the most recent 10 (lines 10-19)
         assert_eq!(result.logs[0].content, "line 10");
         assert_eq!(result.logs[9].content, "line 19");
+    }
+
+    #[test]
+    fn test_push_batch_makes_lines_visible() {
+        let mut store = LogStore::new();
+        let batch = vec![
+            make_log("task1", "batch 1", 100),
+            make_log("task1", "batch 2", 200),
+            make_log("task2", "other", 150),
+        ];
+
+        store.push_batch(batch).unwrap();
+
+        let result = store.query(LogQuery::all()).unwrap();
+        assert_eq!(result.total_count, 3);
+        assert_eq!(result.logs[0].timestamp, 100);
+        assert_eq!(result.logs[1].timestamp, 150);
+        assert_eq!(result.logs[2].timestamp, 200);
+    }
+
+    #[test]
+    fn test_flush_is_noop_for_memory_backend() {
+        let mut store = LogStore::new();
+        store.push(make_log("task1", "before flush", 100)).unwrap();
+
+        store.flush().unwrap();
+
+        let logs = store.get("task1", None).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].content, "before flush");
+    }
+
+    #[test]
+    fn test_flush_now_is_noop_for_memory_backend() {
+        let mut store = LogStore::new();
+        store
+            .push(make_log("task1", "before flush_now", 100))
+            .unwrap();
+
+        store.flush_now().unwrap();
+
+        let logs = store.get("task1", None).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].content, "before flush_now");
+    }
+
+    #[test]
+    fn test_enforce_retention_is_noop_for_memory_backend() {
+        let mut store = LogStore::new();
+        for i in 0..5 {
+            store
+                .push(make_log("task1", &format!("line {}", i), i as u64 * 100))
+                .unwrap();
+        }
+        let before = store.query(LogQuery::all()).unwrap().total_count;
+
+        store.enforce_retention().unwrap();
+
+        let after = store.query(LogQuery::all()).unwrap().total_count;
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn test_drain_and_flush_now_visibility() {
+        let mut store = LogStore::new();
+        let sender = store.sender();
+
+        sender
+            .send(make_log("task1", "shutdown line 1", 100))
+            .await
+            .unwrap();
+        sender
+            .send(make_log("task1", "shutdown line 2", 200))
+            .await
+            .unwrap();
+
+        store.drain_and_flush_now().unwrap();
+
+        let logs = store.get("task1", None).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].content, "shutdown line 1");
+        assert_eq!(logs[1].content, "shutdown line 2");
     }
 }

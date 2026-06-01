@@ -45,6 +45,42 @@ pub enum DaemonError {
     /// Socket target could not be resolved from the current location.
     #[error("could not resolve daemon socket from {}", start_dir.display())]
     SocketResolution { start_dir: PathBuf },
+
+    /// Log storage backend reported an error.
+    #[error("log storage error: {0}")]
+    LogStorage(#[from] LogStorageError),
+}
+
+/// Errors that can occur in a log storage backend.
+///
+/// The in-memory backend currently never returns these, but every variant maps
+/// to a failure mode that the persistent SQLite backend must be able to surface
+/// without silently dropping API log history.
+#[derive(Debug, Error)]
+pub enum LogStorageError {
+    /// Failed to open the backing store.
+    #[error("failed to open log storage: {0}")]
+    Open(String),
+
+    /// Failed to initialize the storage schema.
+    #[error("failed to initialize log storage schema: {0}")]
+    SchemaInit(String),
+
+    /// Write to the backing store failed.
+    #[error("failed to write logs: {0}")]
+    Write(String),
+
+    /// Query against the backing store failed.
+    #[error("failed to query logs: {0}")]
+    Query(String),
+
+    /// Acquiring an exclusive write lock timed out.
+    #[error("log storage lock timed out")]
+    LockTimeout,
+
+    /// Retention sweep failed.
+    #[error("failed to enforce log retention: {0}")]
+    Retention(String),
 }
 
 impl DaemonError {
@@ -91,5 +127,14 @@ mod tests {
     fn other_variants_have_no_hint() {
         assert_eq!(DaemonError::GroupNotFound("x".into()).hint(), None);
         assert_eq!(DaemonError::CyclicDependency("y".into()).hint(), None);
+    }
+
+    #[test]
+    fn log_storage_error_wraps_into_daemon_error() {
+        let err: DaemonError = LogStorageError::Write("disk full".into()).into();
+        assert_eq!(
+            err.to_string(),
+            "log storage error: failed to write logs: disk full"
+        );
     }
 }
