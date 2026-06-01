@@ -6,11 +6,10 @@ lives in [tui.md](tui.md). The MCP tool server is documented in
 [configuration.md](configuration.md) and
 [user-configuration.md](user-configuration.md).
 
-The flag tables inside each subcommand section are generated from the `clap`
-command tree and live between `<!-- BEGIN: zaz <name> -->` and
-`<!-- END: zaz <name> -->` markers. Hand-written prose around the markers is
-preserved across regenerations. Run `make docs-cli` to update the tables;
-`make docs-check` is wired into CI and fails on drift.
+This file is the canonical operator reference. Shell completions
+(`zaz completions <shell>`) and man pages (`zaz man [COMMAND]`) derive from
+the same `clap` definition; see [Generated surfaces](#generated-surfaces)
+for the sync model and the error-message contract.
 
 ## Overview
 
@@ -31,6 +30,74 @@ The subcommands fall into three exit-policy categories:
 
 The categories are spelled out in `src/main.rs` above the `Commands` enum
 and codified in [ADR-0004](../spec/adrs/ADR-0004-cli-exit-code-categories.md).
+
+## Generated surfaces
+
+The single source of truth for every operator-facing CLI artifact is the
+`clap` command tree exported by `Cli::command()` in `src/cli.rs`. Three
+distinct surfaces derive from it; each is regenerated, never hand-edited:
+
+- **This reference's flag and argument tables.** The `<!-- BEGIN: zaz <name> -->` /
+  `<!-- END: zaz <name> -->` blocks inside every subcommand section below are
+  emitted by the `xtask` walker at `crates/xtask/src/docs_cli.rs`. Run
+  `make docs-cli` to regenerate; `make docs-check` runs the same walker in
+  drift-detection mode and is wired into `make ci`. Hand-written prose
+  outside the markers is preserved across regenerations.
+- **Shell completions.** `zaz completions <shell>` writes a completion
+  script to stdout via `clap_complete::generate`. The supported shells are
+  whatever `clap_complete::Shell` exposes — bash, zsh, fish, elvish, and
+  powershell — without a wrapper enum, so new shells added upstream become
+  available without code changes here.
+- **Man pages.** `zaz man [COMMAND]` writes a roff document to stdout via
+  `clap_mangen::Man`. With no argument the page covers the root `zaz`
+  binary; passing a subcommand name renders that subcommand's page with the
+  conventional `ZAZ-<NAME>(1)` header. Unknown subcommand names exit
+  non-zero with `unknown subcommand: <name>` rather than silently rendering
+  the root page.
+
+Richer per-subcommand prose lives in this file rather than in clap's
+`long_about` / `after_help` attributes, which are intentionally unset.
+Keeping prose in one location avoids the drift risk of two parallel content
+streams; completions and man pages stay accurate because they derive from
+the structural attributes (flag names, types, short help) that are already
+the source of every table in this file.
+
+### Error-message contract
+
+Operator-facing error wording follows a fixed shape established by the
+ZAZ-009 audit. The shape exists so scripted consumers can parse `zaz`
+output without regexing free-form prose, and so operators always know
+where the recovery suggestion lives.
+
+- **Recovery hints are structured.** Error types whose recovery prose is
+  fixed per variant — `DaemonError` in `crates/zaz-daemon/src/error.rs` and
+  `McpError` in `crates/zaz-mcp/src/error.rs` — expose a
+  `pub fn hint(&self) -> Option<&'static str>` accessor. `ValidationError`
+  in `crates/zaz-config/src/error.rs` carries an instance-level
+  `hint: Option<String>` field instead, because the disambiguation text
+  depends on construction-site context.
+- **Hints render on a separate line.** The binary's `report_error`
+  printer in `src/main.rs` walks the `anyhow` error chain, finds the first
+  variant that exposes a hint, and emits two lines: an `Error: <message>`
+  line followed by an indented `hint: <recovery>` line. ANSI coloring is
+  gated on `std::io::stderr().is_terminal()`, so non-TTY consumers see
+  plain text and substring matchers stay stable. The same shape powers
+  `zaz check`'s validation pretty-printer.
+- **Daemon-API verbs share wording.** The four verbs that talk to a
+  running daemon (`status`, `restart`, `stop`, `reload`) route through
+  two helpers in `src/main.rs`: `connect_or_no_daemon` and
+  `handle_daemon_response`. The wording is uniform across all four:
+  `no daemon running at <socket>` (with a hint pointing at `zaz start`
+  and `--socket <PATH>`), `<verb> failed: <message>` on an API error, and
+  `<verb> returned unexpected response` on the catch-all branch. The
+  inner `Error:` prefix that earlier versions of zaz emitted is gone;
+  the top-level `report_error` printer is the only source of that
+  prefix.
+
+Adding a new error variant with a recovery action means adding it to
+`hint()` (or, for context-bearing variants, attaching a `hint` at the
+construction site); adding a new daemon-talking verb means routing through
+the two helpers above so the wording stays in lockstep.
 
 ## Global flags
 
