@@ -227,6 +227,17 @@ pub enum ValidationErrorKind {
         /// The duplicated name.
         name: String,
     },
+    /// Daemon command references a file-context built-in variable
+    /// (`${zaz:files}`, `${zaz:dirs}`, `${zaz:prefix}`) which is never
+    /// populated for daemon spawns.
+    DaemonCommandFileBuiltin {
+        /// Name of the group.
+        group: String,
+        /// Name of the daemon.
+        daemon: String,
+        /// The offending built-in name, e.g. `zaz:files`.
+        builtin: String,
+    },
 }
 
 impl ValidationErrorKind {
@@ -245,6 +256,7 @@ impl ValidationErrorKind {
             Self::DuplicateTaskName { .. } => "duplicate_task_name",
             Self::EmptyDaemonCommand { .. } => "empty_daemon_command",
             Self::DuplicateDaemonName { .. } => "duplicate_daemon_name",
+            Self::DaemonCommandFileBuiltin { .. } => "daemon_command_file_builtin",
         }
     }
 }
@@ -319,6 +331,18 @@ impl fmt::Display for ValidationErrorKind {
             }
             Self::DuplicateDaemonName { group, name } => {
                 write!(f, "group '{}': duplicate daemon name '{}'", group, name)
+            }
+            Self::DaemonCommandFileBuiltin {
+                group,
+                daemon,
+                builtin,
+            } => {
+                write!(
+                    f,
+                    "group '{}': daemon '{}' references ${{{}}}, which is only \
+                     populated for file-change triggers and is unavailable to daemons",
+                    group, daemon, builtin
+                )
             }
         }
     }

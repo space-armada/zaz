@@ -317,6 +317,23 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
                 errors.push(error);
             }
             daemon_names.insert(name);
+
+            // Daemons run wholesale, not per-file. References to file-context
+            // built-ins would silently expand to empty strings at spawn time.
+            for var_name in zaz_vars::references(&daemon.command) {
+                if zaz_vars::FILE_CONTEXT_BUILTINS.contains(&var_name) {
+                    errors.push(
+                        ValidationError::new(ValidationErrorKind::DaemonCommandFileBuiltin {
+                            group: group.name.clone(),
+                            daemon: name.to_string(),
+                            builtin: var_name.to_string(),
+                        })
+                        .with_hint(
+                            "move this expansion into a [[group.task]] that runs on file changes",
+                        ),
+                    );
+                }
+            }
         }
     }
 }
@@ -324,7 +341,7 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Group, TaskCommand};
+    use crate::{DaemonCommand, Group, TaskCommand};
 
     fn make_group(name: &str) -> Group {
         Group {
@@ -591,6 +608,64 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("cycle detected"));
         assert!(msg.contains("hint: cycle:"));
+    }
+
+    #[test]
+    fn test_daemon_command_rejects_file_context_builtins() {
+        let mut group = make_group("server");
+        group.daemons = vec![DaemonCommand::new(
+            "watcher",
+            "./bin/handler --files ${zaz:files}",
+        )];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("references ${zaz:files}"),
+            "expected error mentioning ${{zaz:files}}, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("daemon 'watcher'"),
+            "expected daemon name in error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("hint:"),
+            "expected hint pointing at task workaround, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_daemon_command_allows_user_variables_and_root() {
+        let mut group = make_group("server");
+        group.daemons = vec![DaemonCommand::new(
+            "watcher",
+            "./bin/handler --root ${zaz:root} --lexicon ${lexicon}",
+        )];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("user vars and ${zaz:root} must be allowed in daemon commands");
+    }
+
+    #[test]
+    fn test_daemon_command_allows_escaped_file_builtin() {
+        let mut group = make_group("server");
+        group.daemons = vec![DaemonCommand::new(
+            "watcher",
+            r"./bin/handler --files \${zaz:files}",
+        )];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("escaped ${zaz:files} must be allowed in daemon commands");
     }
 
     #[test]
