@@ -2638,7 +2638,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "2026.6.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2653,7 +2653,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "zaz"
-version = "0.1.0"
+version = "2026.6.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2678,7 +2678,7 @@ dependencies = [
 
 [[package]]
 name = "zaz-config"
-version = "0.1.0"
+version = "2026.6.1"
 dependencies = [
  "globset",
  "humantime",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "zaz-daemon"
-version = "0.1.0"
+version = "2026.6.1"
 dependencies = [
  "indexmap",
  "notify-rust",
@@ -2713,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "zaz-mcp"
-version = "0.1.0"
+version = "2026.6.1"
 dependencies = [
  "indexmap",
  "rmcp",
@@ -2730,7 +2730,7 @@ dependencies = [
 
 [[package]]
 name = "zaz-process"
-version = "0.1.0"
+version = "2026.6.1"
 dependencies = [
  "nix 0.29.0",
  "portable-pty",
@@ -2743,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "zaz-tui"
-version = "0.1.0"
+version = "2026.6.1"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -2759,14 +2759,14 @@ dependencies = [
 
 [[package]]
 name = "zaz-vars"
-version = "0.1.0"
+version = "2026.6.1"
 dependencies = [
  "thiserror 2.0.17",
 ]
 
 [[package]]
 name = "zaz-watch"
-version = "0.1.0"
+version = "2026.6.1"
 dependencies = [
  "globset",
  "notify",
