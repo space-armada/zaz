@@ -23,6 +23,14 @@ use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
 const DAEMON_START_TASK_ID: &str = "__daemon_start__";
 const DAEMON_RESTART_TASK_ID: &str = "__daemon_restart__";
 
+/// Period for the persistent-log retention tick.
+///
+/// The after-batch path in `LogStore::push_batch` covers steady-state
+/// writes; this cadence only matters when writes pause long enough for
+/// stored rows or DB size to drift past the configured budget without
+/// a write to trigger a sweep.
+const RETENTION_CADENCE: Duration = Duration::from_secs(60);
+
 /// Completion signal from a spawned task execution.
 #[derive(Debug)]
 struct TaskCompletion {
@@ -555,11 +563,18 @@ impl Engine {
                 }
                 LogStorageBackend::Sqlite => {
                     let db_path = crate::log_storage_sqlite::db_path_for_config(&config_path);
+                    let policy = crate::log_storage_sqlite::RetentionPolicy {
+                        max_size_bytes: user_config.log_storage.sqlite.max_size_bytes(),
+                        max_lines_per_process: user_config.log_storage.sqlite.max_lines_per_process,
+                    };
                     let sqlite = crate::log_storage_sqlite::SqliteLogStorage::open(&db_path)
-                        .map_err(DaemonError::LogStorage)?;
+                        .map_err(DaemonError::LogStorage)?
+                        .with_retention(policy);
                     tracing::info!(
                         backend = "sqlite",
                         path = %db_path.display(),
+                        max_size_bytes = policy.max_size_bytes,
+                        max_lines_per_process = policy.max_lines_per_process,
                         "log storage backend selected"
                     );
                     store = store.with_sqlite(sqlite);
@@ -713,6 +728,16 @@ impl Engine {
     /// are visible. Also call periodically in the main loop.
     pub fn process_incoming_logs(&mut self) -> Result<(), DaemonError> {
         self.log_store.drain()?;
+        Ok(())
+    }
+
+    /// Run the persistent-log retention sweep if the periodic cadence
+    /// has elapsed. Cheap when nothing is due — the gate inside
+    /// [`LogStore::maybe_enforce_retention_tick`] short-circuits without
+    /// touching the SQLite connection.
+    pub fn maybe_enforce_log_retention(&mut self) -> Result<(), DaemonError> {
+        self.log_store
+            .maybe_enforce_retention_tick(RETENTION_CADENCE)?;
         Ok(())
     }
 

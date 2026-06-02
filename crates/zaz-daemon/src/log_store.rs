@@ -14,6 +14,7 @@ use crate::error::LogStorageError;
 use crate::log_storage::{LogQuery, LogQueryResult, LogStorage, LogStorageStats};
 use crate::log_storage_sqlite::SqliteLogStorage;
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
 /// Default maximum log lines to keep per process.
@@ -59,6 +60,12 @@ pub struct LogStore {
     /// the simple `get(name, limit)` recent-tail path so live UI stays
     /// responsive even when the disk backend is slow or degraded.
     sqlite: Option<Box<SqliteLogStorage>>,
+
+    /// Wall-clock instant the persistent retention sweep last ran.
+    /// `push_batch` and the periodic tick share this gate so the tick
+    /// short-circuits when an after-batch sweep already covered the
+    /// window.
+    last_retention_at: Option<Instant>,
 }
 
 impl LogStore {
@@ -82,6 +89,7 @@ impl LogStore {
             estimated_memory: 0,
             verbose_callback: None,
             sqlite: None,
+            last_retention_at: None,
         }
     }
 
@@ -153,6 +161,33 @@ impl LogStore {
     pub fn drain_and_flush_now(&mut self) -> Result<(), LogStorageError> {
         self.drain()?;
         self.flush_now()
+    }
+
+    /// Run the persistent retention sweep if `cadence` has elapsed since
+    /// the last run.
+    ///
+    /// The after-batch path inside [`push_batch`] also bumps the gate,
+    /// so an active daemon under steady writes never re-runs retention
+    /// here. The tick exists to keep the budget honest during quiet
+    /// periods, and is a no-op when no SQLite backend is attached.
+    pub fn maybe_enforce_retention_tick(
+        &mut self,
+        cadence: Duration,
+    ) -> Result<(), LogStorageError> {
+        if self.sqlite.is_none() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let due = match self.last_retention_at {
+            Some(last) => now.duration_since(last) >= cadence,
+            None => true,
+        };
+        if !due {
+            return Ok(());
+        }
+        self.enforce_retention()?;
+        self.last_retention_at = Some(now);
+        Ok(())
     }
 
     /// Internal push that handles storage, trimming, and broadcast.
@@ -343,6 +378,12 @@ impl LogStorage for LogStore {
         }
         if let Some(sqlite) = self.sqlite.as_mut() {
             sqlite.push_batch(persisted)?;
+            // Retention sweeps directly after the batch so the persisted
+            // row count and on-disk size stay near the configured budget
+            // without waiting for the periodic tick. The sweep is cheap
+            // when nothing needs trimming.
+            sqlite.enforce_retention()?;
+            self.last_retention_at = Some(Instant::now());
         }
         Ok(())
     }
@@ -1011,6 +1052,16 @@ mod tests {
         )
     }
 
+    fn hybrid_store_with_retention(
+        policy: crate::log_storage_sqlite::RetentionPolicy,
+    ) -> LogStore {
+        LogStore::new().with_sqlite(
+            SqliteLogStorage::open_in_memory()
+                .expect("open in-memory sqlite")
+                .with_retention(policy),
+        )
+    }
+
     #[test]
     fn hybrid_get_serves_from_hot_buffer() {
         let mut store = hybrid_store();
@@ -1143,6 +1194,146 @@ mod tests {
         assert!(stats.memory_bytes > 0);
         assert_eq!(stats.memory_limit, Some(DEFAULT_MEMORY_LIMIT));
         assert_eq!(stats.max_lines_per_process, DEFAULT_MAX_LINES_PER_PROCESS);
+    }
+
+    #[test]
+    fn hybrid_push_batch_enforces_per_process_retention() {
+        let mut store = hybrid_store_with_retention(crate::log_storage_sqlite::RetentionPolicy {
+            max_size_bytes: 100 * 1024 * 1024,
+            max_lines_per_process: 3,
+        });
+
+        // Ten rows into the same process; the after-batch retention sweep
+        // should trim the persisted side back to the policy limit while
+        // the broadcast and hot-buffer paths still see everything.
+        let batch: Vec<LogLine> = (0..10)
+            .map(|i| make_log("task1", &format!("l{i}"), i as u64))
+            .collect();
+        store.push_batch(batch).unwrap();
+
+        let result = store.query(LogQuery::process("task1")).unwrap();
+        assert_eq!(result.total_count, 3);
+        // The three most recent lines survive: ascending-order id is
+        // insertion order, so contents `l7`, `l8`, `l9` remain.
+        assert_eq!(result.logs[0].content, "l7");
+        assert_eq!(result.logs[2].content, "l9");
+    }
+
+    #[test]
+    fn hybrid_maybe_enforce_retention_tick_skips_within_cadence() {
+        let mut store = hybrid_store_with_retention(crate::log_storage_sqlite::RetentionPolicy {
+            max_size_bytes: 100 * 1024 * 1024,
+            max_lines_per_process: 3,
+        });
+
+        // First batch goes through push_batch and bumps the retention gate.
+        let initial: Vec<LogLine> = (0..5)
+            .map(|i| make_log("task1", &format!("init{i}"), i as u64))
+            .collect();
+        store.push_batch(initial).unwrap();
+        assert_eq!(
+            store.query(LogQuery::process("task1")).unwrap().total_count,
+            3
+        );
+
+        // Re-seed the persistent side directly so the gate stays fresh;
+        // the tick should see "due == false" and skip the SQL.
+        let sqlite = store.sqlite.as_mut().expect("sqlite attached");
+        sqlite
+            .push_batch(vec![
+                make_log("task1", "extra1", 100),
+                make_log("task1", "extra2", 200),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.query(LogQuery::process("task1")).unwrap().total_count,
+            5
+        );
+
+        store
+            .maybe_enforce_retention_tick(Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            store.query(LogQuery::process("task1")).unwrap().total_count,
+            5,
+            "tick within cadence should be a no-op",
+        );
+    }
+
+    #[test]
+    fn hybrid_maybe_enforce_retention_tick_runs_after_cadence_elapsed() {
+        let mut store = hybrid_store_with_retention(crate::log_storage_sqlite::RetentionPolicy {
+            max_size_bytes: 100 * 1024 * 1024,
+            max_lines_per_process: 3,
+        });
+
+        let initial: Vec<LogLine> = (0..5)
+            .map(|i| make_log("task1", &format!("init{i}"), i as u64))
+            .collect();
+        store.push_batch(initial).unwrap();
+
+        let sqlite = store.sqlite.as_mut().expect("sqlite attached");
+        sqlite
+            .push_batch(vec![
+                make_log("task1", "extra1", 100),
+                make_log("task1", "extra2", 200),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.query(LogQuery::process("task1")).unwrap().total_count,
+            5
+        );
+
+        // Wind the gate back so the cadence elapses.
+        store.last_retention_at = Some(Instant::now() - Duration::from_secs(120));
+
+        store
+            .maybe_enforce_retention_tick(Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            store.query(LogQuery::process("task1")).unwrap().total_count,
+            3,
+            "tick past the cadence should sweep persistent rows",
+        );
+    }
+
+    #[test]
+    fn hybrid_maybe_enforce_retention_tick_runs_first_call_without_gate() {
+        let mut store = hybrid_store_with_retention(crate::log_storage_sqlite::RetentionPolicy {
+            max_size_bytes: 100 * 1024 * 1024,
+            max_lines_per_process: 3,
+        });
+
+        // Seed directly so `last_retention_at` stays `None`.
+        let sqlite = store.sqlite.as_mut().expect("sqlite attached");
+        let initial: Vec<LogLine> = (0..6)
+            .map(|i| make_log("task1", &format!("seed{i}"), i as u64))
+            .collect();
+        sqlite.push_batch(initial).unwrap();
+        assert_eq!(
+            store.query(LogQuery::process("task1")).unwrap().total_count,
+            6
+        );
+
+        // First-ever tick runs unconditionally.
+        store
+            .maybe_enforce_retention_tick(Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            store.query(LogQuery::process("task1")).unwrap().total_count,
+            3
+        );
+        assert!(store.last_retention_at.is_some());
+    }
+
+    #[test]
+    fn hybrid_maybe_enforce_retention_tick_noop_without_sqlite() {
+        let mut store = LogStore::new();
+        store
+            .maybe_enforce_retention_tick(Duration::from_secs(60))
+            .unwrap();
+        // No SQLite, no gate bump.
+        assert!(store.last_retention_at.is_none());
     }
 
     #[test]

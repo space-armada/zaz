@@ -856,6 +856,9 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
                 if let Err(e) = engine.process_incoming_logs() {
                     tracing::error!(error = %e, "log drain error");
                 }
+                if let Err(e) = engine.maybe_enforce_log_retention() {
+                    tracing::error!(error = %e, "log retention error");
+                }
 
                 if let Err(e) = engine.poll().await {
                     tracing::error!(error = %e, "poll error");

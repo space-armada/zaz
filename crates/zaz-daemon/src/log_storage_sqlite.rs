@@ -35,6 +35,30 @@ pub const CURRENT_SCHEMA_VERSION: i32 = 1;
 /// contention from the API path while keeping shutdown responsive.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 
+/// Maximum rows deleted per pass when pruning for the size budget.
+/// The size sweep loops until the logical data size is under the
+/// configured limit; chunking keeps any single statement's lock
+/// window bounded so concurrent reads stay responsive.
+const RETENTION_CHUNK: i64 = 1_000;
+
+/// Persistent retention limits applied by `enforce_retention`.
+///
+/// Both limits are enforced together: the per-process sweep deletes
+/// oldest rows for any process whose persisted row count exceeds
+/// `max_lines_per_process`, then the size sweep deletes oldest rows
+/// globally until the logical data size (excluding freelist pages)
+/// is under `max_size_bytes`. The sweep never issues `VACUUM` or
+/// `wal_checkpoint`, so the on-disk file settles near the budget
+/// while subsequent inserts reuse freed pages.
+#[derive(Debug, Clone, Copy)]
+pub struct RetentionPolicy {
+    /// Maximum logical data bytes the persisted log set may occupy.
+    /// Computed as `(page_count - freelist_count) * page_size`.
+    pub max_size_bytes: usize,
+    /// Maximum rows retained per process.
+    pub max_lines_per_process: usize,
+}
+
 /// SQLite-backed log storage.
 ///
 /// Owns the open / migrate lifecycle, the data-plane methods that mirror the
@@ -43,6 +67,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 /// this backend with the in-memory hot buffer.
 pub struct SqliteLogStorage {
     conn: Connection,
+    policy: Option<RetentionPolicy>,
 }
 
 impl SqliteLogStorage {
@@ -63,7 +88,10 @@ impl SqliteLogStorage {
             .map_err(|e| LogStorageError::Open(format!("open {}: {e}", path.display())))?;
         apply_pragmas(&conn)?;
         migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            policy: None,
+        })
     }
 
     /// Open an in-memory SQLite database with the same lifecycle as
@@ -75,7 +103,18 @@ impl SqliteLogStorage {
             .map_err(|e| LogStorageError::Open(format!("open in-memory: {e}")))?;
         apply_pragmas(&conn)?;
         migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            policy: None,
+        })
+    }
+
+    /// Attach a retention policy. Without a policy, `enforce_retention`
+    /// is a no-op so the SQLite backend keeps the original "seam wired,
+    /// no behavior" contract from phase 27.
+    pub fn with_retention(mut self, policy: RetentionPolicy) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     /// Insert a batch of log lines inside a single SQLite transaction.
@@ -248,6 +287,132 @@ impl SqliteLogStorage {
         Ok(())
     }
 
+    /// Run the persistent retention sweep.
+    ///
+    /// With no policy attached, this returns `Ok(())` without touching
+    /// the database. With a policy attached, two passes run:
+    ///
+    /// 1. **Per-process pass.** For each process whose row count exceeds
+    ///    `max_lines_per_process`, the oldest `count - max` rows are
+    ///    deleted by ascending `id` (which equals insertion order).
+    /// 2. **Size pass.** While the logical data size
+    ///    `(page_count - freelist_count) * page_size` exceeds
+    ///    `max_size_bytes`, the oldest [`RETENTION_CHUNK`] rows are
+    ///    deleted in a loop. The loop bails out when no rows remain
+    ///    or when a pass deletes nothing, so a degenerate budget can
+    ///    never spin forever.
+    ///
+    /// No `VACUUM` or `wal_checkpoint` runs here; freed pages stay on
+    /// the freelist and get reused by subsequent inserts.
+    pub fn enforce_retention(&mut self) -> Result<(), LogStorageError> {
+        let Some(policy) = self.policy else {
+            return Ok(());
+        };
+
+        self.prune_per_process(policy.max_lines_per_process)?;
+        self.prune_to_size(policy.max_size_bytes)?;
+        Ok(())
+    }
+
+    fn prune_per_process(&self, max: usize) -> Result<(), LogStorageError> {
+        let max_i64 = max as i64;
+        let over: Vec<(String, i64)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT process, COUNT(*) AS row_count
+                     FROM log_entries
+                     GROUP BY process
+                     HAVING row_count > ?1",
+                )
+                .map_err(|e| {
+                    LogStorageError::Retention(format!("prepare per-process scan: {e}"))
+                })?;
+            let rows = stmt
+                .query_map(rusqlite::params![max_i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| {
+                    LogStorageError::Retention(format!("execute per-process scan: {e}"))
+                })?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(
+                    row.map_err(|e| {
+                        LogStorageError::Retention(format!("decode per-process row: {e}"))
+                    })?,
+                );
+            }
+            out
+        };
+
+        for (process, count) in over {
+            let excess = count - max_i64;
+            if excess <= 0 {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "DELETE FROM log_entries
+                     WHERE id IN (
+                         SELECT id FROM log_entries
+                         WHERE process = ?1
+                         ORDER BY id ASC
+                         LIMIT ?2
+                     )",
+                    rusqlite::params![process, excess],
+                )
+                .map_err(|e| {
+                    LogStorageError::Retention(format!("delete excess for {process}: {e}"))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn prune_to_size(&self, max_bytes: usize) -> Result<(), LogStorageError> {
+        let page_size = self.read_pragma_int("page_size")?;
+        if page_size <= 0 {
+            return Ok(());
+        }
+
+        loop {
+            let logical = self.logical_data_bytes(page_size)?;
+            if logical <= max_bytes as i64 {
+                return Ok(());
+            }
+
+            let deleted = self
+                .conn
+                .execute(
+                    "DELETE FROM log_entries
+                     WHERE id IN (
+                         SELECT id FROM log_entries
+                         ORDER BY id ASC
+                         LIMIT ?1
+                     )",
+                    rusqlite::params![RETENTION_CHUNK],
+                )
+                .map_err(|e| LogStorageError::Retention(format!("delete oldest chunk: {e}")))?;
+
+            if deleted == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    fn logical_data_bytes(&self, page_size: i64) -> Result<i64, LogStorageError> {
+        let page_count = self.read_pragma_int("page_count")?;
+        let freelist = self.read_pragma_int("freelist_count")?;
+        let used_pages = (page_count - freelist).max(0);
+        Ok(used_pages.saturating_mul(page_size))
+    }
+
+    fn read_pragma_int(&self, name: &str) -> Result<i64, LogStorageError> {
+        self.conn
+            .pragma_query_value(None, name, |row| row.get::<_, i64>(0))
+            .map_err(|e| LogStorageError::Retention(format!("read pragma {name}: {e}")))
+    }
+
     /// Read up to `limit` rows for `name`, ordered ascending by
     /// `(timestamp_ms, id)`. `name == "*"` returns rows across every
     /// process. Matches the in-memory store's "most recent `limit`
@@ -352,10 +517,7 @@ impl LogStorage for SqliteLogStorage {
     }
 
     fn enforce_retention(&mut self) -> Result<(), LogStorageError> {
-        // Retention lands with the follow-up phase; the hybrid runtime
-        // forwards this call so the seam is wired even while the policy
-        // is still no-op.
-        Ok(())
+        SqliteLogStorage::enforce_retention(self)
     }
 
     fn memory_limit(&self) -> Option<usize> {
@@ -1210,6 +1372,191 @@ mod tests {
         assert_eq!(LogStorage::max_lines_per_process(&storage), 0);
         assert!(storage.set_memory_limit(123).is_none());
         assert_eq!(storage.set_max_lines_per_process(456), 0);
+    }
+
+    // ---------- enforce_retention ----------
+
+    fn process_row_count(conn: &Connection, process: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM log_entries WHERE process = ?1",
+            (process,),
+            |row| row.get(0),
+        )
+        .expect("count rows for process")
+    }
+
+    fn ids_for_process(conn: &Connection, process: &str) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM log_entries WHERE process = ?1 ORDER BY id ASC")
+            .expect("prepare id select");
+        let rows = stmt
+            .query_map((process,), |row| row.get::<_, i64>(0))
+            .expect("query ids");
+        rows.map(|r| r.expect("decode id")).collect()
+    }
+
+    #[test]
+    fn enforce_retention_noop_without_policy() {
+        let mut storage = SqliteLogStorage::open_in_memory().expect("open");
+        storage
+            .push_batch(vec![
+                line(100, "web", None, "a"),
+                line(200, "web", None, "b"),
+            ])
+            .expect("push_batch");
+
+        storage.enforce_retention().expect("retention");
+
+        assert_eq!(row_count(&storage.conn), 2);
+    }
+
+    #[test]
+    fn enforce_retention_noop_when_under_limits() {
+        let mut storage = SqliteLogStorage::open_in_memory()
+            .expect("open")
+            .with_retention(RetentionPolicy {
+                max_size_bytes: 100 * 1024 * 1024,
+                max_lines_per_process: 1_000,
+            });
+        let batch: Vec<LogLine> = (0..50)
+            .map(|i| line(i as u64 * 10, "web", None, &format!("line {i}")))
+            .collect();
+        storage.push_batch(batch).expect("push_batch");
+
+        storage.enforce_retention().expect("retention");
+
+        assert_eq!(row_count(&storage.conn), 50);
+    }
+
+    #[test]
+    fn enforce_retention_trims_per_process_to_limit() {
+        let mut storage = SqliteLogStorage::open_in_memory()
+            .expect("open")
+            .with_retention(RetentionPolicy {
+                max_size_bytes: 100 * 1024 * 1024,
+                max_lines_per_process: 10,
+            });
+        let batch: Vec<LogLine> = (0..30)
+            .map(|i| line(i as u64 * 10, "web", None, &format!("line {i}")))
+            .collect();
+        storage.push_batch(batch).expect("push_batch");
+        assert_eq!(process_row_count(&storage.conn, "web"), 30);
+
+        storage.enforce_retention().expect("retention");
+
+        assert_eq!(process_row_count(&storage.conn, "web"), 10);
+        let logs = storage.get_internal("web", None).expect("get");
+        // The ten most recent rows survive; ascending-order contract holds.
+        assert_eq!(logs.len(), 10);
+        assert_eq!(logs[0].content, "line 20");
+        assert_eq!(logs[9].content, "line 29");
+    }
+
+    #[test]
+    fn enforce_retention_per_process_independent() {
+        let mut storage = SqliteLogStorage::open_in_memory()
+            .expect("open")
+            .with_retention(RetentionPolicy {
+                max_size_bytes: 100 * 1024 * 1024,
+                max_lines_per_process: 5,
+            });
+        let mut batch = Vec::new();
+        for i in 0..20 {
+            batch.push(line(i as u64 * 10, "web", None, &format!("w{i}")));
+        }
+        for i in 0..3 {
+            batch.push(line(2_000 + i as u64 * 10, "worker", None, &format!("k{i}")));
+        }
+        storage.push_batch(batch).expect("push_batch");
+
+        storage.enforce_retention().expect("retention");
+
+        assert_eq!(process_row_count(&storage.conn, "web"), 5);
+        // Worker stayed under the limit and is untouched.
+        assert_eq!(process_row_count(&storage.conn, "worker"), 3);
+    }
+
+    #[test]
+    fn enforce_retention_handles_stale_process() {
+        let mut storage = SqliteLogStorage::open_in_memory()
+            .expect("open")
+            .with_retention(RetentionPolicy {
+                max_size_bytes: 100 * 1024 * 1024,
+                max_lines_per_process: 4,
+            });
+        // The stale process emitted in the past and has not written
+        // since; the per-process pass should still trim it.
+        let batch: Vec<LogLine> = (0..20)
+            .map(|i| line(i as u64 * 10, "stale", None, &format!("s{i}")))
+            .collect();
+        storage.push_batch(batch).expect("push_batch");
+
+        storage.enforce_retention().expect("retention");
+
+        assert_eq!(process_row_count(&storage.conn, "stale"), 4);
+    }
+
+    #[test]
+    fn enforce_retention_trims_oldest_for_size_budget() {
+        let mut storage = SqliteLogStorage::open_in_memory().expect("open");
+        // Push enough rows that the size sweep must iterate the chunked
+        // delete loop at least twice. A single chunk deletes
+        // `RETENTION_CHUNK` rows, so a smaller dataset would either be
+        // wiped in one pass or not need pruning at all.
+        let payload = "x".repeat(1_024);
+        let total_rows = (RETENTION_CHUNK as usize) * 5;
+        let batch: Vec<LogLine> = (0..total_rows)
+            .map(|i| line(i as u64, "web", None, &payload))
+            .collect();
+        storage.push_batch(batch).expect("push_batch");
+
+        let page_size = storage.read_pragma_int("page_size").expect("page_size");
+        let before = storage.logical_data_bytes(page_size).expect("logical");
+        assert!(before > 1_000_000, "expected sizeable DB, got {before}");
+
+        // Half-of-original budget should leave the loop with rows remaining
+        // because each chunked pass removes ~1/5 of the data.
+        let budget = (before as usize) / 2;
+        storage = storage.with_retention(RetentionPolicy {
+            max_size_bytes: budget,
+            max_lines_per_process: 1_000_000,
+        });
+        storage.enforce_retention().expect("retention");
+
+        let after = storage.logical_data_bytes(page_size).expect("logical");
+        assert!(
+            after <= budget as i64,
+            "logical size {after} should be at or under budget {budget}",
+        );
+
+        let remaining = row_count(&storage.conn);
+        assert!(
+            remaining > 0 && (remaining as usize) < total_rows,
+            "expected partial trim, got {remaining} of {total_rows}",
+        );
+
+        // Surviving rows are the most recent ones: their ids are larger
+        // than any deleted row, and ascending-order id is the insert order.
+        let ids = ids_for_process(&storage.conn, "web");
+        let first_id = *ids.first().expect("at least one surviving row");
+        assert!(
+            first_id > 1,
+            "oldest surviving id {first_id} should be past the deleted prefix",
+        );
+    }
+
+    #[test]
+    fn enforce_retention_size_sweep_bails_when_empty() {
+        let mut storage = SqliteLogStorage::open_in_memory()
+            .expect("open")
+            .with_retention(RetentionPolicy {
+                max_size_bytes: 1,
+                max_lines_per_process: 1_000,
+            });
+        // No rows: nothing to delete, so the loop must terminate cleanly
+        // even though the empty DB can be larger than the absurd budget.
+        storage.enforce_retention().expect("retention");
+        assert_eq!(row_count(&storage.conn), 0);
     }
 
     // ---------- db_path_for_config ----------
