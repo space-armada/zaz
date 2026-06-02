@@ -8,17 +8,17 @@
 //! that issues `PRAGMA wal_checkpoint(TRUNCATE)` so cold open stays
 //! fast and the `.sqlite3` file is copy-safe after a clean shutdown.
 //!
-//! The hybrid hot-buffer / SQLite runtime and the [`LogStorage`] trait
-//! wiring land with the follow-up milestone; until then nothing outside
-//! the inline tests instantiates this backend.
+//! The hybrid hot-buffer / SQLite runtime composes this backend with
+//! the in-memory [`LogStore`]; see [`db_path_for_config`] for the
+//! XDG-state path the daemon resolves at startup.
 //!
 //! [`LogStorage`]: crate::log_storage::LogStorage
+//! [`LogStore`]: crate::log_store::LogStore
 
-// The constructor and methods are reachable only from the inline tests
-// until the daemon startup wiring lands; the suppression peels off then.
-#![allow(dead_code)]
-
-use std::path::Path;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::types::Value;
@@ -26,7 +26,7 @@ use rusqlite::Connection;
 
 use crate::api::{LogLine, LogSource, OutputKind};
 use crate::error::LogStorageError;
-use crate::log_storage::{LogQuery, LogQueryResult, LogStorageStats};
+use crate::log_storage::{LogQuery, LogQueryResult, LogStorage, LogStorageStats};
 
 /// Latest schema version this build understands.
 pub const CURRENT_SCHEMA_VERSION: i32 = 1;
@@ -37,8 +37,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 
 /// SQLite-backed log storage.
 ///
-/// The trait implementation and the read/write methods come with
-/// milestones 27.2 and 27.3; this skeleton only owns the lifecycle.
+/// Owns the open / migrate lifecycle, the data-plane methods that mirror the
+/// in-memory store's filter and pagination semantics, and the shutdown
+/// checkpoint. The hybrid runtime in [`crate::log_store::LogStore`] composes
+/// this backend with the in-memory hot buffer.
 pub struct SqliteLogStorage {
     conn: Connection,
 }
@@ -67,6 +69,7 @@ impl SqliteLogStorage {
     /// Open an in-memory SQLite database with the same lifecycle as
     /// [`open`](Self::open). Useful for tests; WAL does not stick on
     /// `:memory:` so the journal-mode check tolerates `memory` here.
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, LogStorageError> {
         let conn = Connection::open_in_memory()
             .map_err(|e| LogStorageError::Open(format!("open in-memory: {e}")))?;
@@ -244,6 +247,188 @@ impl SqliteLogStorage {
             .map_err(|e| LogStorageError::Write(format!("wal_checkpoint: {e}")))?;
         Ok(())
     }
+
+    /// Read up to `limit` rows for `name`, ordered ascending by
+    /// `(timestamp_ms, id)`. `name == "*"` returns rows across every
+    /// process. Matches the in-memory store's "most recent `limit`
+    /// rows, in ascending order" contract — implemented as a DESC
+    /// inner query that takes the last N rows, then re-ordered ASC.
+    fn get_internal(
+        &self,
+        name: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<LogLine>, LogStorageError> {
+        let limit_value: i64 = match limit {
+            Some(n) => n as i64,
+            None => -1,
+        };
+
+        let collected = if name == "*" {
+            let sql = "SELECT timestamp_ms, process, group_name, source, output_kind, content
+                       FROM (
+                           SELECT id, timestamp_ms, process, group_name, source, output_kind, content
+                           FROM log_entries
+                           ORDER BY timestamp_ms DESC, id DESC
+                           LIMIT ?1
+                       )
+                       ORDER BY timestamp_ms ASC, id ASC";
+            let mut stmt = self
+                .conn
+                .prepare(sql)
+                .map_err(|e| LogStorageError::Query(format!("prepare get: {e}")))?;
+            let rows = stmt
+                .query_map(rusqlite::params![limit_value], row_to_log_line)
+                .map_err(|e| LogStorageError::Query(format!("execute get: {e}")))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| LogStorageError::Query(format!("decode row: {e}")))?);
+            }
+            out
+        } else {
+            let sql = "SELECT timestamp_ms, process, group_name, source, output_kind, content
+                       FROM (
+                           SELECT id, timestamp_ms, process, group_name, source, output_kind, content
+                           FROM log_entries
+                           WHERE process = ?1
+                           ORDER BY timestamp_ms DESC, id DESC
+                           LIMIT ?2
+                       )
+                       ORDER BY timestamp_ms ASC, id ASC";
+            let mut stmt = self
+                .conn
+                .prepare(sql)
+                .map_err(|e| LogStorageError::Query(format!("prepare get: {e}")))?;
+            let rows = stmt
+                .query_map(rusqlite::params![name, limit_value], row_to_log_line)
+                .map_err(|e| LogStorageError::Query(format!("execute get: {e}")))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| LogStorageError::Query(format!("decode row: {e}")))?);
+            }
+            out
+        };
+
+        Ok(collected)
+    }
+}
+
+impl LogStorage for SqliteLogStorage {
+    fn push(&mut self, log: LogLine) -> Result<(), LogStorageError> {
+        self.push_batch(vec![log])
+    }
+
+    fn push_batch(&mut self, logs: Vec<LogLine>) -> Result<(), LogStorageError> {
+        SqliteLogStorage::push_batch(self, logs)
+    }
+
+    fn get(&self, name: &str, limit: Option<usize>) -> Result<Vec<LogLine>, LogStorageError> {
+        self.get_internal(name, limit)
+    }
+
+    fn query(&self, query: LogQuery) -> Result<LogQueryResult, LogStorageError> {
+        SqliteLogStorage::query(self, query)
+    }
+
+    fn stats(&self) -> Result<LogStorageStats, LogStorageError> {
+        SqliteLogStorage::stats(self)
+    }
+
+    fn clear(&mut self) -> Result<(), LogStorageError> {
+        SqliteLogStorage::clear(self)
+    }
+
+    fn clear_process(&mut self, name: &str) -> Result<(), LogStorageError> {
+        SqliteLogStorage::clear_process(self, name)
+    }
+
+    fn flush(&mut self) -> Result<(), LogStorageError> {
+        // The inherent `flush_now` is the meaningful durability boundary;
+        // between-batch flush is a no-op against WAL-mode SQLite.
+        Ok(())
+    }
+
+    fn flush_now(&mut self) -> Result<(), LogStorageError> {
+        SqliteLogStorage::flush_now(self)
+    }
+
+    fn enforce_retention(&mut self) -> Result<(), LogStorageError> {
+        // Retention lands with the follow-up phase; the hybrid runtime
+        // forwards this call so the seam is wired even while the policy
+        // is still no-op.
+        Ok(())
+    }
+
+    fn memory_limit(&self) -> Option<usize> {
+        // Hot-buffer concept; the hybrid runtime answers it from the
+        // in-memory side. SQLite has no equivalent.
+        None
+    }
+
+    fn set_memory_limit(&mut self, _bytes: usize) -> Option<usize> {
+        None
+    }
+
+    fn max_lines_per_process(&self) -> usize {
+        0
+    }
+
+    fn set_max_lines_per_process(&mut self, _max: usize) -> usize {
+        0
+    }
+}
+
+/// Resolve the persistent log database path for `config_path`.
+///
+/// Always lands under `$XDG_STATE_HOME/zaz/logs/<hash>.sqlite3`, falling
+/// back to `~/.local/state/zaz/logs/<hash>.sqlite3`. The proposal pins
+/// this layout against the existing daemon debug-log precedent and
+/// explicitly does *not* fork into `<project>/.zaz/` even when the
+/// socket does, so SQLite WAL / SHM siblings cannot leak into project
+/// trees or network mounts.
+///
+/// Identity is keyed by the canonicalized config path so unrelated
+/// projects do not share log history. The directory tree is created
+/// with `0o700` permissions on first use.
+pub fn db_path_for_config(config_path: &Path) -> PathBuf {
+    db_path_in_base(&state_dir_base(), config_path)
+}
+
+#[cfg(test)]
+impl SqliteLogStorage {
+    /// Test-only access to the underlying connection so sibling-module
+    /// tests can install poison triggers or read pragmas directly.
+    pub(crate) fn conn_for_test(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+fn state_dir_base() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local/state");
+    }
+    PathBuf::from(".")
+}
+
+fn db_path_in_base(base: &Path, config_path: &Path) -> PathBuf {
+    let canonical = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    let hash = {
+        let mut hasher = DefaultHasher::new();
+        canonical.hash(&mut hasher);
+        hasher.finish()
+    };
+    let dir = base.join("zaz").join("logs");
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    dir.join(format!("{:016x}.sqlite3", hash))
 }
 
 fn source_to_str(s: LogSource) -> &'static str {
@@ -945,5 +1130,125 @@ mod tests {
             .push_batch(vec![line(100, "web", None, "a")])
             .expect("push_batch");
         storage.flush_now().expect("flush_now no-op");
+    }
+
+    // ---------- LogStorage trait impl ----------
+
+    #[test]
+    fn trait_push_round_trips_single_line() {
+        let mut storage = SqliteLogStorage::open_in_memory().expect("open");
+        let log = line(100, "web", Some("backend"), "single");
+        LogStorage::push(&mut storage, log).expect("push");
+
+        let logs = LogStorage::get(&storage, "web", None).expect("get");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].content, "single");
+        assert_eq!(logs[0].group.as_deref(), Some("backend"));
+    }
+
+    #[test]
+    fn trait_push_batch_round_trips() {
+        let mut storage = SqliteLogStorage::open_in_memory().expect("open");
+        let batch = vec![
+            line(100, "web", None, "one"),
+            line(200, "web", None, "two"),
+            line(300, "web", None, "three"),
+        ];
+        LogStorage::push_batch(&mut storage, batch).expect("push_batch");
+
+        let logs = LogStorage::get(&storage, "web", None).expect("get");
+        assert_eq!(logs.len(), 3);
+        assert_eq!(logs[0].content, "one");
+        assert_eq!(logs[2].content, "three");
+    }
+
+    #[test]
+    fn trait_get_returns_most_recent_when_limited() {
+        let mut storage = SqliteLogStorage::open_in_memory().expect("open");
+        for i in 0..10 {
+            LogStorage::push(&mut storage, line(i as u64 * 100, "web", None, &format!("l{i}")))
+                .expect("push");
+        }
+        let last_three = LogStorage::get(&storage, "web", Some(3)).expect("get");
+        assert_eq!(last_three.len(), 3);
+        assert_eq!(last_three[0].content, "l7");
+        assert_eq!(last_three[2].content, "l9");
+    }
+
+    #[test]
+    fn trait_get_all_processes() {
+        let mut storage = SqliteLogStorage::open_in_memory().expect("open");
+        LogStorage::push(&mut storage, line(100, "web", None, "a")).expect("push");
+        LogStorage::push(&mut storage, line(200, "worker", None, "b")).expect("push");
+        LogStorage::push(&mut storage, line(300, "web", None, "c")).expect("push");
+
+        let all = LogStorage::get(&storage, "*", None).expect("get");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].timestamp, 100);
+        assert_eq!(all[2].timestamp, 300);
+    }
+
+    #[test]
+    fn trait_clear_removes_all() {
+        let mut storage = SqliteLogStorage::open_in_memory().expect("open");
+        LogStorage::push(&mut storage, line(100, "web", None, "a")).expect("push");
+        LogStorage::clear(&mut storage).expect("clear");
+        assert!(LogStorage::get(&storage, "*", None).expect("get").is_empty());
+    }
+
+    #[test]
+    fn trait_lifecycle_hooks_are_noop() {
+        let mut storage = SqliteLogStorage::open_in_memory().expect("open");
+        // flush / enforce_retention always succeed against the SQLite backend
+        // even when no rows exist.
+        LogStorage::flush(&mut storage).expect("flush");
+        LogStorage::enforce_retention(&mut storage).expect("retention");
+        // memory_limit / max_lines_per_process are hot-buffer concepts; the
+        // hybrid wrapper answers them, so the SQLite-side trait impl returns
+        // neutral values.
+        assert!(LogStorage::memory_limit(&storage).is_none());
+        assert_eq!(LogStorage::max_lines_per_process(&storage), 0);
+        assert!(storage.set_memory_limit(123).is_none());
+        assert_eq!(storage.set_max_lines_per_process(456), 0);
+    }
+
+    // ---------- db_path_for_config ----------
+
+    #[test]
+    fn db_path_in_base_keys_off_canonical_config_path() {
+        let base = tempdir().expect("tempdir");
+        // Use a path that does not exist on disk so canonicalize falls
+        // through to the literal value; deterministic regardless of CWD.
+        let cfg = PathBuf::from("/tmp/zaz-test-config-a/zaz.toml");
+        let p1 = db_path_in_base(base.path(), &cfg);
+        let p2 = db_path_in_base(base.path(), &cfg);
+        assert_eq!(p1, p2, "same config path should resolve to same DB path");
+
+        let cfg2 = PathBuf::from("/tmp/zaz-test-config-b/zaz.toml");
+        let p3 = db_path_in_base(base.path(), &cfg2);
+        assert_ne!(
+            p1, p3,
+            "different config paths should resolve to different DB paths"
+        );
+
+        // Layout: <base>/zaz/logs/<16-hex>.sqlite3
+        assert!(p1.starts_with(base.path().join("zaz").join("logs")));
+        assert_eq!(p1.extension().and_then(|e| e.to_str()), Some("sqlite3"));
+        let stem = p1.file_stem().and_then(|s| s.to_str()).expect("stem");
+        assert_eq!(stem.len(), 16);
+        assert!(stem.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn db_path_in_base_creates_logs_directory_with_0o700() {
+        let base = tempdir().expect("tempdir");
+        let cfg = PathBuf::from("/tmp/zaz-test-dir-perm/zaz.toml");
+        let _ = db_path_in_base(base.path(), &cfg);
+
+        let logs_dir = base.path().join("zaz").join("logs");
+        assert!(logs_dir.is_dir());
+        let meta = std::fs::metadata(&logs_dir).expect("metadata");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "expected 0o700, got {mode:o}");
     }
 }

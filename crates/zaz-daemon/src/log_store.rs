@@ -12,6 +12,7 @@
 use crate::api::{LogLine, LogSource};
 use crate::error::LogStorageError;
 use crate::log_storage::{LogQuery, LogQueryResult, LogStorage, LogStorageStats};
+use crate::log_storage_sqlite::SqliteLogStorage;
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::{broadcast, mpsc};
 
@@ -51,6 +52,13 @@ pub struct LogStore {
     /// Callback for verbose output (optional).
     #[allow(clippy::type_complexity)]
     verbose_callback: Option<Box<dyn Fn(&LogLine) + Send>>,
+
+    /// Optional persistent SQLite backend. When attached, drained
+    /// batches are also written through to disk and historical queries
+    /// route to SQLite; the hot buffer continues to back broadcast and
+    /// the simple `get(name, limit)` recent-tail path so live UI stays
+    /// responsive even when the disk backend is slow or degraded.
+    sqlite: Option<Box<SqliteLogStorage>>,
 }
 
 impl LogStore {
@@ -73,7 +81,17 @@ impl LogStore {
             memory_limit: Some(DEFAULT_MEMORY_LIMIT),
             estimated_memory: 0,
             verbose_callback: None,
+            sqlite: None,
         }
+    }
+
+    /// Attach a SQLite backend. When attached, drained batches are
+    /// also written through to disk, historical queries route to
+    /// SQLite, and `clear` / `clear_process` / `flush_now` /
+    /// `enforce_retention` propagate to both backends.
+    pub fn with_sqlite(mut self, storage: SqliteLogStorage) -> Self {
+        self.sqlite = Some(Box::new(storage));
+        self
     }
 
     /// Set a callback for verbose output.
@@ -309,18 +327,31 @@ impl Default for LogStore {
 
 impl LogStorage for LogStore {
     fn push(&mut self, log: LogLine) -> Result<(), LogStorageError> {
-        self.push_internal(log);
-        Ok(())
+        // Mirror the batched path so the SQLite side gets the same
+        // single-insert transaction shape even when callers push one
+        // line at a time.
+        self.push_batch(vec![log])
     }
 
     fn push_batch(&mut self, logs: Vec<LogLine>) -> Result<(), LogStorageError> {
+        // Hot buffer is authoritative for broadcast and recent-tail,
+        // so it always lands first. SQLite write failures surface to
+        // the caller without dropping what the live UI already saw.
+        let persisted = logs.clone();
         for log in logs {
             self.push_internal(log);
+        }
+        if let Some(sqlite) = self.sqlite.as_mut() {
+            sqlite.push_batch(persisted)?;
         }
         Ok(())
     }
 
     fn get(&self, name: &str, limit: Option<usize>) -> Result<Vec<LogLine>, LogStorageError> {
+        // Hot buffer is the source for the simple recent-tail path; this
+        // keeps the broadcast snapshot and the immediate post-restart
+        // view aligned with what subscribers just saw. Historical reads
+        // beyond the hot buffer's window go through `query`.
         let logs = if name == "*" {
             self.get_all_internal(limit)
         } else {
@@ -330,6 +361,10 @@ impl LogStorage for LogStore {
     }
 
     fn query(&self, query: LogQuery) -> Result<LogQueryResult, LogStorageError> {
+        if let Some(sqlite) = self.sqlite.as_ref() {
+            return sqlite.query(query);
+        }
+
         let (logs, _) = self.query_internal(&query);
         let total_count = logs.len();
 
@@ -351,6 +386,23 @@ impl LogStorage for LogStore {
     }
 
     fn stats(&self) -> Result<LogStorageStats, LogStorageError> {
+        if let Some(sqlite) = self.sqlite.as_ref() {
+            // Persistent aggregates win for total_lines / process_count /
+            // oldest / newest because the hot buffer only holds a recent
+            // slice. Memory pressure fields stay sourced from the hot
+            // buffer since the operator tunes them there.
+            let persisted = sqlite.stats()?;
+            return Ok(LogStorageStats {
+                total_lines: persisted.total_lines,
+                process_count: persisted.process_count,
+                memory_bytes: self.estimated_memory,
+                oldest_timestamp: persisted.oldest_timestamp,
+                newest_timestamp: persisted.newest_timestamp,
+                memory_limit: self.memory_limit,
+                max_lines_per_process: self.max_lines_per_process,
+            });
+        }
+
         let total_lines: usize = self.buffers.values().map(|b| b.len()).sum();
         let process_count = self.buffers.len();
 
@@ -384,6 +436,9 @@ impl LogStorage for LogStore {
     fn clear(&mut self) -> Result<(), LogStorageError> {
         self.buffers.clear();
         self.estimated_memory = 0;
+        if let Some(sqlite) = self.sqlite.as_mut() {
+            sqlite.clear()?;
+        }
         Ok(())
     }
 
@@ -391,6 +446,9 @@ impl LogStorage for LogStore {
         if let Some(buffer) = self.buffers.remove(name) {
             let memory_freed: usize = buffer.iter().map(Self::estimate_log_size).sum();
             self.estimated_memory = self.estimated_memory.saturating_sub(memory_freed);
+        }
+        if let Some(sqlite) = self.sqlite.as_mut() {
+            sqlite.clear_process(name)?;
         }
         Ok(())
     }
@@ -400,10 +458,16 @@ impl LogStorage for LogStore {
     }
 
     fn flush_now(&mut self) -> Result<(), LogStorageError> {
+        if let Some(sqlite) = self.sqlite.as_mut() {
+            sqlite.flush_now()?;
+        }
         Ok(())
     }
 
     fn enforce_retention(&mut self) -> Result<(), LogStorageError> {
+        if let Some(sqlite) = self.sqlite.as_mut() {
+            sqlite.enforce_retention()?;
+        }
         Ok(())
     }
 
@@ -935,5 +999,192 @@ mod tests {
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].content, "shutdown line 1");
         assert_eq!(logs[1].content, "shutdown line 2");
+    }
+
+    // =========================================================================
+    // Hybrid runtime: hot buffer + SQLite
+    // =========================================================================
+
+    fn hybrid_store() -> LogStore {
+        LogStore::new().with_sqlite(
+            SqliteLogStorage::open_in_memory().expect("open in-memory sqlite"),
+        )
+    }
+
+    #[test]
+    fn hybrid_get_serves_from_hot_buffer() {
+        let mut store = hybrid_store();
+        store.push(make_log("task1", "one", 100)).unwrap();
+        store.push(make_log("task1", "two", 200)).unwrap();
+        store.push(make_log("task1", "three", 300)).unwrap();
+
+        // Recent-tail path stays in memory; the broadcast snapshot uses
+        // this path, so persisted history shouldn't perturb it.
+        let logs = store.get("task1", Some(2)).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].content, "two");
+        assert_eq!(logs[1].content, "three");
+    }
+
+    #[test]
+    fn hybrid_query_routes_to_sqlite() {
+        let mut store = hybrid_store();
+        for i in 0..5 {
+            store
+                .push(make_log("task1", &format!("line {i}"), i as u64 * 100))
+                .unwrap();
+        }
+        // Drop the hot buffer so any rows the query returns must have
+        // come from SQLite.
+        store.buffers.clear();
+        store.estimated_memory = 0;
+
+        let result = store.query(LogQuery::process("task1")).unwrap();
+        assert_eq!(result.total_count, 5);
+        assert_eq!(result.logs.len(), 5);
+        assert_eq!(result.logs[0].content, "line 0");
+        assert_eq!(result.logs[4].content, "line 4");
+    }
+
+    #[tokio::test]
+    async fn hybrid_broadcast_delivers_every_line() {
+        let mut store = hybrid_store();
+        let mut subscriber = store.subscribe();
+
+        store.push(make_log("task1", "alpha", 100)).unwrap();
+        store.push(make_log("task1", "beta", 200)).unwrap();
+        store.push(make_log("task1", "gamma", 300)).unwrap();
+
+        // Broadcast lands inside push_internal before the SQLite write,
+        // so subscribers see every line regardless of what SQLite does.
+        let mut received = Vec::new();
+        while let Ok(line) = subscriber.try_recv() {
+            received.push(line.content);
+        }
+        assert_eq!(received, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[tokio::test]
+    async fn hybrid_drain_writes_batch_to_sqlite() {
+        let mut store = hybrid_store();
+        let sender = store.sender();
+
+        for i in 0..4 {
+            sender
+                .send(make_log("task1", &format!("c{i}"), i as u64 * 100))
+                .await
+                .unwrap();
+        }
+        store.drain().unwrap();
+
+        // Query path routes to SQLite when attached, so a positive count
+        // here proves the drained batch reached the persistent backend.
+        let result = store.query(LogQuery::process("task1")).unwrap();
+        assert_eq!(result.total_count, 4);
+        assert_eq!(result.logs[0].content, "c0");
+        assert_eq!(result.logs[3].content, "c3");
+    }
+
+    #[test]
+    fn hybrid_clear_wipes_both_backends() {
+        let mut store = hybrid_store();
+        store.push(make_log("task1", "a", 100)).unwrap();
+        store.push(make_log("task2", "b", 200)).unwrap();
+
+        store.clear().unwrap();
+
+        assert!(store.get("task1", None).unwrap().is_empty());
+        assert!(store.get("task2", None).unwrap().is_empty());
+        let result = store.query(LogQuery::all()).unwrap();
+        assert_eq!(result.total_count, 0);
+    }
+
+    #[test]
+    fn hybrid_clear_process_wipes_only_named_in_both_backends() {
+        let mut store = hybrid_store();
+        store.push(make_log("task1", "a", 100)).unwrap();
+        store.push(make_log("task2", "b", 200)).unwrap();
+        store.push(make_log("task1", "c", 300)).unwrap();
+
+        store.clear_process("task1").unwrap();
+
+        assert!(store.get("task1", None).unwrap().is_empty());
+        let remaining = store.query(LogQuery::all()).unwrap();
+        assert_eq!(remaining.total_count, 1);
+        assert_eq!(remaining.logs[0].process, "task2");
+    }
+
+    #[test]
+    fn hybrid_flush_now_propagates_to_sqlite() {
+        let mut store = hybrid_store();
+        store.push(make_log("task1", "before flush", 100)).unwrap();
+        // In-memory SQLite journal mode is `memory`, so the underlying
+        // wal_checkpoint is a no-op; this asserts the propagation path
+        // returns Ok regardless.
+        store.flush_now().unwrap();
+        let result = store.query(LogQuery::process("task1")).unwrap();
+        assert_eq!(result.total_count, 1);
+    }
+
+    #[test]
+    fn hybrid_stats_combine_persistent_aggregates_with_memory_pressure() {
+        let mut store = hybrid_store();
+        store.push(make_log("task1", "a", 100)).unwrap();
+        store.push(make_log("task2", "b", 200)).unwrap();
+        store.push(make_log("task1", "c", 300)).unwrap();
+
+        let stats = store.stats().unwrap();
+        // Aggregates come from SQLite.
+        assert_eq!(stats.total_lines, 3);
+        assert_eq!(stats.process_count, 2);
+        assert_eq!(stats.oldest_timestamp, Some(100));
+        assert_eq!(stats.newest_timestamp, Some(300));
+        // Memory-side fields come from the hot buffer.
+        assert!(stats.memory_bytes > 0);
+        assert_eq!(stats.memory_limit, Some(DEFAULT_MEMORY_LIMIT));
+        assert_eq!(stats.max_lines_per_process, DEFAULT_MAX_LINES_PER_PROCESS);
+    }
+
+    #[test]
+    fn hybrid_sqlite_write_failure_does_not_drop_broadcast() {
+        let mut store = hybrid_store();
+        let mut subscriber = store.subscribe();
+
+        // Install a trigger that aborts inserts whose content matches the
+        // sentinel, so the next push_batch hits a SQLite write error
+        // while the hot-buffer + broadcast path has already succeeded.
+        let sentinel = "__POISON__";
+        let install_sql = format!(
+            "CREATE TRIGGER abort_on_poison
+             BEFORE INSERT ON log_entries
+             FOR EACH ROW WHEN NEW.content = '{sentinel}'
+             BEGIN
+                 SELECT RAISE(ABORT, 'poison row rejected');
+             END"
+        );
+        store
+            .sqlite
+            .as_ref()
+            .expect("hybrid store has sqlite")
+            .conn_for_test()
+            .execute(&install_sql, ())
+            .expect("install trigger");
+
+        let err = store
+            .push(make_log("task1", sentinel, 100))
+            .expect_err("expected SQLite write to fail");
+        match err {
+            LogStorageError::Write(msg) => assert!(msg.contains("poison"), "msg was {msg}"),
+            other => panic!("expected Write, got {other:?}"),
+        }
+
+        // Broadcast subscriber saw the line.
+        let delivered = subscriber.try_recv().expect("broadcast delivered");
+        assert_eq!(delivered.content, sentinel);
+        // Hot buffer kept the line so live UI does not silently drop it
+        // even though SQLite refused to persist it.
+        let mem = store.get("task1", None).unwrap();
+        assert_eq!(mem.len(), 1);
+        assert_eq!(mem[0].content, sentinel);
     }
 }

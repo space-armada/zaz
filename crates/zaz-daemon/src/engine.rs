@@ -15,7 +15,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
-use zaz_config::{Config, Group};
+use zaz_config::{Config, Group, LogStorageBackend};
 use zaz_process::{Daemon, Executor, OutputLine, TaskRunner};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
@@ -547,6 +547,23 @@ impl Engine {
                 store = store.with_verbose_callback(|log| {
                     println!("[{}] {}", log.process, log.content);
                 });
+            }
+
+            match user_config.log_storage.backend {
+                LogStorageBackend::Memory => {
+                    tracing::info!(backend = "memory", "log storage backend selected");
+                }
+                LogStorageBackend::Sqlite => {
+                    let db_path = crate::log_storage_sqlite::db_path_for_config(&config_path);
+                    let sqlite = crate::log_storage_sqlite::SqliteLogStorage::open(&db_path)
+                        .map_err(DaemonError::LogStorage)?;
+                    tracing::info!(
+                        backend = "sqlite",
+                        path = %db_path.display(),
+                        "log storage backend selected"
+                    );
+                    store = store.with_sqlite(sqlite);
+                }
             }
 
             store
