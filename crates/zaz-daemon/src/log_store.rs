@@ -1378,4 +1378,290 @@ mod tests {
         assert_eq!(mem.len(), 1);
         assert_eq!(mem[0].content, sentinel);
     }
+
+    // =========================================================================
+    // Degraded-mode contract: SQLite errors surface through the trait while
+    // the hot buffer and broadcast keep the live path alive, and subsequent
+    // operations resume durable storage once the underlying issue clears.
+    //
+    // ZAZ-012 milestone 6 pinned the contract via these three scenarios:
+    // (1) write failure mid-batch, (2) query failure, (3) lock timeout
+    // under contention.
+    // =========================================================================
+
+    #[test]
+    fn degraded_mode_write_failure_mid_batch_keeps_live_path_alive_and_recovers() {
+        let mut store = hybrid_store();
+        let mut subscriber = store.subscribe();
+
+        // Seed two persisted rows so the rollback assertion has a positive
+        // pre-existing set to compare against.
+        store.push(make_log("task1", "seed-a", 50)).unwrap();
+        store.push(make_log("task1", "seed-b", 75)).unwrap();
+
+        // Install a trigger that aborts inserts whose content matches the
+        // sentinel. Placed mid-batch so the assertion proves atomic rollback
+        // of the entire batch, not just the offending row.
+        let sentinel = "__POISON__";
+        let install_sql = format!(
+            "CREATE TRIGGER abort_on_poison
+             BEFORE INSERT ON log_entries
+             FOR EACH ROW WHEN NEW.content = '{sentinel}'
+             BEGIN
+                 SELECT RAISE(ABORT, 'poison row rejected');
+             END"
+        );
+        store
+            .sqlite
+            .as_ref()
+            .expect("hybrid store has sqlite")
+            .conn_for_test()
+            .execute(&install_sql, ())
+            .expect("install trigger");
+
+        let batch = vec![
+            make_log("task1", "batch-1", 100),
+            make_log("task1", sentinel, 200),
+            make_log("task1", "batch-3", 300),
+        ];
+        let err = store
+            .push_batch(batch)
+            .expect_err("expected SQLite write to fail mid-batch");
+        match err {
+            LogStorageError::Write(msg) => assert!(msg.contains("poison"), "msg was {msg}"),
+            other => panic!("expected Write, got {other:?}"),
+        }
+
+        // Live path survives: broadcast received every batch line because
+        // push_internal landed them before the SQLite transaction ran.
+        let mut delivered = Vec::new();
+        while let Ok(line) = subscriber.try_recv() {
+            delivered.push(line.content);
+        }
+        assert_eq!(
+            delivered,
+            vec!["seed-a", "seed-b", "batch-1", sentinel, "batch-3"],
+        );
+
+        // Hot buffer holds the full sequence including the poisoned line.
+        let mem = store.get("task1", None).unwrap();
+        let mem_contents: Vec<&str> = mem.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(
+            mem_contents,
+            vec!["seed-a", "seed-b", "batch-1", sentinel, "batch-3"],
+        );
+
+        // Persisted set is the seed pair only; the failed batch rolled back
+        // atomically, so no partial-batch leak even though one of three rows
+        // would have inserted cleanly on its own.
+        let persisted = store.query(LogQuery::process("task1")).unwrap();
+        let persisted_contents: Vec<&str> =
+            persisted.logs.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(persisted_contents, vec!["seed-a", "seed-b"]);
+
+        // Underlying issue clears: drop the trigger and retry. The next
+        // batch persists without operator intervention.
+        store
+            .sqlite
+            .as_ref()
+            .unwrap()
+            .conn_for_test()
+            .execute("DROP TRIGGER abort_on_poison", ())
+            .expect("drop trigger");
+
+        store
+            .push_batch(vec![
+                make_log("task1", "recovery-1", 400),
+                make_log("task1", "recovery-2", 500),
+            ])
+            .expect("recovery batch persists");
+
+        let recovered = store.query(LogQuery::process("task1")).unwrap();
+        let recovered_contents: Vec<&str> =
+            recovered.logs.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(
+            recovered_contents,
+            vec!["seed-a", "seed-b", "recovery-1", "recovery-2"],
+        );
+        assert!(
+            !recovered_contents.contains(&sentinel),
+            "the rolled-back poisoned batch must not appear in the recovered persisted set",
+        );
+    }
+
+    #[test]
+    fn degraded_mode_query_failure_keeps_hot_buffer_get_serving() {
+        let mut store = hybrid_store();
+        let mut subscriber = store.subscribe();
+
+        store.push(make_log("task1", "alpha", 100)).unwrap();
+        store.push(make_log("task1", "beta", 200)).unwrap();
+
+        // Drop the table so any SQLite-routed read fails. The hot buffer
+        // path is independent of the persistent backend, so `get` keeps
+        // serving recent-tail reads.
+        store
+            .sqlite
+            .as_ref()
+            .expect("hybrid store has sqlite")
+            .conn_for_test()
+            .execute("DROP TABLE log_entries", ())
+            .expect("drop table");
+
+        let err = store
+            .query(LogQuery::process("task1"))
+            .expect_err("expected SQLite query to fail without the table");
+        match err {
+            LogStorageError::Query(msg) => {
+                let lower = msg.to_lowercase();
+                assert!(
+                    lower.contains("log_entries") || lower.contains("no such table"),
+                    "expected query error to name the missing table, got: {msg}",
+                );
+            }
+            other => panic!("expected Query, got {other:?}"),
+        }
+
+        let mem = store.get("task1", None).unwrap();
+        let mem_contents: Vec<&str> = mem.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(mem_contents, vec!["alpha", "beta"]);
+
+        // Recreate the schema so subsequent writes can resume. Mirrors the
+        // initial migration's DDL.
+        store
+            .sqlite
+            .as_ref()
+            .unwrap()
+            .conn_for_test()
+            .execute_batch(
+                "CREATE TABLE log_entries (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     timestamp_ms INTEGER NOT NULL,
+                     process TEXT NOT NULL,
+                     group_name TEXT,
+                     source TEXT NOT NULL,
+                     output_kind TEXT NOT NULL,
+                     content TEXT NOT NULL
+                 );
+                 CREATE INDEX log_entries_process_id_idx ON log_entries(process, id);
+                 CREATE INDEX log_entries_time_id_idx ON log_entries(timestamp_ms, id);
+                 CREATE INDEX log_entries_group_id_idx ON log_entries(group_name, id);",
+            )
+            .expect("recreate schema");
+
+        store
+            .push(make_log("task1", "gamma", 300))
+            .expect("post-recovery push persists");
+
+        let mut delivered = Vec::new();
+        while let Ok(line) = subscriber.try_recv() {
+            delivered.push(line.content);
+        }
+        assert_eq!(delivered, vec!["alpha", "beta", "gamma"]);
+
+        // Persisted set only contains the post-recovery row; the dropped
+        // rows are gone, but the query surface works again.
+        let persisted = store.query(LogQuery::process("task1")).unwrap();
+        let persisted_contents: Vec<&str> =
+            persisted.logs.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(persisted_contents, vec!["gamma"]);
+    }
+
+    #[test]
+    fn degraded_mode_lock_timeout_under_contention_keeps_live_path_alive() {
+        // File-backed DB so a second connection can contend over the same
+        // WAL writer slot; :memory: databases are private per connection.
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tempdir.path().join("logs.sqlite3");
+
+        let sqlite = SqliteLogStorage::open(&db_path).expect("open sqlite");
+        // Shorten the busy timeout so the test does not sit on the
+        // production five-second budget while the blocker holds the lock.
+        sqlite
+            .conn_for_test()
+            .busy_timeout(std::time::Duration::from_millis(50))
+            .expect("shorten busy timeout");
+        let mut store = LogStore::new().with_sqlite(sqlite);
+        let mut subscriber = store.subscribe();
+
+        store
+            .push(make_log("task1", "before", 100))
+            .expect("pre-contention push persists");
+
+        // Open a competing connection and hold the WAL writer slot via
+        // BEGIN IMMEDIATE plus an uncommitted insert.
+        let blocker =
+            rusqlite::Connection::open(&db_path).expect("open competing connection");
+        blocker
+            .busy_timeout(std::time::Duration::from_millis(0))
+            .expect("blocker timeout");
+        blocker
+            .execute("BEGIN IMMEDIATE", ())
+            .expect("blocker begin");
+        blocker
+            .execute(
+                "INSERT INTO log_entries
+                    (timestamp_ms, process, group_name, source, output_kind, content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    150_i64,
+                    "blocker",
+                    Option::<&str>::None,
+                    "process",
+                    "combined",
+                    "blocker-row",
+                ],
+            )
+            .expect("blocker insert");
+
+        // Push through the hybrid store. The SQLite transaction's first
+        // insert hits SQLITE_BUSY and the busy-timeout retry expires.
+        let err = store
+            .push(make_log("task1", "during", 200))
+            .expect_err("expected SQLite write to fail under lock contention");
+        match err {
+            LogStorageError::Write(msg) => {
+                let lower = msg.to_lowercase();
+                assert!(
+                    lower.contains("lock") || lower.contains("busy"),
+                    "expected SQLite busy/lock error, got: {msg}",
+                );
+            }
+            other => panic!("expected Write, got {other:?}"),
+        }
+
+        let mut delivered = Vec::new();
+        while let Ok(line) = subscriber.try_recv() {
+            delivered.push(line.content);
+        }
+        assert_eq!(delivered, vec!["before", "during"]);
+
+        let mem = store.get("task1", None).unwrap();
+        let mem_contents: Vec<&str> = mem.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(mem_contents, vec!["before", "during"]);
+
+        // Release the lock. Subsequent pushes resume without operator action.
+        blocker.execute("COMMIT", ()).expect("blocker commit");
+        drop(blocker);
+
+        store
+            .push(make_log("task1", "after", 300))
+            .expect("post-recovery push persists");
+
+        let persisted = store.query(LogQuery::process("task1")).unwrap();
+        let persisted_contents: Vec<&str> =
+            persisted.logs.iter().map(|l| l.content.as_str()).collect();
+        assert!(
+            persisted_contents.contains(&"before"),
+            "pre-contention row should still be persisted: {persisted_contents:?}",
+        );
+        assert!(
+            persisted_contents.contains(&"after"),
+            "post-recovery row should be persisted: {persisted_contents:?}",
+        );
+        assert!(
+            !persisted_contents.contains(&"during"),
+            "contended row rolled back when the busy timeout fired: {persisted_contents:?}",
+        );
+    }
 }
