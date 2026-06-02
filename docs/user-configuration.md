@@ -114,8 +114,18 @@ on_group_complete = true
 
 ## `[log_storage]`
 
-Bounds on the in-memory log buffer used by the daemon and the TUI, and
-selection of the optional persistent backend.
+Controls how the daemon stores the API-visible log stream. Two backends
+are available. `memory` keeps every retained line in a bounded in-process
+buffer and loses history when the daemon exits. `sqlite` keeps the same
+hot buffer for the live TUI and broadcast subscribers, but routes
+historical pagination, search, and total counts through a persistent
+SQLite database so `zaz_logs` and the daemon API return pre-restart
+lines. The query shape (`name`, `offset`, `limit`, `search`) is identical
+across both modes.
+
+The hot buffer is always present. Under `sqlite`, the hot buffer covers
+the recent tail served by `get(name, limit)` and the broadcast channel
+that drives the TUI; SQLite serves everything else.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
@@ -128,6 +138,9 @@ suffixes — all 1024-based — as well as fractional values like `"1.5MB"`.
 A bare integer is interpreted as a byte count. Whitespace between the
 number and the suffix is allowed (`"100 MB"`). Unparseable values fall
 back to the documented default.
+
+The hot-buffer defaults do not shrink when SQLite is enabled; they bound
+RAM in both modes. The SQLite limits bound disk independently.
 
 ```toml
 [log_storage]
@@ -155,3 +168,64 @@ backend = "sqlite"
 max_size = "1GB"
 max_lines_per_process = 500000
 ```
+
+#### Database location
+
+The database lands under
+`$XDG_STATE_HOME/zaz/logs/<config-hash>.sqlite3`, falling back to
+`~/.local/state/zaz/logs/<config-hash>.sqlite3` when `XDG_STATE_HOME`
+is unset. The hash is keyed by the canonicalized project config path,
+so unrelated projects never share log history. The directory tree is
+created with `0o700` permissions on first use.
+
+The database does not follow the socket's `.zaz/` directory fork even
+when the socket is forced into a project tree; persistent log state
+always lives under XDG state alongside the existing daemon debug logs.
+This keeps SQLite WAL/SHM siblings out of project directories and out
+of network-mounted source trees.
+
+#### Persistent retention
+
+The SQLite backend enforces two limits: the on-disk database size from
+`max_size` and the lines-per-process cap from `max_lines_per_process`.
+Both run twice: once immediately after every successful batch write so
+fast writers settle near their budget, and again on a bounded periodic
+cadence so processes that have stopped emitting still get trimmed.
+Pruning issues plain `DELETE` statements; no `VACUUM` or
+`wal_checkpoint` runs on every sweep, so freed pages are reused by
+subsequent inserts and ingestion latency stays bounded. Age-based
+retention is not implemented in this release.
+
+`PRAGMA wal_checkpoint(TRUNCATE)` runs once on clean shutdown so the
+`.sqlite3` file is self-contained for backup and reopen-startup cost
+stays predictable.
+
+#### Group rename semantics
+
+`group_name` is a write-time snapshot: each row records the group the
+process belonged to when the line was written. Renaming a group in
+`zaz.toml` does not rewrite historical rows. A query filtered by the
+new group name returns only rows written after the rename, and vice
+versa. To inspect logs from before a rename, query by process name or
+by the original group name.
+
+#### Degraded mode
+
+When SQLite fails after startup — a corrupt page, a held lock, a write
+that hits a constraint — the failure surfaces as a
+`LogStorageError` through the trait. Query errors reach the API as
+`log query failed: …`; write errors are logged via `tracing::error!`
+from the daemon's drain sites. The daemon does not exit. The hot
+buffer and broadcast subscribers remain authoritative for the live
+path, so the TUI and recent-tail `get(name, limit)` keep working
+while persistence is degraded. Once the underlying issue clears, the
+next batch write or query succeeds with no operator restart needed.
+
+#### Distinction from debug log files
+
+Persistent API logs are separate from the daemon's debug log files
+(`daemon-output.log`, `daemon-debug.log`, `tui-debug.log`) described
+in [cli.md](cli.md#log-files-and-rotation). The debug files capture
+unstructured operator output and panics; the SQLite database holds
+the structured, queryable per-process log stream that `zaz_logs`, the
+TUI, and the daemon API consume.

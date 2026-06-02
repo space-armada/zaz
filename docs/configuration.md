@@ -264,3 +264,17 @@ group name within Levenshtein distance 2 exists, otherwise an
 Duplicate-task and duplicate-daemon errors append
 `(use explicit 'name' field to disambiguate)` when the duplicate came
 from name derivation rather than an explicit `name = "..."`.
+
+## Log storage
+
+Log storage is configured per operator, not per project. The daemon's
+API-visible log stream — what `zaz_logs`, the TUI, and `zaz status` read
+back — is bounded by an in-memory hot buffer in every mode and can
+optionally be persisted to a SQLite database under
+`$XDG_STATE_HOME/zaz/logs/`. Backend selection and retention limits live
+in the user config: see
+[user-configuration.md#log_storage](user-configuration.md#log_storage)
+for the backend selector, hot-buffer bounds, the SQLite retention
+fields, and the persistence contract (database location, group rename
+semantics, degraded-mode behavior, and the distinction from the
+daemon's debug log files).

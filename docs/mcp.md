@@ -45,6 +45,16 @@ When the daemon refuses an operation — unknown group name, parse error on
 reload, and so on — its error message is returned verbatim so the agent can
 surface it to the user without paraphrase.
 
+`zaz_logs` consumes persistent history when the daemon runs with the
+SQLite backend (`backend = "sqlite"` in user config), so pre-restart
+lines remain queryable after the daemon has been restarted. Under the
+default `memory` backend the same call serves whatever is in the
+in-memory buffer at the moment of the request. The request shape
+(`name`, `offset`, `limit`, `search`) and the response fields are
+identical across both modes. See
+[user-configuration.md#log_storage](user-configuration.md#log_storage)
+for backend selection and the retention contract.
+
 ## Client configuration
 
 ### Claude Code

@@ -85,7 +85,8 @@ command, flag, and exit-code reference lives in
 - [docs/configuration.md](docs/configuration.md) — project config
   (`zaz.toml`/`zaz.json`) reference.
 - [docs/user-configuration.md](docs/user-configuration.md) — per-user
-  preferences and XDG paths.
+  preferences, XDG paths, and the optional SQLite log persistence
+  backend (`[log_storage]`).
 - [docs/cli.md](docs/cli.md) — CLI command, flag, exit-code, and log-file
   reference.
 - [docs/tui.md](docs/tui.md) — TUI styles, modes, and keyboard shortcuts.

@@ -174,6 +174,35 @@ Rotation parameters:
 
 Oldest rotated files are pruned first when the budget is exceeded.
 
+## API log persistence
+
+The structured per-process log stream that `zaz_logs`, the TUI, and the
+daemon API read back is a separate surface from the debug log files
+described above. By default it lives in a bounded in-memory buffer that
+is lost when the daemon exits. With `backend = "sqlite"` in user config
+the same stream is also written to
+`$XDG_STATE_HOME/zaz/logs/<config-hash>.sqlite3` (falling back to
+`~/.local/state/zaz/logs/`), so historical queries return rows written
+before the most recent restart. The query shape and exit codes are
+unchanged across modes.
+
+See [user-configuration.md#log_storage](user-configuration.md#log_storage)
+for backend selection, retention limits, the database location
+convention, and the degraded-mode contract.
+
+Two behaviors are worth flagging for scripted consumers:
+
+- **Offset pagination under concurrent retention.** Pagination uses
+  `offset` and `limit`. When the daemon prunes rows mid-read — which
+  happens after every batch write and on a bounded periodic cadence —
+  the page after the one you just received may have shifted underneath
+  you. A cursor-based pagination contract is a future proposal; the
+  current MCP and CLI request shape stays offset-based.
+- **Group rename semantics.** `group_name` on each row is a write-time
+  snapshot, so renaming a group in `zaz.toml` does not retroactively
+  retag historical rows. Filter by process name or by the original
+  group name to reach logs written before the rename.
+
 ## Subcommands
 
 ### zaz (default, TUI mode)
