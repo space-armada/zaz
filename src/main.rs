@@ -12,11 +12,13 @@ use tokio::sync::mpsc;
 use zaz::cli::{Cli, Commands};
 use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
 use zaz_daemon::{
-    resolve_socket, socket_path_for_config, ApiRequest, ApiResponse, Client, DaemonError, Engine,
-    EngineCommand, Server,
+    resolve_socket, resolve_workspace_socket, socket_path_for_config, ApiRequest, ApiResponse,
+    Client, DaemonError, Engine, EngineCommand, Server,
 };
 use zaz_mcp::McpError;
 use zaz_process::{DaemonLauncher, LaunchHandle};
+
+mod supervisor;
 
 /// Effective TUI options after merging CLI flags with user config.
 #[derive(Debug, Clone)]
@@ -453,21 +455,19 @@ async fn try_main() -> Result<()> {
         Some(Commands::Task) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let config_path = find_config(&cli.config)?;
+            let config = at_most_one_config(&cli.config)?;
+            let config_path = find_config(&config)?;
             run_tasks(&config_path).await
         }
         Some(Commands::Daemon { quiet }) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let config_path = find_config(&cli.config)?;
-            let socket_path =
-                resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+            let config = at_most_one_config(&cli.config)?;
+            let config_path = find_config(&config)?;
+            let socket_path = resolve_command_socket(&config, cli.socket.clone(), &current_dir)?;
             run_daemon(&config_path, &socket_path, quiet).await
         }
         Some(Commands::Start) => {
-            let config_path = find_config(&cli.config)?;
-            let socket_path =
-                resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
             let daemon_log_file =
                 resolve_autostart_daemon_log_file(cli.debug, cli.log_file.as_deref())?;
             let daemon_output_log = resolve_autostart_daemon_output_log(cli.log_file.as_deref())?;
@@ -481,47 +481,81 @@ async fn try_main() -> Result<()> {
 
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
 
-            start_daemon_command(
-                &config_path,
-                &socket_path,
-                cli.debug,
-                daemon_log_file.as_deref(),
-                &daemon_output_log,
-            )
-            .await
+            if cli.config.len() >= 2 {
+                let socket_path = resolve_workspace_socket(cli.socket.clone(), &current_dir)?;
+                start_supervisor_command(
+                    &cli.config,
+                    &socket_path,
+                    cli.debug,
+                    daemon_log_file.as_deref(),
+                    &daemon_output_log,
+                )
+                .await
+            } else {
+                let config = at_most_one_config(&cli.config)?;
+                let config_path = find_config(&config)?;
+                let socket_path =
+                    resolve_command_socket(&config, cli.socket.clone(), &current_dir)?;
+                start_daemon_command(
+                    &config_path,
+                    &socket_path,
+                    cli.debug,
+                    daemon_log_file.as_deref(),
+                    &daemon_output_log,
+                )
+                .await
+            }
+        }
+        Some(Commands::Supervisor { quiet }) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
+            let socket_path = resolve_workspace_socket(cli.socket.clone(), &current_dir)?;
+            supervisor::run_supervisor(&cli.config, &socket_path, cli.debug, quiet).await
         }
         Some(Commands::Status) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let socket_path =
-                resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+            let socket_path = resolve_control_command_socket(
+                &at_most_one_config(&cli.config)?,
+                cli.socket.clone(),
+                &current_dir,
+            )?;
             show_status(&socket_path).await
         }
         Some(Commands::Restart { group }) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let socket_path =
-                resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+            let socket_path = resolve_control_command_socket(
+                &at_most_one_config(&cli.config)?,
+                cli.socket.clone(),
+                &current_dir,
+            )?;
             restart(&socket_path, group).await
         }
         Some(Commands::Stop) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let socket_path =
-                resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+            let socket_path = resolve_control_command_socket(
+                &at_most_one_config(&cli.config)?,
+                cli.socket.clone(),
+                &current_dir,
+            )?;
             stop_daemon(&socket_path).await
         }
         Some(Commands::Reload) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let socket_path =
-                resolve_control_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+            let socket_path = resolve_control_command_socket(
+                &at_most_one_config(&cli.config)?,
+                cli.socket.clone(),
+                &current_dir,
+            )?;
             reload_config(&socket_path).await
         }
         Some(Commands::Check { config, json }) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let config_path = find_config(&config.or(cli.config.clone()))?;
+            let config_path = find_config(&config.or(at_most_one_config(&cli.config)?))?;
             check_config(&config_path, json)
         }
         Some(Commands::Ignores) => {
@@ -530,11 +564,11 @@ async fn try_main() -> Result<()> {
             show_ignores()
         }
         Some(Commands::Mcp { autostart }) => {
-            let socket_path =
-                resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+            let config = at_most_one_config(&cli.config)?;
+            let socket_path = resolve_command_socket(&config, cli.socket.clone(), &current_dir)?;
 
             if autostart {
-                let config_path = find_config(&cli.config)?;
+                let config_path = find_config(&config)?;
                 let daemon_log_file =
                     resolve_autostart_daemon_log_file(cli.debug, cli.log_file.as_deref())?;
                 let daemon_output_log =
@@ -594,7 +628,7 @@ async fn try_main() -> Result<()> {
             zaz_mcp::run(zaz_mcp::McpRunOptions {
                 cwd: current_dir.clone(),
                 socket_path,
-                explicit_config: cli.config.clone(),
+                explicit_config: config,
             })
             .await
             .map_err(anyhow::Error::from)
@@ -610,9 +644,9 @@ async fn try_main() -> Result<()> {
             generate_man(command.as_deref())
         }
         None => {
-            let config_path = find_config(&cli.config)?;
-            let socket_path =
-                resolve_command_socket(&cli.config, cli.socket.clone(), &current_dir)?;
+            let config = at_most_one_config(&cli.config)?;
+            let config_path = find_config(&config)?;
+            let socket_path = resolve_command_socket(&config, cli.socket.clone(), &current_dir)?;
             let tui_log_file = resolve_tui_log_file(cli.debug, cli.log_file.as_deref())?;
             let daemon_log_file =
                 resolve_autostart_daemon_log_file(cli.debug, cli.log_file.as_deref())?;
@@ -710,6 +744,18 @@ fn handle_daemon_response(response: ApiResponse, verb: &str, default_ok: &str) -
 }
 
 /// Find the configuration file.
+/// Collapse the repeatable `--config` flag down to the single-config shape every
+/// subcommand except `start`/`supervisor` expects. Zero flags discovers a config
+/// as before; one flag is the explicit path; 2+ is a workspace invocation that
+/// only `start` (and the internal `supervisor`) accept.
+fn at_most_one_config(configs: &[PathBuf]) -> Result<Option<PathBuf>> {
+    match configs {
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        _ => bail!("multiple --config flags are only supported by `zaz start`"),
+    }
+}
+
 fn find_config(explicit: &Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         if path.exists() {
@@ -751,7 +797,7 @@ fn resolve_command_socket(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DaemonAvailability {
+pub(crate) enum DaemonAvailability {
     Running,
     StaleSocket,
     Unreachable,
@@ -925,6 +971,108 @@ async fn start_daemon_command(
         ),
         DaemonReadyOutcome::Timeout => bail!(
             "daemon did not become ready within 2s; see {} for details",
+            daemon_output_log.display()
+        ),
+    }
+}
+
+/// Build the argv that launches `zaz supervisor` for the workspace working set.
+/// Mirrors [`build_daemon_args`] but forwards every member config so the
+/// supervisor's boot loop can attach each one.
+fn build_supervisor_args(
+    config_paths: &[PathBuf],
+    socket_path: &Path,
+    debug: bool,
+    log_file: Option<&Path>,
+) -> Result<Vec<OsString>> {
+    let mut args: Vec<OsString> = Vec::new();
+
+    for config_path in config_paths {
+        args.push(OsString::from("--config"));
+        args.push(OsString::from(config_path.to_str().ok_or_else(|| {
+            anyhow::anyhow!("config path is not valid utf-8")
+        })?));
+    }
+
+    args.push(OsString::from("--socket"));
+    args.push(OsString::from(socket_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!("socket path is not valid utf-8")
+    })?));
+
+    if debug {
+        args.push(OsString::from("--debug"));
+    }
+
+    if let Some(path) = log_file {
+        args.push(OsString::from("--log-file"));
+        args.push(OsString::from(path.to_str().ok_or_else(|| {
+            anyhow::anyhow!("log file path is not valid utf-8")
+        })?));
+    }
+
+    args.push(OsString::from("supervisor"));
+    args.push(OsString::from("--quiet"));
+
+    Ok(args)
+}
+
+/// Launch a workspace supervisor in the background, mirroring
+/// [`start_daemon_command`]. The supervisor's own readiness is probed against
+/// the workspace socket; member children come up under it.
+async fn start_supervisor_command(
+    config_paths: &[PathBuf],
+    socket_path: &Path,
+    debug: bool,
+    daemon_log_file: Option<&Path>,
+    daemon_output_log: &Path,
+) -> Result<()> {
+    let check_timeout = Duration::from_secs(1);
+    if matches!(
+        check_daemon_availability(socket_path, check_timeout).await,
+        DaemonAvailability::Running
+    ) {
+        println!(
+            "workspace supervisor already running (socket {})",
+            socket_path.display()
+        );
+        return Ok(());
+    }
+
+    tracing::info!(
+        members = config_paths.len(),
+        socket = %socket_path.display(),
+        daemon_output_log = %daemon_output_log.display(),
+        "starting workspace supervisor in background"
+    );
+
+    let exe = resolve_autostart_executable()?;
+    let args = build_supervisor_args(config_paths, socket_path, debug, daemon_log_file)?;
+    let mut launcher = DaemonLauncher::new(exe, daemon_output_log);
+    launcher.args(args);
+    let mut handle = launcher.launch()?;
+
+    // The supervisor binds its control socket only after its boot attach loop
+    // brings every member up, so allow extra readiness budget per member.
+    let attempts = 30 + 30 * config_paths.len();
+    match wait_for_daemon_ready(
+        socket_path,
+        &mut handle,
+        attempts,
+        Duration::from_millis(100),
+    )
+    .await?
+    {
+        DaemonReadyOutcome::Ready => {
+            println!("workspace supervisor started (pid {})", handle.id());
+            Ok(())
+        }
+        DaemonReadyOutcome::Crashed(status) => bail!(
+            "supervisor exited before becoming ready (status: {}); see {} for details",
+            status,
+            daemon_output_log.display()
+        ),
+        DaemonReadyOutcome::Timeout => bail!(
+            "supervisor did not become ready in time; see {} for details",
             daemon_output_log.display()
         ),
     }
@@ -1201,7 +1349,10 @@ async fn is_daemon_responsive(socket_path: &Path, timeout: Duration) -> bool {
     )
 }
 
-async fn check_daemon_availability(socket_path: &Path, timeout: Duration) -> DaemonAvailability {
+pub(crate) async fn check_daemon_availability(
+    socket_path: &Path,
+    timeout: Duration,
+) -> DaemonAvailability {
     match tokio::time::timeout(timeout, Client::connect(socket_path)).await {
         Ok(Ok(mut client)) => {
             match tokio::time::timeout(timeout, client.request(&ApiRequest::Status)).await {
@@ -1243,7 +1394,7 @@ async fn check_daemon_availability(socket_path: &Path, timeout: Duration) -> Dae
     }
 }
 
-fn resolve_autostart_executable() -> Result<PathBuf> {
+pub(crate) fn resolve_autostart_executable() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_zaz") {
         return Ok(PathBuf::from(path));
     }
@@ -1263,7 +1414,7 @@ fn resolve_autostart_executable() -> Result<PathBuf> {
     Ok(current_exe)
 }
 
-fn build_daemon_args(
+pub(crate) fn build_daemon_args(
     config_path: &Path,
     socket_path: &Path,
     debug: bool,
@@ -1297,7 +1448,7 @@ fn build_daemon_args(
     Ok(args)
 }
 
-fn start_daemon_via_launcher(
+pub(crate) fn start_daemon_via_launcher(
     config_path: &Path,
     socket_path: &Path,
     debug: bool,
@@ -1312,13 +1463,13 @@ fn start_daemon_via_launcher(
 }
 
 #[derive(Debug)]
-enum DaemonReadyOutcome {
+pub(crate) enum DaemonReadyOutcome {
     Ready,
     Crashed(ExitStatus),
     Timeout,
 }
 
-async fn wait_for_daemon_ready(
+pub(crate) async fn wait_for_daemon_ready(
     socket_path: &Path,
     handle: &mut LaunchHandle,
     attempts: usize,
@@ -1527,6 +1678,29 @@ mod tests {
 
         assert!(!options.stop_on_exit);
         assert!(!options.no_autostart);
+    }
+
+    #[test]
+    fn at_most_one_config_collapses_zero_and_one() {
+        assert_eq!(at_most_one_config(&[]).unwrap(), None);
+        let one = PathBuf::from("a/zaz.toml");
+        assert_eq!(
+            at_most_one_config(std::slice::from_ref(&one)).unwrap(),
+            Some(one)
+        );
+    }
+
+    #[test]
+    fn at_most_one_config_rejects_multiple() {
+        let configs = vec![PathBuf::from("a/zaz.toml"), PathBuf::from("b/zaz.toml")];
+        let err = at_most_one_config(&configs).unwrap_err();
+        assert!(err.to_string().contains("only supported by `zaz start`"));
+    }
+
+    #[test]
+    fn cli_config_flag_is_repeatable() {
+        let cli = parse_cli(&["zaz", "-c", "a/zaz.toml", "-c", "b/zaz.toml", "start"]);
+        assert_eq!(cli.config.len(), 2);
     }
 
     #[test]

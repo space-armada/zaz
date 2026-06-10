@@ -11,9 +11,9 @@ use std::path::PathBuf;
 #[command(name = "zaz")]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    /// Configuration file path
+    /// Configuration file path (repeatable; 2+ starts a workspace)
     #[arg(short, long)]
-    pub config: Option<PathBuf>,
+    pub config: Vec<PathBuf>,
 
     /// Enable debug logging
     #[arg(short, long)]
@@ -57,7 +57,9 @@ pub struct Cli {
 //   API returns an error.
 // - Idempotent-mutating commands ensure a postcondition. `stop` exits 0 when
 //   the daemon is already stopped, `start` exits 0 when the daemon is already
-//   running, and both exit 1 for API/operational errors.
+//   running, and both exit 1 for API/operational errors. `start` with 2+
+//   `--config` flags launches a workspace supervisor and follows the same
+//   idempotent-mutating contract.
 //
 // New CLI commands must declare which category they belong to before
 // implementation so their exit behavior stays predictable in scripts.
@@ -75,6 +77,14 @@ pub enum Commands {
 
     /// Start the daemon in the background and exit
     Start,
+
+    /// Run a workspace supervisor in the foreground (internal; launched by `start`)
+    #[command(hide = true)]
+    Supervisor {
+        /// Suppress process output logging
+        #[arg(short, long)]
+        quiet: bool,
+    },
 
     /// Show status of running daemon
     Status,

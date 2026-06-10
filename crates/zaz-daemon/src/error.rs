@@ -46,6 +46,10 @@ pub enum DaemonError {
     #[error("could not resolve daemon socket from {}", start_dir.display())]
     SocketResolution { start_dir: PathBuf },
 
+    /// Workspace socket target could not be resolved from the current location.
+    #[error("could not resolve workspace socket from {}", start_dir.display())]
+    WorkspaceSocketResolution { start_dir: PathBuf },
+
     /// Log storage backend reported an error.
     #[error("log storage error: {0}")]
     LogStorage(#[from] LogStorageError),
@@ -91,6 +95,9 @@ impl DaemonError {
             Self::SocketResolution { .. } => {
                 Some("run this command from a zaz project directory or pass --socket <PATH>")
             }
+            Self::WorkspaceSocketResolution { .. } => {
+                Some("create a .zaz/ workspace root above your configs or pass --socket <PATH>")
+            }
             _ => None,
         }
     }
@@ -120,6 +127,29 @@ mod tests {
         assert_eq!(
             err.hint(),
             Some("run this command from a zaz project directory or pass --socket <PATH>")
+        );
+    }
+
+    #[test]
+    fn workspace_socket_resolution_display_omits_recovery_prose() {
+        let err = DaemonError::WorkspaceSocketResolution {
+            start_dir: PathBuf::from("/tmp/outside"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("could not resolve workspace socket from"));
+        assert!(msg.contains("/tmp/outside"));
+        assert!(!msg.contains("--socket"));
+        assert!(!msg.contains(".zaz/"));
+    }
+
+    #[test]
+    fn workspace_socket_resolution_hint_returns_recovery_prose() {
+        let err = DaemonError::WorkspaceSocketResolution {
+            start_dir: PathBuf::from("/tmp/outside"),
+        };
+        assert_eq!(
+            err.hint(),
+            Some("create a .zaz/ workspace root above your configs or pass --socket <PATH>")
         );
     }
 

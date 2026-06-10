@@ -230,7 +230,7 @@ zaz --stop-on-exit     # stop the daemon when the TUI exits
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-c`, `--config` `<CONFIG>` | — | Configuration file path |
+| `-c`, `--config` `<CONFIG>` | — | Configuration file path (repeatable; 2+ starts a workspace) |
 | `-d`, `--debug` | `false` | Enable debug logging |
 | `-s`, `--socket` `<SOCKET>` | — | Socket path for daemon communication |
 | `--full` | `false` | Use full TUI style (split panes with group tree) |

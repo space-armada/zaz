@@ -44,7 +44,9 @@ fn regenerate(original: &str) -> Result<String> {
     current = splice(&root_marker, &render_command(&root, true), &current)
         .with_context(|| format!("splicing {root_marker}"))?;
 
-    for sub in root.get_subcommands() {
+    // Hidden subcommands (e.g. the internal `supervisor` launcher) are excluded
+    // from the user-facing reference.
+    for sub in root.get_subcommands().filter(|sub| !sub.is_hide_set()) {
         let marker = format!("{} {}", root.get_name(), sub.get_name());
         let body = render_command(sub, false);
         current = splice(&marker, &body, &current).with_context(|| format!("splicing {marker}"))?;
