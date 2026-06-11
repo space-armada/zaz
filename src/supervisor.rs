@@ -4,9 +4,9 @@
 //! The supervisor spawns one ordinary `zaz daemon` per member config (ADR-0007),
 //! adopting a member whose hashed socket is already live rather than killing it.
 //! The single-config engine is untouched: each member keeps its own socket, so
-//! member-directory commands still resolve to the member's own daemon. This
-//! milestone lands the lifecycle spine; namespaced routing and aggregate reads
-//! arrive in later milestones.
+//! member-directory commands still resolve to the member's own daemon. Control
+//! verbs and log queries route to one member by project token; `Status` fans out
+//! and merges every reachable member's groups under qualified names.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 use zaz_daemon::{
     socket_path_for_config, ApiRequest, ApiResponse, Client, DaemonState, DaemonStatus,
-    EngineCommand, Server,
+    EngineCommand, GroupState, GroupStatus, Server,
 };
 use zaz_process::LaunchHandle;
 
@@ -80,6 +80,27 @@ fn parse_qualified(qualified: &str) -> Result<(&str, &str), String> {
             "malformed qualified name '{}': expected 'project/group'",
             qualified
         )),
+    }
+}
+
+/// Resolve a routing target into `(project, bare_name)`. A structured `project`
+/// field wins; otherwise the `field` string is parsed as `project/name` so the
+/// CLI's `project/group` shorthand still routes. The same string thus works
+/// against both a supervisor, which splits it here, and a single daemon, which
+/// treats it literally because it never calls this.
+fn resolve_target(project: Option<String>, field: String) -> Result<(String, String), String> {
+    match project {
+        Some(p) if !p.is_empty() => Ok((p, field)),
+        Some(_) => Err("empty project token".to_string()),
+        None => parse_qualified(&field).map(|(p, rest)| (p.to_string(), rest.to_string())),
+    }
+}
+
+/// The later of two optional timestamps, preferring whichever is present.
+fn max_option(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (some, None) | (None, some) => some,
     }
 }
 
@@ -287,13 +308,17 @@ impl Supervisor {
     }
 
     /// Map an API request to a response and whether it should trigger shutdown.
-    /// Mutations carry `project/group` qualified names that route to one member's
-    /// child daemon, while `RestartAll`/`ReloadConfig` fan out across the set.
-    /// Aggregate status content arrives in a later milestone; for now `Status`
-    /// answers the readiness probe with a minimal running state.
+    /// Mutations and log queries select a member by project token, carried in the
+    /// structured `project` field or, when absent, parsed from a `project/group`
+    /// string so the CLI shorthand keeps working. `RestartAll`/`ReloadConfig` fan
+    /// out across the set, and `Status` merges every reachable member's groups
+    /// under qualified names.
     async fn handle_request(&self, request: ApiRequest) -> (ApiResponse, bool) {
         match request {
-            ApiRequest::Status | ApiRequest::ListGroups | ApiRequest::Subscribe => {
+            ApiRequest::Status | ApiRequest::ListGroups => (self.aggregate_status().await, false),
+            ApiRequest::Subscribe => {
+                // The supervisor does not stream member status updates; answer the
+                // readiness probe with a bare running state.
                 let state = DaemonState {
                     status: DaemonStatus::Running,
                     ..Default::default()
@@ -304,10 +329,17 @@ impl Supervisor {
                 ApiResponse::ok_with_message("shutting down workspace"),
                 true,
             ),
-            ApiRequest::RestartGroup { name } => (self.route_restart_group(&name).await, false),
-            ApiRequest::RestartProcess { group, process } => {
-                (self.route_restart_process(&group, &process).await, false)
+            ApiRequest::RestartGroup { name, project } => {
+                (self.route_restart_group(project, name).await, false)
             }
+            ApiRequest::RestartProcess {
+                group,
+                process,
+                project,
+            } => (
+                self.route_restart_process(project, group, process).await,
+                false,
+            ),
             ApiRequest::RestartAll => (
                 self.fan_out("restart initiated for all groups", ApiRequest::RestartAll)
                     .await,
@@ -318,38 +350,116 @@ impl Supervisor {
                     .await,
                 false,
             ),
-            ApiRequest::GetLogs { .. }
-            | ApiRequest::SubscribeLogs { .. }
-            | ApiRequest::Identify => (
+            ApiRequest::GetLogs {
+                name,
+                project,
+                lines,
+                offset,
+                limit,
+                search,
+            } => (
+                self.route_logs(project, name, lines, offset, limit, search)
+                    .await,
+                false,
+            ),
+            ApiRequest::SubscribeLogs { .. } | ApiRequest::Identify => (
                 ApiResponse::error("not supported in workspace mode yet"),
                 false,
             ),
         }
     }
 
-    /// Route a qualified `project/group` restart to the owning member, returning
-    /// a response that re-qualifies the child's bare-name acknowledgement.
-    async fn route_restart_group(&self, qualified: &str) -> ApiResponse {
-        let (project, group) = match parse_qualified(qualified) {
+    /// Fan `Status` out across the working set and merge each reachable member's
+    /// groups under `project/group` keys. An unreachable member surfaces as a
+    /// single `Failed` group named after its project, so a crashed child is
+    /// visible without taking the aggregate down; the supervisor's own status
+    /// stays `Running` so readiness probes never fail.
+    async fn aggregate_status(&self) -> ApiResponse {
+        let mut merged = DaemonState {
+            status: DaemonStatus::Running,
+            ..Default::default()
+        };
+
+        for member in &self.members {
+            match forward(&member.socket_path, &ApiRequest::Status).await {
+                Ok(ApiResponse::Status { state }) => {
+                    merged.watched_files += state.watched_files;
+                    merged.last_change = max_option(merged.last_change, state.last_change);
+                    for (group_name, mut group) in state.groups {
+                        let qualified = format!("{}/{}", member.token, group_name);
+                        group.name = qualified.clone();
+                        merged.groups.insert(qualified, group);
+                    }
+                }
+                _ => {
+                    let marker = GroupState {
+                        name: member.token.clone(),
+                        status: GroupStatus::Failed,
+                        tasks: Vec::new(),
+                        daemons: Vec::new(),
+                    };
+                    merged.groups.insert(member.token.clone(), marker);
+                }
+            }
+        }
+
+        ApiResponse::Status { state: merged }
+    }
+
+    /// Route a group restart to the owning member, returning a response that
+    /// re-qualifies the child's bare-name acknowledgement.
+    async fn route_restart_group(&self, project: Option<String>, group: String) -> ApiResponse {
+        let (project, group) = match resolve_target(project, group) {
             Ok(parts) => parts,
             Err(message) => return ApiResponse::error(message),
         };
-        let member = match self.member_by_token(project) {
+        let member = match self.member_by_token(&project) {
             Some(member) => member,
-            None => {
-                return ApiResponse::error(format!(
-                    "unknown project '{}' in '{}'",
-                    project, qualified
-                ))
-            }
+            None => return ApiResponse::error(format!("unknown project '{}'", project)),
         };
 
         let forwarded = ApiRequest::RestartGroup {
-            name: group.to_string(),
+            name: group.clone(),
+            project: None,
+        };
+        match forward(&member.socket_path, &forwarded).await {
+            Ok(ApiResponse::Ok { .. }) => ApiResponse::ok_with_message(format!(
+                "restart initiated for group '{}/{}'",
+                project, group
+            )),
+            Ok(ApiResponse::Error { message }) => {
+                ApiResponse::error(format!("project '{}': {}", project, message))
+            }
+            Ok(other) => other,
+            Err(e) => ApiResponse::error(format!("project '{}': {}", project, e)),
+        }
+    }
+
+    /// Route a process restart to the owning member. The project is taken from the
+    /// structured field or parsed off the `group` string for the CLI shorthand.
+    async fn route_restart_process(
+        &self,
+        project: Option<String>,
+        group: String,
+        process: String,
+    ) -> ApiResponse {
+        let (project, _group) = match resolve_target(project, group) {
+            Ok(parts) => parts,
+            Err(message) => return ApiResponse::error(message),
+        };
+        let member = match self.member_by_token(&project) {
+            Some(member) => member,
+            None => return ApiResponse::error(format!("unknown project '{}'", project)),
+        };
+
+        let forwarded = ApiRequest::RestartProcess {
+            group: _group,
+            process: process.clone(),
+            project: None,
         };
         match forward(&member.socket_path, &forwarded).await {
             Ok(ApiResponse::Ok { .. }) => {
-                ApiResponse::ok_with_message(format!("restart initiated for group '{}'", qualified))
+                ApiResponse::ok_with_message(format!("restarted '{}/{}'", project, process))
             }
             Ok(ApiResponse::Error { message }) => {
                 ApiResponse::error(format!("project '{}': {}", project, message))
@@ -359,28 +469,54 @@ impl Supervisor {
         }
     }
 
-    /// Route a qualified `project/group` process restart to the owning member.
-    /// `group` carries the qualifier; `process` is the bare process name.
-    async fn route_restart_process(&self, group: &str, process: &str) -> ApiResponse {
-        let (project, bare_group) = match parse_qualified(group) {
-            Ok(parts) => parts,
-            Err(message) => return ApiResponse::error(message),
-        };
-        let member = match self.member_by_token(project) {
+    /// Route a log query to one member daemon. Scoping to a single member is what
+    /// keeps a query inside that member's own ZAZ-012 database; rows from another
+    /// member are unreachable by construction. A query with no project (and no
+    /// `project/name` shorthand) is rejected so a bare `*` cannot fan out.
+    #[allow(clippy::too_many_arguments)]
+    async fn route_logs(
+        &self,
+        project: Option<String>,
+        name: String,
+        lines: Option<usize>,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        search: Option<String>,
+    ) -> ApiResponse {
+        let (project, name) =
+            match resolve_target(project, name) {
+                Ok(parts) => parts,
+                Err(_) => return ApiResponse::error(
+                    "workspace log query requires a project (set `project` or use 'project/name')",
+                ),
+            };
+        let member = match self.member_by_token(&project) {
             Some(member) => member,
-            None => {
-                return ApiResponse::error(format!("unknown project '{}' in '{}'", project, group))
-            }
+            None => return ApiResponse::error(format!("unknown project '{}'", project)),
         };
 
-        let forwarded = ApiRequest::RestartProcess {
-            group: bare_group.to_string(),
-            process: process.to_string(),
+        let forwarded = ApiRequest::GetLogs {
+            name: name.clone(),
+            project: None,
+            lines,
+            offset,
+            limit,
+            search,
         };
         match forward(&member.socket_path, &forwarded).await {
-            Ok(ApiResponse::Ok { .. }) => {
-                ApiResponse::ok_with_message(format!("restarted '{}/{}'", project, process))
-            }
+            Ok(ApiResponse::Logs {
+                lines,
+                total_count,
+                has_more,
+                offset,
+                ..
+            }) => ApiResponse::Logs {
+                name: format!("{}/{}", project, name),
+                lines,
+                total_count,
+                has_more,
+                offset,
+            },
             Ok(ApiResponse::Error { message }) => {
                 ApiResponse::error(format!("project '{}': {}", project, message))
             }
@@ -737,11 +873,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn log_requests_are_unsupported_in_workspace_mode() {
+    async fn log_request_without_a_project_is_rejected() {
         let sup = test_supervisor();
         let (response, is_shutdown) = sup
             .handle_request(ApiRequest::GetLogs {
                 name: "*".to_string(),
+                project: None,
                 lines: None,
                 offset: None,
                 limit: None,
@@ -749,7 +886,10 @@ mod tests {
             })
             .await;
         assert!(!is_shutdown);
-        assert!(matches!(response, ApiResponse::Error { .. }));
+        match response {
+            ApiResponse::Error { message } => assert!(message.contains("requires a project")),
+            other => panic!("expected Error, got {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -760,6 +900,7 @@ mod tests {
         let (malformed, _) = sup
             .handle_request(ApiRequest::RestartGroup {
                 name: "bareword".to_string(),
+                project: None,
             })
             .await;
         match malformed {
@@ -770,11 +911,54 @@ mod tests {
         let (unknown, _) = sup
             .handle_request(ApiRequest::RestartGroup {
                 name: "nope/g".to_string(),
+                project: None,
             })
             .await;
         match unknown {
             ApiResponse::Error { message } => assert!(message.contains("unknown project 'nope'")),
             other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_target_prefers_field_then_shorthand() {
+        // Structured field wins; the string stays a bare name.
+        assert_eq!(
+            resolve_target(Some("web".to_string()), "g".to_string()),
+            Ok(("web".to_string(), "g".to_string()))
+        );
+        // No field: parse the `project/group` shorthand.
+        assert_eq!(
+            resolve_target(None, "web/g".to_string()),
+            Ok(("web".to_string(), "g".to_string()))
+        );
+        // No field and no separator is rejected.
+        assert!(resolve_target(None, "bare".to_string()).is_err());
+    }
+
+    #[tokio::test]
+    async fn aggregate_status_marks_unreachable_members_failed() {
+        let mut sup = test_supervisor();
+        // Members whose sockets are not bound: each fans out to nothing and
+        // surfaces as a Failed marker named after its token.
+        sup.members
+            .push(member("api", "/tmp/zaz-agg-test/api/zaz.toml"));
+        sup.members
+            .push(member("web", "/tmp/zaz-agg-test/web/zaz.toml"));
+
+        let (response, _) = sup.handle_request(ApiRequest::Status).await;
+        match response {
+            ApiResponse::Status { state } => {
+                assert_eq!(state.status, DaemonStatus::Running);
+                assert_eq!(state.groups.len(), 2);
+                for token in ["api", "web"] {
+                    let group = state.groups.get(token).expect("marker for token");
+                    assert_eq!(group.name, token);
+                    assert_eq!(group.status, GroupStatus::Failed);
+                    assert!(group.tasks.is_empty() && group.daemons.is_empty());
+                }
+            }
+            other => panic!("expected Status, got {:?}", other),
         }
     }
 }

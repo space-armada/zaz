@@ -10,13 +10,15 @@
 //! `--config` flags launches it, and `zaz stop --socket <ws>` tears it down.
 
 use std::ffi::OsStr;
+use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use zaz_daemon::socket_path_for_config;
+use zaz_daemon::{socket_path_for_config, ApiRequest, ApiResponse, LogLine};
 
 fn zaz_bin() -> &'static str {
     env!("CARGO_BIN_EXE_zaz")
@@ -669,6 +671,201 @@ fn workspace_explicit_name_overrides_basename() {
         !miss.status.success(),
         "basename should not address a member with an explicit name"
     );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+/// A daemon that emits one marker line and then stays alive, so its captured
+/// output is queryable. `echo` avoids TOML escape processing in the command.
+fn emitter_config(marker: &str) -> String {
+    format!(
+        r#"
+[[group]]
+name = "g"
+patterns = []
+
+[[group.daemon]]
+name = "emitter"
+command = "echo {marker}; sleep 600"
+"#
+    )
+}
+
+/// Send a `GetLogs` to `socket` with an optional project token, returning the raw
+/// `ApiResponse` so callers can assert on `Logs` or `Error`.
+fn get_logs(socket: &Path, project: Option<&str>, name: &str, search: Option<&str>) -> ApiResponse {
+    let request = ApiRequest::GetLogs {
+        name: name.to_string(),
+        project: project.map(str::to_string),
+        lines: None,
+        offset: None,
+        limit: Some(1024),
+        search: search.map(str::to_string),
+    };
+    let mut stream = UnixStream::connect(socket).expect("connect socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut payload = serde_json::to_string(&request).expect("serialize request");
+    payload.push('\n');
+    stream.write_all(payload.as_bytes()).expect("write request");
+    let mut response = String::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut buf).expect("read response");
+        if n == 0 {
+            break;
+        }
+        response.push_str(std::str::from_utf8(&buf[..n]).expect("utf-8"));
+        if response.contains('\n') {
+            break;
+        }
+    }
+    serde_json::from_str(response.trim_end_matches('\n')).expect("parse ApiResponse")
+}
+
+/// The `Logs` lines of a response, panicking on any other variant.
+fn logs_lines(response: ApiResponse) -> Vec<LogLine> {
+    match response {
+        ApiResponse::Logs { lines, .. } => lines,
+        other => panic!("expected Logs, got {other:?}"),
+    }
+}
+
+/// Poll the supervisor for `project`'s logs until a line containing `marker`
+/// appears or the deadline trips.
+fn await_marker(socket: &Path, project: &str, marker: &str, timeout: Duration) -> Vec<LogLine> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let lines = logs_lines(get_logs(socket, Some(project), "*", Some(marker)));
+        if lines.iter().any(|l| l.content.contains(marker)) {
+            return lines;
+        }
+        if Instant::now() >= deadline {
+            return lines;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn workspace_status_merges_members_under_qualified_names() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
+    assert!(ws.wait_running(&b_sock, Duration::from_secs(10)));
+
+    let status = ws.status(&ws.ws_socket);
+    assert!(status.status.success(), "aggregate status failed");
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("a/g") && stdout.contains("b/g"),
+        "status should merge groups under project/group: {stdout}"
+    );
+    assert!(
+        stdout.contains("[daemon] d"),
+        "merged status should carry each member's processes: {stdout}"
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_status_marks_unreachable_member_failed() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
+    assert!(ws.wait_running(&b_sock, Duration::from_secs(10)));
+
+    // Take member a's child daemon down; the supervisor keeps it in the set.
+    assert!(ws.stop(&a_sock).status.success());
+    assert!(ws.wait_socket_gone(&a_sock, Duration::from_secs(10)));
+
+    let status = ws.status(&ws.ws_socket);
+    assert!(
+        status.status.success(),
+        "aggregate status should still succeed with one member down"
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("a (Failed)"),
+        "unreachable member should surface as a Failed marker: {stdout}"
+    );
+    assert!(
+        stdout.contains("b/g"),
+        "the surviving member should still render: {stdout}"
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_logs_scope_to_one_member() {
+    let ws = Workspace::new();
+    let a = ws.member("a", &emitter_config("MARK-A"));
+    let b = ws.member("b", &emitter_config("MARK-B"));
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
+    assert!(ws.wait_running(&b_sock, Duration::from_secs(10)));
+
+    let a_lines = await_marker(&ws.ws_socket, "a", "MARK-A", Duration::from_secs(10));
+    assert!(
+        a_lines.iter().any(|l| l.content.contains("MARK-A")),
+        "project a should return its own line"
+    );
+    assert!(
+        !a_lines.iter().any(|l| l.content.contains("MARK-B")),
+        "project a must not surface b's rows"
+    );
+
+    let b_lines = await_marker(&ws.ws_socket, "b", "MARK-B", Duration::from_secs(10));
+    assert!(
+        b_lines.iter().any(|l| l.content.contains("MARK-B")),
+        "project b should return its own line"
+    );
+    assert!(
+        !b_lines.iter().any(|l| l.content.contains("MARK-A")),
+        "project b must not surface a's rows"
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_logs_without_project_are_rejected() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+
+    let response = get_logs(&ws.ws_socket, None, "*", None);
+    match response {
+        ApiResponse::Error { message } => assert!(
+            message.contains("requires a project"),
+            "error should explain the project requirement: {message}"
+        ),
+        other => panic!("bare-* log query should error, got {other:?}"),
+    }
 
     cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
 }

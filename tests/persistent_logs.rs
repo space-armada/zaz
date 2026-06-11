@@ -439,6 +439,7 @@ fn daemon_get_logs(
 ) -> DaemonLogs {
     let request = ApiRequest::GetLogs {
         name: name.to_string(),
+        project: None,
         lines: None,
         offset,
         limit,

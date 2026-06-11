@@ -134,6 +134,11 @@ pub enum ApiRequest {
     GetLogs {
         /// Process name ("*" for all processes).
         name: String,
+        /// Workspace project token selecting which member daemon to query. A
+        /// single-config daemon ignores it; a supervisor routes by it. Unset in
+        /// single-config mode, where it carries no meaning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
         /// Number of lines to return (None = all).
         /// Deprecated: use `limit` instead. Kept for backward compatibility.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,6 +164,10 @@ pub enum ApiRequest {
     RestartGroup {
         /// Group name.
         name: String,
+        /// Workspace project token selecting which member daemon to target. A
+        /// single-config daemon ignores it; a supervisor routes by it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
     },
 
     /// Restart a specific process (task or daemon) within a group.
@@ -167,6 +176,10 @@ pub enum ApiRequest {
         group: String,
         /// Process name (task or daemon).
         process: String,
+        /// Workspace project token selecting which member daemon to target. A
+        /// single-config daemon ignores it; a supervisor routes by it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
     },
 
     /// Restart all groups.
@@ -267,10 +280,14 @@ mod tests {
         // Request with field
         let req = ApiRequest::RestartGroup {
             name: "web".to_string(),
+            project: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains(r#""type":"restart_group""#));
         assert!(json.contains(r#""name":"web""#));
+        // An unset project is omitted from the wire, keeping the shape compatible
+        // with single-config clients.
+        assert!(!json.contains("project"));
     }
 
     #[test]
@@ -282,7 +299,10 @@ mod tests {
         let json = r#"{"type":"restart_group","name":"api"}"#;
         let req: ApiRequest = serde_json::from_str(json).unwrap();
         match req {
-            ApiRequest::RestartGroup { name } => assert_eq!(name, "api"),
+            ApiRequest::RestartGroup { name, project } => {
+                assert_eq!(name, "api");
+                assert_eq!(project, None);
+            }
             _ => panic!("expected RestartGroup"),
         }
 
@@ -292,12 +312,14 @@ mod tests {
         match req {
             ApiRequest::GetLogs {
                 name,
+                project,
                 lines,
                 offset,
                 limit,
                 search,
             } => {
                 assert_eq!(name, "server");
+                assert_eq!(project, None);
                 assert_eq!(lines, Some(100));
                 assert_eq!(offset, None);
                 assert_eq!(limit, None);
@@ -312,12 +334,14 @@ mod tests {
         match req {
             ApiRequest::GetLogs {
                 name,
+                project,
                 lines,
                 offset,
                 limit,
                 search,
             } => {
                 assert_eq!(name, "*");
+                assert_eq!(project, None);
                 assert_eq!(lines, None);
                 assert_eq!(offset, Some(50));
                 assert_eq!(limit, Some(25));
@@ -448,6 +472,7 @@ mod tests {
             ApiRequest::ListGroups,
             ApiRequest::GetLogs {
                 name: "test".to_string(),
+                project: None,
                 lines: None,
                 offset: None,
                 limit: None,
@@ -458,6 +483,7 @@ mod tests {
             },
             ApiRequest::RestartGroup {
                 name: "test".to_string(),
+                project: None,
             },
             ApiRequest::RestartAll,
             ApiRequest::ReloadConfig,

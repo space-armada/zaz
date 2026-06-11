@@ -590,3 +590,80 @@ fn mcp_workspace_unknown_project_returns_error() {
         "error should name the unknown project, got: {serialized}"
     );
 }
+
+#[test]
+fn mcp_workspace_restart_group_with_project_field() {
+    let ws = StartedWorkspace::launch();
+
+    let response = call_tool(
+        &ws.ws_socket,
+        &ws.root,
+        "zaz_restart_group",
+        json!({"name": "g", "project": "a"}),
+    );
+
+    assert_not_error(&response);
+    let report: MutationReport = parse_structured(&response);
+    assert!(
+        report.message.contains("a/g"),
+        "structured project field should route and re-qualify, got: {}",
+        report.message
+    );
+}
+
+#[test]
+fn mcp_workspace_restart_process_with_project_field() {
+    let ws = StartedWorkspace::launch();
+
+    let response = call_tool(
+        &ws.ws_socket,
+        &ws.root,
+        "zaz_restart_process",
+        json!({"group": "g", "process": "d", "project": "a"}),
+    );
+
+    assert_not_error(&response);
+    let report: MutationReport = parse_structured(&response);
+    assert!(
+        report.message.contains("a/") && report.message.contains('d'),
+        "structured project field should name the project and process, got: {}",
+        report.message
+    );
+}
+
+#[test]
+fn mcp_workspace_logs_scoped_by_project() {
+    let ws = StartedWorkspace::launch();
+
+    let response = call_tool(
+        &ws.ws_socket,
+        &ws.root,
+        "zaz_logs",
+        json!({"name": "*", "project": "a"}),
+    );
+
+    assert_not_error(&response);
+    let report: LogsReport = parse_structured(&response);
+    assert_eq!(
+        report.name, "a/*",
+        "scoped log query should echo the qualified name"
+    );
+}
+
+#[test]
+fn mcp_workspace_logs_without_project_errors() {
+    let ws = StartedWorkspace::launch();
+
+    let response = call_tool(&ws.ws_socket, &ws.root, "zaz_logs", json!({"name": "*"}));
+
+    let serialized = response.to_string();
+    let has_jsonrpc_error = response.get("error").is_some();
+    let has_tool_error = response
+        .pointer("/result/isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        has_jsonrpc_error || has_tool_error,
+        "a workspace log query without a project should error, got: {serialized}"
+    );
+}

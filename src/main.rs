@@ -1129,7 +1129,10 @@ async fn restart(socket_path: &Path, group: Option<String>) -> Result<()> {
     let mut client = connect_or_no_daemon(socket_path).await?;
 
     let request = match group {
-        Some(name) => ApiRequest::RestartGroup { name },
+        Some(name) => ApiRequest::RestartGroup {
+            name,
+            project: None,
+        },
         None => ApiRequest::RestartAll,
     };
 

@@ -87,7 +87,7 @@ impl ZazMcpServer {
     /// Paginated, optionally-filtered log query.
     #[tool(
         name = "zaz_logs",
-        description = "Read captured log output for a process. `name` is the process name (e.g. \"server\"); use \"*\" or omit to query across all processes. Supports pagination (`offset`, `limit`) and case-insensitive substring search."
+        description = "Read captured log output for a process. `name` is the process name (e.g. \"server\"); use \"*\" or omit to query across all processes. Supports pagination (`offset`, `limit`) and case-insensitive substring search. Against a workspace supervisor, set `project` to select the member; a query is always scoped to one member."
     )]
     async fn zaz_logs(
         &self,
@@ -124,13 +124,13 @@ impl ZazMcpServer {
     /// Restart every process in a single group.
     #[tool(
         name = "zaz_restart_group",
-        description = "Restart all tasks and daemons in the named group. Reversible: equivalent to a file-change-triggered restart. Use after editing code that the group watches when you want to skip the file event and restart immediately."
+        description = "Restart all tasks and daemons in the named group. Reversible: equivalent to a file-change-triggered restart. Use after editing code that the group watches when you want to skip the file event and restart immediately. Against a workspace supervisor, set `project` to select the member."
     )]
     async fn zaz_restart_group(
         &self,
         Parameters(req): Parameters<RestartGroupRequest>,
     ) -> Result<Json<MutationReport>, ErrorData> {
-        let message = client::restart_group(&self.socket_path, &req.name)
+        let message = client::restart_group(&self.socket_path, &req.name, req.project.as_deref())
             .await
             .map_err(into_error)?;
         Ok(Json(MutationReport { message }))
@@ -139,15 +139,20 @@ impl ZazMcpServer {
     /// Restart a single task or daemon within a group.
     #[tool(
         name = "zaz_restart_process",
-        description = "Restart a single process inside a group. `group` is the group name and `process` is the task or daemon `name` field as declared in the config. Reversible: starts a fresh instance the same way a file change would."
+        description = "Restart a single process inside a group. `group` is the group name and `process` is the task or daemon `name` field as declared in the config. Reversible: starts a fresh instance the same way a file change would. Against a workspace supervisor, set `project` to select the member."
     )]
     async fn zaz_restart_process(
         &self,
         Parameters(req): Parameters<RestartProcessRequest>,
     ) -> Result<Json<MutationReport>, ErrorData> {
-        let message = client::restart_process(&self.socket_path, &req.group, &req.process)
-            .await
-            .map_err(into_error)?;
+        let message = client::restart_process(
+            &self.socket_path,
+            &req.group,
+            &req.process,
+            req.project.as_deref(),
+        )
+        .await
+        .map_err(into_error)?;
         Ok(Json(MutationReport { message }))
     }
 

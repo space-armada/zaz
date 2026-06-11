@@ -172,8 +172,8 @@ fn assert_request_matches(actual: &ApiRequest, expected: &ApiRequest) {
         | (ApiRequest::RestartAll, ApiRequest::RestartAll)
         | (ApiRequest::ReloadConfig, ApiRequest::ReloadConfig) => {}
         (
-            ApiRequest::RestartGroup { name: actual },
-            ApiRequest::RestartGroup { name: expected },
+            ApiRequest::RestartGroup { name: actual, .. },
+            ApiRequest::RestartGroup { name: expected, .. },
         ) => {
             assert_eq!(actual, expected, "restart group name should match");
         }

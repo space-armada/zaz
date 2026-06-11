@@ -108,6 +108,11 @@ pub struct LogsRequest {
     /// Process name to query. Use "*" or omit for all processes.
     #[serde(default)]
     pub name: Option<String>,
+    /// Project token selecting one workspace member to query. Required against a
+    /// workspace supervisor; omit for a single-config daemon. A query is always
+    /// scoped to one member, never merged across the working set.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Number of leading entries to skip for pagination.
     #[serde(default)]
     pub offset: Option<usize>,
@@ -123,18 +128,24 @@ pub struct LogsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RestartGroupRequest {
     /// Name of the group to restart. Must match a group declared in `zaz.toml`/`zaz.json`.
-    /// Against a workspace supervisor, qualify with the project token as `project/group`.
     pub name: String,
+    /// Project token selecting one workspace member. Set against a workspace
+    /// supervisor; omit for a single-config daemon.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Input parameters for the `zaz_restart_process` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RestartProcessRequest {
-    /// Group the process belongs to. Against a workspace supervisor, qualify with the
-    /// project token as `project/group`.
+    /// Group the process belongs to.
     pub group: String,
     /// Process name. Matches the `name` field of a task or daemon entry inside the group.
     pub process: String,
+    /// Project token selecting one workspace member. Set against a workspace
+    /// supervisor; omit for a single-config daemon.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Confirmation response returned by all mutation tools.

@@ -1880,6 +1880,7 @@ impl Engine {
                 offset,
                 limit,
                 search,
+                ..
             } => {
                 // Use new pagination if any pagination param is set, otherwise use legacy
                 let use_pagination = offset.is_some() || limit.is_some() || search.is_some();
@@ -1942,13 +1943,13 @@ impl Engine {
                     Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
                 }
             }
-            ApiRequest::RestartGroup { name } => match self.restart_group(&name).await {
+            ApiRequest::RestartGroup { name, .. } => match self.restart_group(&name).await {
                 Ok(()) => {
                     ApiResponse::ok_with_message(format!("restart initiated for group '{}'", name))
                 }
                 Err(e) => ApiResponse::error(format!("failed to restart group '{}': {}", name, e)),
             },
-            ApiRequest::RestartProcess { group, process } => {
+            ApiRequest::RestartProcess { group, process, .. } => {
                 match self.restart_process(&group, &process).await {
                     Ok(()) => ApiResponse::ok_with_message(format!("restarted '{}'", process)),
                     Err(e) => ApiResponse::error(format!(
@@ -2858,6 +2859,7 @@ mod tests {
         let response = engine
             .handle_request(ApiRequest::GetLogs {
                 name: "task1".to_string(),
+                project: None,
                 lines: Some(1),
                 offset: None,
                 limit: None,
@@ -2900,6 +2902,7 @@ mod tests {
         let response = engine
             .handle_request(ApiRequest::GetLogs {
                 name: "task1".to_string(),
+                project: None,
                 lines: None,
                 offset: Some(1),
                 limit: Some(2),
