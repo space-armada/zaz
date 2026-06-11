@@ -62,12 +62,31 @@ impl Workspace {
     }
 
     fn run(&self, args: &[&OsStr]) -> Output {
+        self.run_in(&self.root, args)
+    }
+
+    /// Run `zaz` with `dir` as the working directory, so socket resolution walks
+    /// up from a member directory rather than the workspace root.
+    fn run_in(&self, dir: &Path, args: &[&OsStr]) -> Output {
         Command::new(zaz_bin())
             .args(args)
-            .current_dir(&self.root)
+            .current_dir(dir)
             .env("HOME", &self.home)
             .output()
             .expect("run zaz")
+    }
+
+    /// Start a single-config daemon for `config` bound at an arbitrary `socket`,
+    /// independent of the config's own resolved socket. Used to plant a foreign
+    /// daemon at a member's socket path.
+    fn start_single_at(&self, config: &Path, socket: &Path) -> Output {
+        self.run(&[
+            OsStr::new("-c"),
+            config.as_os_str(),
+            OsStr::new("--socket"),
+            socket.as_os_str(),
+            OsStr::new("start"),
+        ])
     }
 
     /// `zaz start` with each member config plus an explicit workspace socket.
@@ -271,6 +290,101 @@ fn workspace_adopts_live_member_without_killing_it() {
     assert_eq!(
         a_inode_before, a_inode_after,
         "adopted member socket was recreated (killed and replaced)"
+    );
+
+    // The identity check permits the legitimate same-config adopt, so the
+    // adopted member is addressable through the supervisor.
+    let routed = ws.restart(&ws.ws_socket, Some("a/g"));
+    assert!(
+        routed.status.success(),
+        "adopted member should be routable: {}",
+        String::from_utf8_lossy(&routed.stderr)
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_refuses_member_socket_bound_elsewhere() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let foreign = ws.member("foreign", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    // Plant a daemon serving `foreign` at member a's socket path. Attaching a
+    // would otherwise adopt this foreign daemon and double-manage a config.
+    assert!(ws.start_single_at(&foreign, &a_sock).status.success());
+    assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
+    let a_inode_before = std::fs::metadata(&a_sock).expect("a socket metadata").ino();
+
+    let out = ws.start_workspace(&[&a, &b]);
+    assert!(
+        out.status.success(),
+        "supervisor should still come up: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        ws.wait_running(&ws.ws_socket, Duration::from_secs(10)),
+        "supervisor not responsive"
+    );
+    assert!(
+        ws.wait_running(&b_sock, Duration::from_secs(10)),
+        "member b not spawned"
+    );
+
+    // The foreign daemon is left untouched: never killed, never replaced.
+    assert!(ws.status_running(&a_sock), "foreign daemon was taken down");
+    let a_inode_after = std::fs::metadata(&a_sock).expect("a socket metadata").ino();
+    assert_eq!(
+        a_inode_before, a_inode_after,
+        "foreign daemon socket was recreated"
+    );
+
+    // Member a was refused, not adopted, so the supervisor cannot address it.
+    let miss = ws.restart(&ws.ws_socket, Some("a/g"));
+    assert!(!miss.status.success(), "refused member should not route");
+    assert!(
+        String::from_utf8_lossy(&miss.stderr).contains("unknown project"),
+        "error should report the refused member as unknown: {}",
+        String::from_utf8_lossy(&miss.stderr)
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn member_dir_command_reaches_member_daemon() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+    let a_dir = a.parent().expect("member dir").to_path_buf();
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
+
+    // From inside member a's directory, with no --socket, resolution must land on
+    // a's own child daemon, not the supervisor. The member engine reports its
+    // configured group and daemon; the supervisor's status would not.
+    let status = ws.run_in(&a_dir, &[OsStr::new("status")]);
+    assert!(status.status.success(), "member-dir status failed");
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("[daemon] d"),
+        "member-dir status should report the member engine state, got: {stdout}"
+    );
+
+    // A bare, unqualified group name restarts only against the member daemon; the
+    // supervisor would reject it as malformed, so success proves member targeting.
+    let restart = ws.run_in(&a_dir, &[OsStr::new("restart"), OsStr::new("g")]);
+    assert!(
+        restart.status.success(),
+        "bare-name restart from member dir failed: {}",
+        String::from_utf8_lossy(&restart.stderr)
     );
 
     cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);

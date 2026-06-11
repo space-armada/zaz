@@ -1974,6 +1974,15 @@ impl Engine {
                 )),
                 ReloadResult::Failed(e) => ApiResponse::error(format!("reload failed: {}", e)),
             },
+            ApiRequest::Identify => {
+                let config_path = self
+                    .config_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.config_path.clone());
+                ApiResponse::Identity {
+                    config_path: config_path.display().to_string(),
+                }
+            }
             ApiRequest::Shutdown => {
                 // Signal handled by caller
                 ApiResponse::ok_with_message("shutting down")
@@ -2625,6 +2634,21 @@ mod tests {
         let mut engine = create_test_engine(groups);
         engine.task_only = true;
         engine
+    }
+
+    #[tokio::test]
+    async fn identify_reports_engine_config_path() {
+        let mut engine = create_test_engine(vec![]);
+        let expected = engine
+            .config_path
+            .canonicalize()
+            .unwrap_or_else(|_| engine.config_path.clone())
+            .display()
+            .to_string();
+        match engine.handle_request(ApiRequest::Identify).await {
+            ApiResponse::Identity { config_path } => assert_eq!(config_path, expected),
+            other => panic!("expected Identity, got {:?}", other),
+        }
     }
 
     fn test_config(groups: Vec<Group>) -> Config {

@@ -175,6 +175,9 @@ pub enum ApiRequest {
     /// Reload configuration.
     ReloadConfig,
 
+    /// Report the config the daemon is serving, for identity verification.
+    Identify,
+
     /// Graceful shutdown.
     Shutdown,
 }
@@ -218,6 +221,9 @@ pub enum ApiResponse {
 
     /// Log line (streaming).
     Log(LogLine),
+
+    /// Identity of the config a daemon is serving (canonical path).
+    Identity { config_path: String },
 
     /// Error response.
     Error { message: String },
@@ -318,6 +324,30 @@ mod tests {
                 assert_eq!(search, Some("error".to_string()));
             }
             _ => panic!("expected GetLogs"),
+        }
+    }
+
+    #[test]
+    fn test_identify_round_trip() {
+        let req = ApiRequest::Identify;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"type":"identify"}"#);
+        assert!(matches!(
+            serde_json::from_str::<ApiRequest>(&json).unwrap(),
+            ApiRequest::Identify
+        ));
+
+        let resp = ApiResponse::Identity {
+            config_path: "/tmp/proj/zaz.toml".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""type":"identity""#));
+        assert!(json.contains(r#""config_path":"/tmp/proj/zaz.toml""#));
+        match serde_json::from_str::<ApiResponse>(&json).unwrap() {
+            ApiResponse::Identity { config_path } => {
+                assert_eq!(config_path, "/tmp/proj/zaz.toml")
+            }
+            _ => panic!("expected Identity"),
         }
     }
 
@@ -431,6 +461,7 @@ mod tests {
             },
             ApiRequest::RestartAll,
             ApiRequest::ReloadConfig,
+            ApiRequest::Identify,
             ApiRequest::Shutdown,
         ];
 

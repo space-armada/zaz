@@ -182,19 +182,39 @@ impl Supervisor {
             check_daemon_availability(&socket, timeout).await,
             DaemonAvailability::Running
         ) {
-            tracing::info!(
-                config = %config_path.display(),
-                socket = %socket.display(),
-                "adopting live member daemon"
-            );
-            self.members.push(Member {
-                config_path: canonical,
-                socket_path: socket,
-                handle: None,
-                adopted: true,
-                token,
-            });
-            return Ok(());
+            // The socket is live. Adopt only if the daemon there serves this
+            // member's own config. A daemon serving anything else means the
+            // socket is bound elsewhere, and adopting it would double-manage a
+            // config across workspaces; refuse so this member is skipped while
+            // the rest of the set and the foreign daemon are left undisturbed.
+            match identify_daemon(&socket).await {
+                Some(reported) if same_config(&canonical, &reported) => {
+                    tracing::info!(
+                        config = %config_path.display(),
+                        socket = %socket.display(),
+                        "adopting live member daemon"
+                    );
+                    self.members.push(Member {
+                        config_path: canonical,
+                        socket_path: socket,
+                        handle: None,
+                        adopted: true,
+                        token,
+                    });
+                    return Ok(());
+                }
+                Some(reported) => bail!(
+                    "member socket {} is bound by a daemon serving {}; refusing to double-manage {}",
+                    socket.display(),
+                    reported.display(),
+                    config_path.display()
+                ),
+                None => bail!(
+                    "member socket {} is bound by an unidentifiable daemon; refusing to adopt {}",
+                    socket.display(),
+                    config_path.display()
+                ),
+            }
         }
 
         let output_log = self.child_output_log(&socket);
@@ -298,7 +318,9 @@ impl Supervisor {
                     .await,
                 false,
             ),
-            ApiRequest::GetLogs { .. } | ApiRequest::SubscribeLogs { .. } => (
+            ApiRequest::GetLogs { .. }
+            | ApiRequest::SubscribeLogs { .. }
+            | ApiRequest::Identify => (
                 ApiResponse::error("not supported in workspace mode yet"),
                 false,
             ),
@@ -396,6 +418,30 @@ async fn forward(socket: &Path, request: &ApiRequest) -> Result<ApiResponse, Str
         .request(request)
         .await
         .map_err(|e| format!("member request failed: {}", e))
+}
+
+/// Ask the daemon bound at `socket` which config it serves, for adopt-time
+/// identity verification. Returns the reported config path, or `None` if the
+/// socket is unreachable, the request fails, or the response is not `Identity`.
+async fn identify_daemon(socket: &Path) -> Option<PathBuf> {
+    let mut client = Client::connect(socket).await.ok()?;
+    match client.request(&ApiRequest::Identify).await.ok()? {
+        ApiResponse::Identity { config_path } => Some(PathBuf::from(config_path)),
+        _ => None,
+    }
+}
+
+/// Whether a daemon reporting `reported` serves the same config as the member at
+/// `member`. Both sides are canonicalized so symlinks and relative paths do not
+/// produce a false mismatch.
+fn same_config(member: &Path, reported: &Path) -> bool {
+    let lhs = member
+        .canonicalize()
+        .unwrap_or_else(|_| member.to_path_buf());
+    let rhs = reported
+        .canonicalize()
+        .unwrap_or_else(|_| reported.to_path_buf());
+    lhs == rhs
 }
 
 /// Send `Shutdown` to a child daemon and wait, bounded, for its socket file to
@@ -625,6 +671,33 @@ mod tests {
     fn combine_fanout_zero_members_is_error() {
         let response = combine_fanout("config reloaded", 0, 0, Vec::new());
         assert!(matches!(response, ApiResponse::Error { .. }));
+    }
+
+    #[test]
+    fn same_config_matches_identical_and_rejects_distinct_paths() {
+        // Non-existent paths fall back to literal comparison.
+        assert!(same_config(
+            Path::new("/repo/a/zaz.toml"),
+            Path::new("/repo/a/zaz.toml")
+        ));
+        assert!(!same_config(
+            Path::new("/repo/a/zaz.toml"),
+            Path::new("/repo/b/zaz.toml")
+        ));
+    }
+
+    #[test]
+    fn same_config_canonicalizes_before_comparing() {
+        let dir = std::env::temp_dir().join("zaz-supervisor-same-config-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("zaz.toml");
+        std::fs::write(&file, "").unwrap();
+
+        // A path with a redundant `.` component canonicalizes to the same file.
+        let indirect = dir.join(".").join("zaz.toml");
+        assert!(same_config(&file, &indirect));
+        // A sibling that does not exist is not the same config.
+        assert!(!same_config(&file, &dir.join("other.toml")));
     }
 
     #[test]
