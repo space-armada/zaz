@@ -129,3 +129,35 @@ needs to target a specific project — pass `--socket` or `--config` in
 ```
 
 `--socket` wins over `--config` when both are passed.
+
+### Workspace supervisor
+
+A workspace covers the handful of zaz projects you are touching in a monorepo
+under one registration. Start it with two or more `--config` flags:
+
+```sh
+zaz start -c backend/zaz.toml -c frontend/zaz.toml
+```
+
+This launches a supervisor that owns one child daemon per member and binds a
+single workspace socket at `<workspace-root>/.zaz/daemon.sock`, where the
+workspace root is the nearest ancestor directory holding a `.zaz/` directory
+but no `zaz.toml` or `zaz.json`. Pin that socket once and a single MCP
+registration reaches the whole set:
+
+```json
+{
+  "mcpServers": {
+    "zaz-workspace": {
+      "command": "zaz",
+      "args": ["mcp", "--socket", "/abs/path/to/workspace/.zaz/daemon.sock"]
+    }
+  }
+}
+```
+
+`zaz_status` against the supervisor merges every member's groups under
+`project/group` keys. `zaz_logs`, `zaz_restart_group`, and `zaz_restart_process`
+take a structured `project` parameter to target one member; a log query without
+a `project` is rejected rather than fanned out, since each member keeps its own
+log database.

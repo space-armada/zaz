@@ -121,11 +121,18 @@ Every subcommand resolves its target socket the same way:
 1. If `--socket <PATH>` is passed, use it verbatim. Explicit always wins.
 2. Otherwise, discover the project config by walking upward from CWD until
    `zaz.toml` or `zaz.json` is found (or the path supplied to `--config` is
-   used directly). The socket is derived deterministically from the
-   canonical config path via a hash, so two different project directories
-   never share a socket by accident.
+   used directly). The socket is then derived from that config's directory:
+   if the directory contains a `.zaz/` directory, the socket is
+   `<dir>/.zaz/daemon.sock`; otherwise it is derived deterministically from
+   the canonical config path via a hash (`~/.local/state/zaz/<hash>.sock`),
+   so two different project directories never share a socket by accident.
 3. If no config is found and no `--socket` is given, the command errors with
    an actionable message rather than falling back to a global default.
+
+A workspace supervisor follows the same `.zaz/` convention one level up: it
+binds `<workspace-root>/.zaz/daemon.sock`, where the workspace root is the
+nearest ancestor directory that holds a `.zaz/` directory but no `zaz.toml`
+or `zaz.json` of its own.
 
 `docs/mcp.md` defers to this section; the `--socket` and `--config` flags
 behave the same way for `zaz mcp`.
