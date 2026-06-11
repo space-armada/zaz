@@ -88,10 +88,7 @@ impl SqliteLogStorage {
             .map_err(|e| LogStorageError::Open(format!("open {}: {e}", path.display())))?;
         apply_pragmas(&conn)?;
         migrate(&conn)?;
-        Ok(Self {
-            conn,
-            policy: None,
-        })
+        Ok(Self { conn, policy: None })
     }
 
     /// Open an in-memory SQLite database with the same lifecycle as
@@ -103,10 +100,7 @@ impl SqliteLogStorage {
             .map_err(|e| LogStorageError::Open(format!("open in-memory: {e}")))?;
         apply_pragmas(&conn)?;
         migrate(&conn)?;
-        Ok(Self {
-            conn,
-            policy: None,
-        })
+        Ok(Self { conn, policy: None })
     }
 
     /// Attach a retention policy. Without a policy, `enforce_retention`
@@ -337,11 +331,9 @@ impl SqliteLogStorage {
                 })?;
             let mut out = Vec::new();
             for row in rows {
-                out.push(
-                    row.map_err(|e| {
-                        LogStorageError::Retention(format!("decode per-process row: {e}"))
-                    })?,
-                );
+                out.push(row.map_err(|e| {
+                    LogStorageError::Retention(format!("decode per-process row: {e}"))
+                })?);
             }
             out
         };
@@ -1328,8 +1320,11 @@ mod tests {
     fn trait_get_returns_most_recent_when_limited() {
         let mut storage = SqliteLogStorage::open_in_memory().expect("open");
         for i in 0..10 {
-            LogStorage::push(&mut storage, line(i as u64 * 100, "web", None, &format!("l{i}")))
-                .expect("push");
+            LogStorage::push(
+                &mut storage,
+                line(i as u64 * 100, "web", None, &format!("l{i}")),
+            )
+            .expect("push");
         }
         let last_three = LogStorage::get(&storage, "web", Some(3)).expect("get");
         assert_eq!(last_three.len(), 3);
@@ -1355,7 +1350,9 @@ mod tests {
         let mut storage = SqliteLogStorage::open_in_memory().expect("open");
         LogStorage::push(&mut storage, line(100, "web", None, "a")).expect("push");
         LogStorage::clear(&mut storage).expect("clear");
-        assert!(LogStorage::get(&storage, "*", None).expect("get").is_empty());
+        assert!(LogStorage::get(&storage, "*", None)
+            .expect("get")
+            .is_empty());
     }
 
     #[test]
@@ -1465,7 +1462,12 @@ mod tests {
             batch.push(line(i as u64 * 10, "web", None, &format!("w{i}")));
         }
         for i in 0..3 {
-            batch.push(line(2_000 + i as u64 * 10, "worker", None, &format!("k{i}")));
+            batch.push(line(
+                2_000 + i as u64 * 10,
+                "worker",
+                None,
+                &format!("k{i}"),
+            ));
         }
         storage.push_batch(batch).expect("push_batch");
 

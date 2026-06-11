@@ -123,13 +123,15 @@ pub struct LogsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RestartGroupRequest {
     /// Name of the group to restart. Must match a group declared in `zaz.toml`/`zaz.json`.
+    /// Against a workspace supervisor, qualify with the project token as `project/group`.
     pub name: String,
 }
 
 /// Input parameters for the `zaz_restart_process` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RestartProcessRequest {
-    /// Group the process belongs to.
+    /// Group the process belongs to. Against a workspace supervisor, qualify with the
+    /// project token as `project/group`.
     pub group: String,
     /// Process name. Matches the `name` field of a task or daemon entry inside the group.
     pub process: String,

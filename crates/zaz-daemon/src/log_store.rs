@@ -1047,14 +1047,11 @@ mod tests {
     // =========================================================================
 
     fn hybrid_store() -> LogStore {
-        LogStore::new().with_sqlite(
-            SqliteLogStorage::open_in_memory().expect("open in-memory sqlite"),
-        )
+        LogStore::new()
+            .with_sqlite(SqliteLogStorage::open_in_memory().expect("open in-memory sqlite"))
     }
 
-    fn hybrid_store_with_retention(
-        policy: crate::log_storage_sqlite::RetentionPolicy,
-    ) -> LogStore {
+    fn hybrid_store_with_retention(policy: crate::log_storage_sqlite::RetentionPolicy) -> LogStore {
         LogStore::new().with_sqlite(
             SqliteLogStorage::open_in_memory()
                 .expect("open in-memory sqlite")
@@ -1590,8 +1587,7 @@ mod tests {
 
         // Open a competing connection and hold the WAL writer slot via
         // BEGIN IMMEDIATE plus an uncommitted insert.
-        let blocker =
-            rusqlite::Connection::open(&db_path).expect("open competing connection");
+        let blocker = rusqlite::Connection::open(&db_path).expect("open competing connection");
         blocker
             .busy_timeout(std::time::Duration::from_millis(0))
             .expect("blocker timeout");

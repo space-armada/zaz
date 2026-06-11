@@ -199,8 +199,9 @@ impl StartedDaemon {
         let output = run_zaz(current_dir, xdg, args);
         if !output.status.success() {
             let daemon_log = current_dir.join("zaz.daemon-output.log");
-            let daemon_log_contents = std::fs::read_to_string(&daemon_log)
-                .unwrap_or_else(|e| format!("(no daemon-output.log at {}: {e})", daemon_log.display()));
+            let daemon_log_contents = std::fs::read_to_string(&daemon_log).unwrap_or_else(|e| {
+                format!("(no daemon-output.log at {}: {e})", daemon_log.display())
+            });
             panic!(
                 "zaz start exited with {:?}\nstdout: {}\nstderr: {}\ndaemon-output.log:\n{}",
                 output.status.code(),
@@ -507,7 +508,12 @@ fn await_log_count(
     }
     let observed: Vec<String> = last_lines
         .iter()
-        .map(|l| format!("[{:?}/{:?}] {}: {}", l.source, l.output_kind, l.process, l.content))
+        .map(|l| {
+            format!(
+                "[{:?}/{:?}] {}: {}",
+                l.source, l.output_kind, l.process, l.content
+            )
+        })
         .collect();
     panic!(
         "timed out waiting for {expected} `{name}` log lines matching {search:?}; last observed {last} within {timeout:?}\nlines:\n{}",
@@ -590,9 +596,14 @@ fn paginated_and_search_queries_against_persisted_logs() {
     assert_eq!(api_p0.has_more, Some(true));
     assert_eq!(api_p0.lines.len(), 10);
     let api_p0_contents: Vec<&str> = api_p0.lines.iter().map(|l| l.content.as_str()).collect();
-    let expected_p0: Vec<String> = (1..=10).map(|i| format_line("LINE", i, &needle_indices)).collect();
+    let expected_p0: Vec<String> = (1..=10)
+        .map(|i| format_line("LINE", i, &needle_indices))
+        .collect();
     let expected_p0_refs: Vec<&str> = expected_p0.iter().map(String::as_str).collect();
-    assert_eq!(api_p0_contents, expected_p0_refs, "daemon API page 0 contents");
+    assert_eq!(
+        api_p0_contents, expected_p0_refs,
+        "daemon API page 0 contents"
+    );
 
     let mcp_p0 = mcp_logs(
         &socket,
@@ -617,7 +628,10 @@ fn paginated_and_search_queries_against_persisted_logs() {
         .map(|i| format_line("LINE", i, &needle_indices))
         .collect();
     let expected_p1_refs: Vec<&str> = expected_p1.iter().map(String::as_str).collect();
-    assert_eq!(api_p1_contents, expected_p1_refs, "daemon API page 1 contents");
+    assert_eq!(
+        api_p1_contents, expected_p1_refs,
+        "daemon API page 1 contents"
+    );
 
     let mcp_p1 = mcp_logs(
         &socket,

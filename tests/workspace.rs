@@ -112,6 +112,26 @@ impl Workspace {
         ])
     }
 
+    fn restart(&self, socket: &Path, target: Option<&str>) -> Output {
+        let mut args: Vec<&OsStr> = vec![
+            OsStr::new("--socket"),
+            socket.as_os_str(),
+            OsStr::new("restart"),
+        ];
+        if let Some(target) = target {
+            args.push(OsStr::new(target));
+        }
+        self.run(&args)
+    }
+
+    fn reload(&self, socket: &Path) -> Output {
+        self.run(&[
+            OsStr::new("--socket"),
+            socket.as_os_str(),
+            OsStr::new("reload"),
+        ])
+    }
+
     fn status_running(&self, socket: &Path) -> bool {
         let out = self.status(socket);
         out.status.code() == Some(0)
@@ -152,6 +172,24 @@ patterns = []
 name = "d"
 command = "sleep 600"
 "#
+}
+
+/// A long-running config that pins an explicit `[settings] name` project token.
+fn named_config(name: &str) -> String {
+    format!(
+        r#"
+[settings]
+name = "{name}"
+
+[[group]]
+name = "g"
+patterns = []
+
+[[group.daemon]]
+name = "d"
+command = "sleep 600"
+"#
+    )
 }
 
 /// A config that fails validation (`deny_unknown_fields`), so attaching its
@@ -352,4 +390,204 @@ fn single_config_start_is_unchanged() {
     );
 
     cleanup(&ws, &[&a_sock]);
+}
+
+#[test]
+fn workspace_restart_group_routes_to_member() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
+    assert!(ws.wait_running(&b_sock, Duration::from_secs(10)));
+
+    let out = ws.restart(&ws.ws_socket, Some("a/g"));
+    assert!(
+        out.status.success(),
+        "qualified restart failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("a/g"),
+        "response should re-qualify the group name: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Routing to a must not disturb b.
+    assert!(
+        ws.status_running(&a_sock),
+        "member a went down after restart"
+    );
+    assert!(
+        ws.status_running(&b_sock),
+        "member b disturbed by restart of a"
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_restart_all_fans_out() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
+    assert!(ws.wait_running(&b_sock, Duration::from_secs(10)));
+
+    let out = ws.restart(&ws.ws_socket, None);
+    assert!(
+        out.status.success(),
+        "restart-all fan-out failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("2 project(s)"),
+        "fan-out summary should mention project count: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_reload_fans_out() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
+    assert!(ws.wait_running(&b_sock, Duration::from_secs(10)));
+
+    let out = ws.reload(&ws.ws_socket);
+    assert!(
+        out.status.success(),
+        "reload fan-out failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("config reloaded"),
+        "reload summary should mention config reloaded: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_unknown_project_errors() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+
+    let out = ws.restart(&ws.ws_socket, Some("nope/g"));
+    assert!(!out.status.success(), "unknown project should fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nope"),
+        "error should name the unknown project: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_malformed_name_errors() {
+    let ws = Workspace::new();
+    let a = ws.member("a", long_running_config());
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+
+    let out = ws.restart(&ws.ws_socket, Some("bareword"));
+    assert!(!out.status.success(), "unqualified name should fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("project/group"),
+        "error should name the expected format: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_explicit_name_overrides_basename() {
+    let ws = Workspace::new();
+    let a = ws.member("a", &named_config("frontend"));
+    let b = ws.member("b", long_running_config());
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    assert!(ws.start_workspace(&[&a, &b]).status.success());
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
+
+    // The explicit token addresses the member; the directory basename does not.
+    let ok = ws.restart(&ws.ws_socket, Some("frontend/g"));
+    assert!(
+        ok.status.success(),
+        "explicit-name restart failed: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    let miss = ws.restart(&ws.ws_socket, Some("a/g"));
+    assert!(
+        !miss.status.success(),
+        "basename should not address a member with an explicit name"
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+#[test]
+fn workspace_duplicate_token_aborts_startup() {
+    let ws = Workspace::new();
+    // Distinct directories, but both pin the same explicit token.
+    let a = ws.member("a", &named_config("dup"));
+    let b = ws.member("b", &named_config("dup"));
+    let a_sock = ws.member_socket(&a);
+    let b_sock = ws.member_socket(&b);
+
+    let out = ws.start_workspace(&[&a, &b]);
+    assert!(
+        !out.status.success(),
+        "duplicate project token should abort startup"
+    );
+
+    // The supervisor never binds its control socket, and the children it spawned
+    // during the boot loop are torn down rather than orphaned.
+    assert!(
+        !ws.status_running(&ws.ws_socket),
+        "supervisor should not be running after a collision abort"
+    );
+    assert!(
+        ws.wait_socket_gone(&a_sock, Duration::from_secs(10)),
+        "spawned child a leaked after collision abort"
+    );
+    assert!(
+        ws.wait_socket_gone(&b_sock, Duration::from_secs(10)),
+        "spawned child b leaked after collision abort"
+    );
+
+    cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
 }

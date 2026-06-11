@@ -34,6 +34,71 @@ struct Member {
     socket_path: PathBuf,
     handle: Option<LaunchHandle>,
     adopted: bool,
+    token: String,
+}
+
+/// Resolve a member's project token: the explicit `[settings] name` when set,
+/// otherwise the config directory basename. The token is the addressing label in
+/// a `project/group` qualified name, so `/` is forbidden in it.
+fn resolve_token(config_path: &Path, settings_name: Option<&str>) -> Result<String> {
+    if let Some(name) = settings_name {
+        if name.is_empty() {
+            bail!(
+                "[settings] name must not be empty in {}",
+                config_path.display()
+            );
+        }
+        if name.contains('/') {
+            bail!(
+                "[settings] name '{}' must not contain '/' in {}",
+                name,
+                config_path.display()
+            );
+        }
+        return Ok(name.to_string());
+    }
+
+    let basename = config_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    match basename {
+        Some(name) if !name.is_empty() && !name.contains('/') => Ok(name.to_string()),
+        _ => bail!(
+            "cannot derive a project token from {}; set an explicit [settings] name",
+            config_path.display()
+        ),
+    }
+}
+
+/// Split a `project/group` qualified name on the first `/`. Both halves must be
+/// non-empty; the group half may itself contain `/`.
+fn parse_qualified(qualified: &str) -> Result<(&str, &str), String> {
+    match qualified.split_once('/') {
+        Some((project, rest)) if !project.is_empty() && !rest.is_empty() => Ok((project, rest)),
+        _ => Err(format!(
+            "malformed qualified name '{}': expected 'project/group'",
+            qualified
+        )),
+    }
+}
+
+/// Combine per-member outcomes of a fan-out operation into one response. `verb`
+/// is the success-summary noun phrase, `failures` carries `token: message`
+/// strings for members that errored or were unreachable.
+fn combine_fanout(verb: &str, ok: usize, total: usize, failures: Vec<String>) -> ApiResponse {
+    if total == 0 {
+        return ApiResponse::error("no workspace members available");
+    }
+    if failures.is_empty() {
+        return ApiResponse::ok_with_message(format!("{} across {} project(s)", verb, ok));
+    }
+    ApiResponse::error(format!(
+        "{}/{} project(s) failed: {}",
+        failures.len(),
+        total,
+        failures.join("; ")
+    ))
 }
 
 /// Owns the working set of member daemons.
@@ -54,6 +119,28 @@ impl Supervisor {
 
     fn member_count(&self) -> usize {
         self.members.len()
+    }
+
+    fn member_by_token(&self, token: &str) -> Option<&Member> {
+        self.members.iter().find(|m| m.token == token)
+    }
+
+    /// Reject a working set in which two members resolve to the same project
+    /// token: the token is the only addressing label, so a collision makes
+    /// routing ambiguous. Resolvable by setting an explicit `[settings] name`.
+    fn check_token_uniqueness(&self) -> Result<()> {
+        let mut seen: std::collections::HashMap<&str, &Path> = std::collections::HashMap::new();
+        for member in &self.members {
+            if let Some(first) = seen.insert(member.token.as_str(), &member.config_path) {
+                bail!(
+                    "workspace members resolve to the same project token '{}': {} and {} (set an explicit [settings] name)",
+                    member.token,
+                    first.display(),
+                    member.config_path.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Per-child output log path, derived from the member socket so concurrent
@@ -77,8 +164,9 @@ impl Supervisor {
         if !config_path.exists() {
             bail!("config file not found: {}", config_path.display());
         }
-        zaz_config::load(config_path)
+        let config = zaz_config::load(config_path)
             .with_context(|| format!("invalid config: {}", config_path.display()))?;
+        let token = resolve_token(config_path, config.settings.name.as_deref())?;
 
         let canonical = config_path
             .canonicalize()
@@ -104,6 +192,7 @@ impl Supervisor {
                 socket_path: socket,
                 handle: None,
                 adopted: true,
+                token,
             });
             return Ok(());
         }
@@ -129,6 +218,7 @@ impl Supervisor {
                     socket_path: socket,
                     handle: Some(handle),
                     adopted: false,
+                    token,
                 });
                 Ok(())
             }
@@ -177,9 +267,11 @@ impl Supervisor {
     }
 
     /// Map an API request to a response and whether it should trigger shutdown.
+    /// Mutations carry `project/group` qualified names that route to one member's
+    /// child daemon, while `RestartAll`/`ReloadConfig` fan out across the set.
     /// Aggregate status content arrives in a later milestone; for now `Status`
     /// answers the readiness probe with a minimal running state.
-    fn handle_request(&self, request: ApiRequest) -> (ApiResponse, bool) {
+    async fn handle_request(&self, request: ApiRequest) -> (ApiResponse, bool) {
         match request {
             ApiRequest::Status | ApiRequest::ListGroups | ApiRequest::Subscribe => {
                 let state = DaemonState {
@@ -192,12 +284,118 @@ impl Supervisor {
                 ApiResponse::ok_with_message("shutting down workspace"),
                 true,
             ),
-            _ => (
+            ApiRequest::RestartGroup { name } => (self.route_restart_group(&name).await, false),
+            ApiRequest::RestartProcess { group, process } => {
+                (self.route_restart_process(&group, &process).await, false)
+            }
+            ApiRequest::RestartAll => (
+                self.fan_out("restart initiated for all groups", ApiRequest::RestartAll)
+                    .await,
+                false,
+            ),
+            ApiRequest::ReloadConfig => (
+                self.fan_out("config reloaded", ApiRequest::ReloadConfig)
+                    .await,
+                false,
+            ),
+            ApiRequest::GetLogs { .. } | ApiRequest::SubscribeLogs { .. } => (
                 ApiResponse::error("not supported in workspace mode yet"),
                 false,
             ),
         }
     }
+
+    /// Route a qualified `project/group` restart to the owning member, returning
+    /// a response that re-qualifies the child's bare-name acknowledgement.
+    async fn route_restart_group(&self, qualified: &str) -> ApiResponse {
+        let (project, group) = match parse_qualified(qualified) {
+            Ok(parts) => parts,
+            Err(message) => return ApiResponse::error(message),
+        };
+        let member = match self.member_by_token(project) {
+            Some(member) => member,
+            None => {
+                return ApiResponse::error(format!(
+                    "unknown project '{}' in '{}'",
+                    project, qualified
+                ))
+            }
+        };
+
+        let forwarded = ApiRequest::RestartGroup {
+            name: group.to_string(),
+        };
+        match forward(&member.socket_path, &forwarded).await {
+            Ok(ApiResponse::Ok { .. }) => {
+                ApiResponse::ok_with_message(format!("restart initiated for group '{}'", qualified))
+            }
+            Ok(ApiResponse::Error { message }) => {
+                ApiResponse::error(format!("project '{}': {}", project, message))
+            }
+            Ok(other) => other,
+            Err(e) => ApiResponse::error(format!("project '{}': {}", project, e)),
+        }
+    }
+
+    /// Route a qualified `project/group` process restart to the owning member.
+    /// `group` carries the qualifier; `process` is the bare process name.
+    async fn route_restart_process(&self, group: &str, process: &str) -> ApiResponse {
+        let (project, bare_group) = match parse_qualified(group) {
+            Ok(parts) => parts,
+            Err(message) => return ApiResponse::error(message),
+        };
+        let member = match self.member_by_token(project) {
+            Some(member) => member,
+            None => {
+                return ApiResponse::error(format!("unknown project '{}' in '{}'", project, group))
+            }
+        };
+
+        let forwarded = ApiRequest::RestartProcess {
+            group: bare_group.to_string(),
+            process: process.to_string(),
+        };
+        match forward(&member.socket_path, &forwarded).await {
+            Ok(ApiResponse::Ok { .. }) => {
+                ApiResponse::ok_with_message(format!("restarted '{}/{}'", project, process))
+            }
+            Ok(ApiResponse::Error { message }) => {
+                ApiResponse::error(format!("project '{}': {}", project, message))
+            }
+            Ok(other) => other,
+            Err(e) => ApiResponse::error(format!("project '{}': {}", project, e)),
+        }
+    }
+
+    /// Forward `request` to every member, combining the outcomes into one
+    /// response. Used by the unqualified `RestartAll` and `ReloadConfig` verbs.
+    async fn fan_out(&self, verb: &str, request: ApiRequest) -> ApiResponse {
+        let mut ok = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        for member in &self.members {
+            match forward(&member.socket_path, &request).await {
+                Ok(ApiResponse::Ok { .. }) => ok += 1,
+                Ok(ApiResponse::Error { message }) => {
+                    failures.push(format!("{}: {}", member.token, message))
+                }
+                Ok(_) => failures.push(format!("{}: unexpected response", member.token)),
+                Err(e) => failures.push(format!("{}: {}", member.token, e)),
+            }
+        }
+        combine_fanout(verb, ok, self.members.len(), failures)
+    }
+}
+
+/// Connect to a child daemon socket and issue one request, mapping connection
+/// and request errors to display strings the caller re-qualifies.
+async fn forward(socket: &Path, request: &ApiRequest) -> Result<ApiResponse, String> {
+    let mut client = Client::connect(socket)
+        .await
+        .map_err(|e| format!("member daemon unreachable: {}", e))?;
+    client
+        .request(request)
+        .await
+        .map_err(|e| format!("member request failed: {}", e))
 }
 
 /// Send `Shutdown` to a child daemon and wait, bounded, for its socket file to
@@ -265,6 +463,14 @@ pub(crate) async fn run_supervisor(
         "workspace boot attach loop complete"
     );
 
+    // Cross-member token uniqueness. Members that failed to attach are already
+    // gone; a collision among the survivors aborts startup. Stop the children we
+    // just spawned first so the failed boot does not leak daemons.
+    if let Err(e) = supervisor.check_token_uniqueness() {
+        supervisor.detach_all().await;
+        return Err(e);
+    }
+
     let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
     let server = Server::bind(socket_path, command_tx).await?;
     let server_handle = tokio::spawn(async move {
@@ -282,7 +488,7 @@ pub(crate) async fn run_supervisor(
             }
 
             Some(cmd) = command_rx.recv() => {
-                let (response, is_shutdown) = supervisor.handle_request(cmd.request);
+                let (response, is_shutdown) = supervisor.handle_request(cmd.request).await;
                 let _ = cmd.response_tx.send(response);
                 if is_shutdown {
                     shutdown_requested = true;
@@ -315,6 +521,112 @@ mod tests {
         Supervisor::new(PathBuf::from("/tmp/zaz-ws/.zaz/daemon.sock"), false)
     }
 
+    fn member(token: &str, config: &str) -> Member {
+        Member {
+            config_path: PathBuf::from(config),
+            socket_path: PathBuf::from(format!("/tmp/{}.sock", token)),
+            handle: None,
+            adopted: true,
+            token: token.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_token_prefers_explicit_name() {
+        let token = resolve_token(Path::new("/repo/api/zaz.toml"), Some("frontend")).unwrap();
+        assert_eq!(token, "frontend");
+    }
+
+    #[test]
+    fn resolve_token_falls_back_to_basename() {
+        let token = resolve_token(Path::new("/repo/api/zaz.toml"), None).unwrap();
+        assert_eq!(token, "api");
+    }
+
+    #[test]
+    fn resolve_token_rejects_empty_and_slashed_name() {
+        assert!(resolve_token(Path::new("/repo/api/zaz.toml"), Some("")).is_err());
+        assert!(resolve_token(Path::new("/repo/api/zaz.toml"), Some("a/b")).is_err());
+    }
+
+    #[test]
+    fn parse_qualified_splits_on_first_slash() {
+        assert_eq!(parse_qualified("a/b"), Ok(("a", "b")));
+        // Group names may legally contain '/'; only the first split matters.
+        assert_eq!(parse_qualified("proj/a/b"), Ok(("proj", "a/b")));
+    }
+
+    #[test]
+    fn parse_qualified_rejects_malformed() {
+        assert!(parse_qualified("nogroup").is_err());
+        assert!(parse_qualified("/g").is_err());
+        assert!(parse_qualified("p/").is_err());
+    }
+
+    #[test]
+    fn check_token_uniqueness_passes_for_distinct_tokens() {
+        let mut sup = test_supervisor();
+        sup.members.push(member("api", "/repo/api/zaz.toml"));
+        sup.members.push(member("web", "/repo/web/zaz.toml"));
+        assert!(sup.check_token_uniqueness().is_ok());
+    }
+
+    #[test]
+    fn check_token_uniqueness_reports_collision_with_both_paths() {
+        let mut sup = test_supervisor();
+        sup.members.push(member("dup", "/repo/a/zaz.toml"));
+        sup.members.push(member("dup", "/repo/b/zaz.toml"));
+        let err = sup.check_token_uniqueness().unwrap_err().to_string();
+        assert!(err.contains("dup"));
+        assert!(err.contains("/repo/a/zaz.toml"));
+        assert!(err.contains("/repo/b/zaz.toml"));
+    }
+
+    #[test]
+    fn member_by_token_finds_and_misses() {
+        let mut sup = test_supervisor();
+        sup.members.push(member("api", "/repo/api/zaz.toml"));
+        assert!(sup.member_by_token("api").is_some());
+        assert!(sup.member_by_token("web").is_none());
+    }
+
+    #[test]
+    fn combine_fanout_all_success() {
+        let response = combine_fanout("config reloaded", 2, 2, Vec::new());
+        match response {
+            ApiResponse::Ok { message } => {
+                assert_eq!(
+                    message.as_deref(),
+                    Some("config reloaded across 2 project(s)")
+                );
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn combine_fanout_partial_failure_is_error() {
+        let response = combine_fanout(
+            "restart initiated for all groups",
+            1,
+            2,
+            vec!["web: boom".to_string()],
+        );
+        match response {
+            ApiResponse::Error { message } => {
+                assert!(message.contains("1/2 project(s) failed"));
+                assert!(message.contains("web: boom"));
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn combine_fanout_zero_members_is_error() {
+        let response = combine_fanout("config reloaded", 0, 0, Vec::new());
+        assert!(matches!(response, ApiResponse::Error { .. }));
+    }
+
     #[test]
     fn child_output_log_is_deterministic_and_distinct() {
         let sup = test_supervisor();
@@ -332,10 +644,10 @@ mod tests {
             .starts_with("child-"));
     }
 
-    #[test]
-    fn status_request_answers_running() {
+    #[tokio::test]
+    async fn status_request_answers_running() {
         let sup = test_supervisor();
-        let (response, is_shutdown) = sup.handle_request(ApiRequest::Status);
+        let (response, is_shutdown) = sup.handle_request(ApiRequest::Status).await;
         assert!(!is_shutdown);
         match response {
             ApiResponse::Status { state } => assert_eq!(state.status, DaemonStatus::Running),
@@ -343,19 +655,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shutdown_request_signals_teardown() {
+    #[tokio::test]
+    async fn shutdown_request_signals_teardown() {
         let sup = test_supervisor();
-        let (response, is_shutdown) = sup.handle_request(ApiRequest::Shutdown);
+        let (response, is_shutdown) = sup.handle_request(ApiRequest::Shutdown).await;
         assert!(is_shutdown);
         assert!(matches!(response, ApiResponse::Ok { .. }));
     }
 
-    #[test]
-    fn unsupported_request_returns_error() {
+    #[tokio::test]
+    async fn log_requests_are_unsupported_in_workspace_mode() {
         let sup = test_supervisor();
-        let (response, is_shutdown) = sup.handle_request(ApiRequest::RestartAll);
+        let (response, is_shutdown) = sup
+            .handle_request(ApiRequest::GetLogs {
+                name: "*".to_string(),
+                lines: None,
+                offset: None,
+                limit: None,
+                search: None,
+            })
+            .await;
         assert!(!is_shutdown);
         assert!(matches!(response, ApiResponse::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn restart_group_rejects_malformed_and_unknown() {
+        let mut sup = test_supervisor();
+        sup.members.push(member("api", "/repo/api/zaz.toml"));
+
+        let (malformed, _) = sup
+            .handle_request(ApiRequest::RestartGroup {
+                name: "bareword".to_string(),
+            })
+            .await;
+        match malformed {
+            ApiResponse::Error { message } => assert!(message.contains("malformed qualified name")),
+            other => panic!("expected Error, got {:?}", other),
+        }
+
+        let (unknown, _) = sup
+            .handle_request(ApiRequest::RestartGroup {
+                name: "nope/g".to_string(),
+            })
+            .await;
+        match unknown {
+            ApiResponse::Error { message } => assert!(message.contains("unknown project 'nope'")),
+            other => panic!("expected Error, got {:?}", other),
+        }
     }
 }

@@ -429,3 +429,164 @@ fn mcp_zaz_restart_group_unknown_returns_error() {
         "error response should mention the operation, got: {serialized}"
     );
 }
+
+/// A two-member workspace supervisor for the qualified-name MCP round-trips.
+/// The MCP server is pointed at the supervisor socket, so qualified
+/// `project/group` names route through the supervisor to the member daemons.
+struct StartedWorkspace {
+    _temp: TempDir,
+    home: PathBuf,
+    root: PathBuf,
+    ws_socket: PathBuf,
+}
+
+impl StartedWorkspace {
+    fn launch() -> Self {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let root = temp.path().join("ws");
+        std::fs::create_dir_all(root.join(".zaz")).unwrap();
+        let ws_socket = root.join(".zaz").join("daemon.sock");
+
+        let a = Self::write_member(&root, "a");
+        let b = Self::write_member(&root, "b");
+
+        let output = Command::new(zaz_bin())
+            .args([
+                "-c",
+                a.to_str().unwrap(),
+                "-c",
+                b.to_str().unwrap(),
+                "--socket",
+                ws_socket.to_str().unwrap(),
+                "start",
+            ])
+            .current_dir(&root)
+            .env("HOME", &home)
+            .output()
+            .expect("run zaz start");
+        assert!(
+            output.status.success(),
+            "workspace start failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let ws = Self {
+            _temp: temp,
+            home,
+            root,
+            ws_socket,
+        };
+        ws.wait_ready();
+        ws
+    }
+
+    fn write_member(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join(".zaz")).unwrap();
+        let config = dir.join("zaz.toml");
+        std::fs::write(
+            &config,
+            "[[group]]\nname = \"g\"\npatterns = []\n\n[[group.daemon]]\nname = \"d\"\ncommand = \"sleep 600\"\n",
+        )
+        .unwrap();
+        config
+    }
+
+    fn wait_ready(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let output = Command::new(zaz_bin())
+                .args(["--socket", self.ws_socket.to_str().unwrap(), "status"])
+                .current_dir(&self.root)
+                .env("HOME", &self.home)
+                .output()
+                .expect("run zaz status");
+            if output.status.code() == Some(0)
+                && String::from_utf8_lossy(&output.stdout).contains("Daemon Status:")
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("workspace supervisor did not become ready in time");
+    }
+}
+
+impl Drop for StartedWorkspace {
+    fn drop(&mut self) {
+        let _ = Command::new(zaz_bin())
+            .args(["--socket", self.ws_socket.to_str().unwrap(), "stop"])
+            .current_dir(&self.root)
+            .env("HOME", &self.home)
+            .output();
+    }
+}
+
+#[test]
+fn mcp_workspace_restart_group_routes_qualified_name() {
+    let ws = StartedWorkspace::launch();
+
+    let response = call_tool(
+        &ws.ws_socket,
+        &ws.root,
+        "zaz_restart_group",
+        json!({"name": "a/g"}),
+    );
+
+    assert_not_error(&response);
+    let report: MutationReport = parse_structured(&response);
+    assert!(
+        report.message.contains("a/g"),
+        "qualified restart_group should re-qualify the group name, got: {}",
+        report.message
+    );
+}
+
+#[test]
+fn mcp_workspace_restart_process_routes_qualified_name() {
+    let ws = StartedWorkspace::launch();
+
+    let response = call_tool(
+        &ws.ws_socket,
+        &ws.root,
+        "zaz_restart_process",
+        json!({"group": "a/g", "process": "d"}),
+    );
+
+    assert_not_error(&response);
+    let report: MutationReport = parse_structured(&response);
+    assert!(
+        report.message.contains("a/") && report.message.contains('d'),
+        "qualified restart_process should name the project and process, got: {}",
+        report.message
+    );
+}
+
+#[test]
+fn mcp_workspace_unknown_project_returns_error() {
+    let ws = StartedWorkspace::launch();
+
+    let response = call_tool(
+        &ws.ws_socket,
+        &ws.root,
+        "zaz_restart_group",
+        json!({"name": "nope/g"}),
+    );
+
+    let serialized = response.to_string();
+    let has_jsonrpc_error = response.get("error").is_some();
+    let has_tool_error = response
+        .pointer("/result/isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        has_jsonrpc_error || has_tool_error,
+        "expected an error response for unknown project, got: {serialized}"
+    );
+    assert!(
+        serialized.contains("nope"),
+        "error should name the unknown project, got: {serialized}"
+    );
+}
