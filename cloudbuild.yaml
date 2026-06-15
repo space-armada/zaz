@@ -6,13 +6,20 @@
 # What it does:
 #
 #   - Runs the full `make ci` gate: fmt-check, lint, build, test, docs-check.
-#   - Caches the cargo registry, the target/ dir, and the rumdl download across
-#     builds so a warm build skips re-fetching crates and recompiling deps.
+#   - Caches the cargo registry, the rustup toolchain, and the rumdl download
+#     so a warm build skips re-fetching crates and re-resolving the toolchain.
+#     target/ is intentionally not cached; see Save-Cache.
+#
+# The cache object is keyed on a hash of Cargo.lock and rust-toolchain.toml,
+# so it is rewritten only when dependencies or the toolchain change. Every
+# build (PR, main, tag) restores it; only main writes it, and even then it
+# skips the compress-and-upload when the keyed object already exists. PR and
+# tag builds never pay any save cost.
 #
 # Caching lives in the default cloudbuild staging bucket, which already exists
 # for every project, so no extra setup is needed. Only /workspace is shared
-# between steps, so CARGO_HOME and the rumdl cache are pinned under /workspace
-# to make them cacheable.
+# between steps, so CARGO_HOME, RUSTUP_HOME, and the rumdl cache are pinned
+# under /workspace to make them cacheable.
 
 steps:
   - id: Restore-Cache
@@ -28,12 +35,19 @@ steps:
         else
           echo "Build type: COMMIT $SHORT_SHA"
         fi
-        gsutil cp "${_CACHE_BUCKET}/${_CACHE_KEY}" /workspace/cache.tar.gz
+        # The cache contents are determined entirely by the locked dependency
+        # set and the toolchain pin, so key the object on a hash of both. When
+        # neither changes, every build reuses the same object and the save step
+        # short-circuits instead of recompressing.
+        KEY=$(sha256sum Cargo.lock rust-toolchain.toml | sha256sum | cut -c1-16)
+        OBJ="${_CACHE_BUCKET}/cache-$$KEY.tar.gz"
+        echo "Cache key: $$KEY"
+        gsutil cp "$$OBJ" /workspace/cache.tar.gz
         if [[ -f /workspace/cache.tar.gz ]]; then
           tar -xzf /workspace/cache.tar.gz -C /workspace
-          echo "Restored cache from ${_CACHE_BUCKET}/${_CACHE_KEY}"
+          echo "Restored cache from $$OBJ"
         else
-          echo "No cache found; building cold"
+          echo "No cache for key $$KEY; building cold"
         fi
         exit 0
 
@@ -61,9 +75,26 @@ steps:
       - '-c'
       - |
         set -e
+        # Only the main branch writes the shared cache; PR and tag builds read
+        # it but never pay the save cost. $BRANCH_NAME is the pushed branch on
+        # main, the head branch on PRs, and empty on tag builds.
+        if [[ "$BRANCH_NAME" != "main" ]]; then
+          echo "Not on main (BRANCH_NAME='$BRANCH_NAME'); skipping cache save"
+          exit 0
+        fi
+        KEY=$(sha256sum Cargo.lock rust-toolchain.toml | sha256sum | cut -c1-16)
+        OBJ="${_CACHE_BUCKET}/cache-$$KEY.tar.gz"
+        # The object is immutable per key, so if it already exists the contents
+        # are unchanged and there is nothing to compress or upload.
+        if gsutil -q stat "$$OBJ"; then
+          echo "Cache $$OBJ already current; skipping compress and upload"
+          exit 0
+        fi
         # Only archive the dirs that actually exist after the build.
+        # target/ is deliberately excluded: it dwarfs the cache and its
+        # round-trip costs more than recompiling from a warm crate registry.
         dirs=()
-        for d in .cargo-home .rustup target .cache; do
+        for d in .cargo-home .rustup .cache; do
           [[ -d "/workspace/$$d" ]] && dirs+=("$$d")
         done
         if [[ "$${#dirs[@]}" -eq 0 ]]; then
@@ -71,12 +102,11 @@ steps:
           exit 0
         fi
         tar -czf /workspace/cache.tar.gz -C /workspace "$${dirs[@]}"
-        gsutil cp /workspace/cache.tar.gz "${_CACHE_BUCKET}/${_CACHE_KEY}"
-        echo "Saved cache to ${_CACHE_BUCKET}/${_CACHE_KEY}"
+        gsutil cp /workspace/cache.tar.gz "$$OBJ"
+        echo "Saved cache to $$OBJ"
 
 substitutions:
   _CACHE_BUCKET: 'gs://${PROJECT_ID}_cloudbuild/zaz-cache'
-  _CACHE_KEY: 'zaz-ci-cache.tar.gz'
 
 timeout: 1800s
 
