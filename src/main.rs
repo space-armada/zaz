@@ -808,9 +808,10 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
 
     let mut engine = Engine::with_options(config_path, !quiet)?;
     let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
     // Start API server
-    let server = Server::bind(socket_path, command_tx).await?;
+    let server = Server::bind(socket_path, command_tx, shutdown_tx).await?;
     let server_handle = tokio::spawn(async move {
         if let Err(e) = server.run().await {
             tracing::error!(error = %e, "server error");
@@ -837,14 +838,14 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
                 // Drain log channel before handling request (ensures GetLogs returns fresh data)
                 engine.process_incoming_logs();
 
-                let is_shutdown = matches!(cmd.request, ApiRequest::Shutdown);
                 let response = engine.handle_request(cmd.request).await;
                 let _ = cmd.response_tx.send(response);
+            }
 
-                if is_shutdown {
-                    shutdown_requested = true;
-                    break;
-                }
+            // Tear down once a Shutdown response has been written to its client
+            _ = shutdown_rx.recv() => {
+                shutdown_requested = true;
+                break;
             }
 
             // Poll for file changes and check daemons
