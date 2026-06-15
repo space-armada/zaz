@@ -1,0 +1,84 @@
+# GCB (cloudbuild) config for zaz CI.
+#
+# Setup: create one or more triggers in GCB. Both branch pushes and tag pushes
+# are supported; the same checks run for either.
+#
+# What it does:
+#
+#   - Runs the full `make ci` gate: fmt-check, lint, build, test, docs-check.
+#   - Caches the cargo registry, the target/ dir, and the rumdl download across
+#     builds so a warm build skips re-fetching crates and recompiling deps.
+#
+# Caching lives in the default cloudbuild staging bucket, which already exists
+# for every project, so no extra setup is needed. Only /workspace is shared
+# between steps, so CARGO_HOME and the rumdl cache are pinned under /workspace
+# to make them cacheable.
+
+steps:
+  - id: Restore-Cache
+    name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # A missing cache is normal on the first build; never fail on it.
+        set +e
+        if [[ -n "$TAG_NAME" ]]; then
+          echo "Build type: TAG $TAG_NAME"
+        else
+          echo "Build type: COMMIT $SHORT_SHA"
+        fi
+        gsutil cp "${_CACHE_BUCKET}/${_CACHE_KEY}" /workspace/cache.tar.gz
+        if [[ -f /workspace/cache.tar.gz ]]; then
+          tar -xzf /workspace/cache.tar.gz -C /workspace
+          echo "Restored cache from ${_CACHE_BUCKET}/${_CACHE_KEY}"
+        else
+          echo "No cache found; building cold"
+        fi
+        exit 0
+
+  - id: CI
+    name: 'rust:1-trixie'
+    env:
+      # Relocate the cargo registry and the rustup toolchain into /workspace so they survive as cache;
+      # rust-toolchain.toml pins `stable`, which rustup would otherwise re-resolve and redownload from
+      # its default home.
+      - 'CARGO_HOME=/workspace/.cargo-home'
+      - 'RUSTUP_HOME=/workspace/.rustup'
+      - 'CARGO_TERM_COLOR=always'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+        export PATH="$$CARGO_HOME/bin:$$PATH"
+        make ci
+
+  - id: Save-Cache
+    name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+        # Only archive the dirs that actually exist after the build.
+        dirs=()
+        for d in .cargo-home .rustup target .cache; do
+          [[ -d "/workspace/$$d" ]] && dirs+=("$$d")
+        done
+        if [[ "$${#dirs[@]}" -eq 0 ]]; then
+          echo "Nothing to cache"
+          exit 0
+        fi
+        tar -czf /workspace/cache.tar.gz -C /workspace "$${dirs[@]}"
+        gsutil cp /workspace/cache.tar.gz "${_CACHE_BUCKET}/${_CACHE_KEY}"
+        echo "Saved cache to ${_CACHE_BUCKET}/${_CACHE_KEY}"
+
+substitutions:
+  _CACHE_BUCKET: 'gs://${PROJECT_ID}_cloudbuild/zaz-cache'
+  _CACHE_KEY: 'zaz-ci-cache.tar.gz'
+
+timeout: 1800s
+
+options:
+  dynamicSubstitutions: true
