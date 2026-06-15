@@ -654,7 +654,8 @@ pub(crate) async fn run_supervisor(
     }
 
     let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
-    let server = Server::bind(socket_path, command_tx).await?;
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let server = Server::bind(socket_path, command_tx, shutdown_tx).await?;
     let server_handle = tokio::spawn(async move {
         if let Err(e) = server.run().await {
             tracing::error!(error = %e, "server error");
@@ -670,12 +671,14 @@ pub(crate) async fn run_supervisor(
             }
 
             Some(cmd) = command_rx.recv() => {
-                let (response, is_shutdown) = supervisor.handle_request(cmd.request).await;
+                let (response, _is_shutdown) = supervisor.handle_request(cmd.request).await;
                 let _ = cmd.response_tx.send(response);
-                if is_shutdown {
-                    shutdown_requested = true;
-                    break;
-                }
+            }
+
+            // Tear down once a Shutdown response has been written to its client
+            _ = shutdown_rx.recv() => {
+                shutdown_requested = true;
+                break;
             }
 
             _ = async {
