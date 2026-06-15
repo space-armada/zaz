@@ -36,7 +36,7 @@ See [Socket and config resolution](cli.md#socket-and-config-resolution).
 Project config uses `deny_unknown_fields` on every struct: unknown keys
 are rejected with a clear error. There is no `version` field; schema
 evolution is backwards-compatible by policy. See the schema-evolution
-rationale in `spec/phases/index.md`.
+rationale in `docs/architecture.md`.
 
 This is a deliberate contrast with [user config](user-configuration.md),
 which is permissive and falls back to defaults on parse failure. Project
