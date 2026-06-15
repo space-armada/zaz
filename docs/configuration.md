@@ -18,18 +18,25 @@ relevant alias.
 ## File discovery
 
 zaz looks for `zaz.toml` first, then `zaz.json`, in the current working
-directory. Search is CWD-only — there is no walk up the directory tree.
-The first existing file wins. Override discovery with the global
-`--config` flag (see [cli.md](cli.md#global-flags)); when `--config`
+directory. Loading the config file is CWD-only — there is no walk up the
+directory tree. The first existing file wins. Override discovery with the
+global `--config` flag (see [cli.md](cli.md#global-flags)); when `--config`
 points at a file, the format is detected from the extension (`.toml` or
 `.json`).
+
+Socket resolution is separate. Control commands that only talk to a running
+daemon — `zaz status`, `zaz restart`, `zaz stop`, `zaz reload` — do walk
+upward from the current directory to find a parent config, then derive the
+daemon socket from it. So a control command issued from a subdirectory reaches
+the project's daemon even though loading the config file itself stays CWD-only.
+See [Socket and config resolution](cli.md#socket-and-config-resolution).
 
 ## Schema validation policy
 
 Project config uses `deny_unknown_fields` on every struct: unknown keys
 are rejected with a clear error. There is no `version` field; schema
 evolution is backwards-compatible by policy. See the schema-evolution
-rationale in `spec/phases/index.md`.
+rationale in `docs/architecture.md`.
 
 This is a deliberate contrast with [user config](user-configuration.md),
 which is permissive and falls back to defaults on parse failure. Project
@@ -264,3 +271,17 @@ group name within Levenshtein distance 2 exists, otherwise an
 Duplicate-task and duplicate-daemon errors append
 `(use explicit 'name' field to disambiguate)` when the duplicate came
 from name derivation rather than an explicit `name = "..."`.
+
+## Log storage
+
+Log storage is configured per operator, not per project. The daemon's
+API-visible log stream — what `zaz_logs`, the TUI, and `zaz status` read
+back — is bounded by an in-memory hot buffer in every mode and can
+optionally be persisted to a SQLite database under
+`$XDG_STATE_HOME/zaz/logs/`. Backend selection and retention limits live
+in the user config: see
+[user-configuration.md#log_storage](user-configuration.md#log_storage)
+for the backend selector, hot-buffer bounds, the SQLite retention
+fields, and the persistence contract (database location, group rename
+semantics, degraded-mode behavior, and the distinction from the
+daemon's debug log files).

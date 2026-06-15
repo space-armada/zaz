@@ -15,13 +15,21 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
-use zaz_config::{Config, Group};
+use zaz_config::{Config, Group, LogStorageBackend};
 use zaz_process::{Daemon, Executor, OutputLine, TaskRunner};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
 
 const DAEMON_START_TASK_ID: &str = "__daemon_start__";
 const DAEMON_RESTART_TASK_ID: &str = "__daemon_restart__";
+
+/// Period for the persistent-log retention tick.
+///
+/// The after-batch path in `LogStore::push_batch` covers steady-state
+/// writes; this cadence only matters when writes pause long enough for
+/// stored rows or DB size to drift past the configured budget without
+/// a write to trigger a sweep.
+const RETENTION_CADENCE: Duration = Duration::from_secs(60);
 
 /// Completion signal from a spawned task execution.
 #[derive(Debug)]
@@ -540,13 +548,37 @@ impl Engine {
         // Create log store with user config settings
         let log_store = {
             let mut store = crate::log_store::LogStore::new()
-                .with_memory_limit(user_config.log_storage.memory_limit_bytes())
-                .with_max_lines_per_process(user_config.log_storage.max_lines_per_process);
+                .with_memory_limit(user_config.log_storage.hot_memory_limit_bytes())
+                .with_max_lines_per_process(user_config.log_storage.hot_max_lines_per_process);
 
             if verbose_output {
                 store = store.with_verbose_callback(|log| {
                     println!("[{}] {}", log.process, log.content);
                 });
+            }
+
+            match user_config.log_storage.backend {
+                LogStorageBackend::Memory => {
+                    tracing::info!(backend = "memory", "log storage backend selected");
+                }
+                LogStorageBackend::Sqlite => {
+                    let db_path = crate::log_storage_sqlite::db_path_for_config(&config_path);
+                    let policy = crate::log_storage_sqlite::RetentionPolicy {
+                        max_size_bytes: user_config.log_storage.sqlite.max_size_bytes(),
+                        max_lines_per_process: user_config.log_storage.sqlite.max_lines_per_process,
+                    };
+                    let sqlite = crate::log_storage_sqlite::SqliteLogStorage::open(&db_path)
+                        .map_err(DaemonError::LogStorage)?
+                        .with_retention(policy);
+                    tracing::info!(
+                        backend = "sqlite",
+                        path = %db_path.display(),
+                        max_size_bytes = policy.max_size_bytes,
+                        max_lines_per_process = policy.max_lines_per_process,
+                        "log storage backend selected"
+                    );
+                    store = store.with_sqlite(sqlite);
+                }
             }
 
             store
@@ -623,22 +655,23 @@ impl Engine {
     }
 
     /// Add a log line to storage and broadcast.
-    pub fn push_log(&mut self, log: LogLine) {
-        self.log_store.push(log);
+    pub fn push_log(&mut self, log: LogLine) -> Result<(), DaemonError> {
+        self.log_store.push(log)?;
+        Ok(())
     }
 
     /// Get stored logs for a process.
     ///
     /// If `name` is "*", returns logs from all processes sorted by timestamp.
-    pub fn get_logs(&self, name: &str, limit: Option<usize>) -> Vec<LogLine> {
-        self.log_store.get(name, limit)
+    pub fn get_logs(&self, name: &str, limit: Option<usize>) -> Result<Vec<LogLine>, DaemonError> {
+        Ok(self.log_store.get(name, limit)?)
     }
 
     /// Query logs with pagination and filtering support.
     ///
     /// This is the new API for log retrieval that supports pagination.
-    pub fn query_logs(&self, query: LogQuery) -> LogQueryResult {
-        self.log_store.query(query)
+    pub fn query_logs(&self, query: LogQuery) -> Result<LogQueryResult, DaemonError> {
+        Ok(self.log_store.query(query)?)
     }
 
     /// Spawn a background task to read PTY output and push to logs.
@@ -693,8 +726,19 @@ impl Engine {
     ///
     /// This MUST be called before handling API requests to ensure fresh logs
     /// are visible. Also call periodically in the main loop.
-    pub fn process_incoming_logs(&mut self) {
-        self.log_store.drain();
+    pub fn process_incoming_logs(&mut self) -> Result<(), DaemonError> {
+        self.log_store.drain()?;
+        Ok(())
+    }
+
+    /// Run the persistent-log retention sweep if the periodic cadence
+    /// has elapsed. Cheap when nothing is due — the gate inside
+    /// [`LogStore::maybe_enforce_retention_tick`] short-circuits without
+    /// touching the SQLite connection.
+    pub fn maybe_enforce_log_retention(&mut self) -> Result<(), DaemonError> {
+        self.log_store
+            .maybe_enforce_retention_tick(RETENTION_CADENCE)?;
+        Ok(())
     }
 
     /// Run the initial startup sequence.
@@ -1196,11 +1240,11 @@ impl Engine {
             if should_start {
                 self.push_log(
                     LogLine::daemon(daemon_name, "starting").with_group(group_name.to_string()),
-                );
+                )?;
             } else {
                 self.push_log(
                     LogLine::daemon(daemon_name, "restarting").with_group(group_name.to_string()),
-                );
+                )?;
             }
         }
 
@@ -1487,6 +1531,11 @@ impl Engine {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
 
+        // Drain any residual log lines from the ingestion channel and run the
+        // shutdown-time flush hook. The memory backend's `flush_now` is a
+        // no-op; persistent backends commit and checkpoint here.
+        self.log_store.drain_and_flush_now()?;
+
         Ok(())
     }
 
@@ -1629,7 +1678,7 @@ impl Engine {
         self.execute_groups(&reload_targets, &trigger_ctx).await;
 
         // 9. Broadcast reload complete
-        self.push_log(LogLine::daemon(
+        if let Err(e) = self.push_log(LogLine::daemon(
             "zaz",
             format!(
                 "configuration reloaded: {} added, {} removed, {} modified",
@@ -1637,7 +1686,9 @@ impl Engine {
                 diff.removed.len(),
                 diff.modified.len()
             ),
-        ));
+        )) {
+            tracing::error!(error = %e, "failed to record reload-complete log line");
+        }
         self.update_state();
 
         ReloadResult::Success {
@@ -1770,7 +1821,7 @@ impl Engine {
 
             self.push_log(
                 LogLine::daemon(process_name, "restarting").with_group(group_name.to_string()),
-            );
+            )?;
 
             if let Some(group) = self.groups.get_mut(group_name) {
                 group.daemons[daemon_idx]
@@ -1829,6 +1880,7 @@ impl Engine {
                 offset,
                 limit,
                 search,
+                ..
             } => {
                 // Use new pagination if any pagination param is set, otherwise use legacy
                 let use_pagination = offset.is_some() || limit.is_some() || search.is_some();
@@ -1854,44 +1906,50 @@ impl Engine {
                         query = query.with_search(pattern);
                     }
 
-                    let result = self.query_logs(query);
-                    ApiResponse::Logs {
-                        name,
-                        lines: result.logs,
-                        total_count: Some(result.total_count),
-                        has_more: Some(result.has_more),
-                        offset: Some(result.offset),
+                    match self.query_logs(query) {
+                        Ok(result) => ApiResponse::Logs {
+                            name,
+                            lines: result.logs,
+                            total_count: Some(result.total_count),
+                            has_more: Some(result.has_more),
+                            offset: Some(result.offset),
+                        },
+                        Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
                     }
                 } else {
                     // Legacy behavior: just return logs with optional limit
-                    let logs = self.get_logs(&name, lines);
-                    ApiResponse::Logs {
-                        name,
-                        lines: logs,
-                        total_count: None,
-                        has_more: None,
-                        offset: None,
+                    match self.get_logs(&name, lines) {
+                        Ok(logs) => ApiResponse::Logs {
+                            name,
+                            lines: logs,
+                            total_count: None,
+                            has_more: None,
+                            offset: None,
+                        },
+                        Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
                     }
                 }
             }
             ApiRequest::SubscribeLogs { name } => {
                 // Return current logs; caller should use subscribe_logs() for streaming
-                let logs = self.get_logs(&name, Some(100));
-                ApiResponse::Logs {
-                    name,
-                    lines: logs,
-                    total_count: None,
-                    has_more: None,
-                    offset: None,
+                match self.get_logs(&name, Some(100)) {
+                    Ok(logs) => ApiResponse::Logs {
+                        name,
+                        lines: logs,
+                        total_count: None,
+                        has_more: None,
+                        offset: None,
+                    },
+                    Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
                 }
             }
-            ApiRequest::RestartGroup { name } => match self.restart_group(&name).await {
+            ApiRequest::RestartGroup { name, .. } => match self.restart_group(&name).await {
                 Ok(()) => {
                     ApiResponse::ok_with_message(format!("restart initiated for group '{}'", name))
                 }
                 Err(e) => ApiResponse::error(format!("failed to restart group '{}': {}", name, e)),
             },
-            ApiRequest::RestartProcess { group, process } => {
+            ApiRequest::RestartProcess { group, process, .. } => {
                 match self.restart_process(&group, &process).await {
                     Ok(()) => ApiResponse::ok_with_message(format!("restarted '{}'", process)),
                     Err(e) => ApiResponse::error(format!(
@@ -1917,6 +1975,15 @@ impl Engine {
                 )),
                 ReloadResult::Failed(e) => ApiResponse::error(format!("reload failed: {}", e)),
             },
+            ApiRequest::Identify => {
+                let config_path = self
+                    .config_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.config_path.clone());
+                ApiResponse::Identity {
+                    config_path: config_path.display().to_string(),
+                }
+            }
             ApiRequest::Shutdown => {
                 // Signal handled by caller
                 ApiResponse::ok_with_message("shutting down")
@@ -2570,6 +2637,21 @@ mod tests {
         engine
     }
 
+    #[tokio::test]
+    async fn identify_reports_engine_config_path() {
+        let mut engine = create_test_engine(vec![]);
+        let expected = engine
+            .config_path
+            .canonicalize()
+            .unwrap_or_else(|_| engine.config_path.clone())
+            .display()
+            .to_string();
+        match engine.handle_request(ApiRequest::Identify).await {
+            ApiResponse::Identity { config_path } => assert_eq!(config_path, expected),
+            other => panic!("expected Identity, got {:?}", other),
+        }
+    }
+
     fn test_config(groups: Vec<Group>) -> Config {
         Config {
             settings: zaz_config::Settings::default(),
@@ -2767,12 +2849,17 @@ mod tests {
         let groups = vec![test_group("mygroup", &["task1"])];
         let mut engine = create_test_engine(groups);
 
-        engine.push_log(LogLine::process("task1", "line 1").with_group("mygroup"));
-        engine.push_log(LogLine::process("task1", "line 2").with_group("mygroup"));
+        engine
+            .push_log(LogLine::process("task1", "line 1").with_group("mygroup"))
+            .unwrap();
+        engine
+            .push_log(LogLine::process("task1", "line 2").with_group("mygroup"))
+            .unwrap();
 
         let response = engine
             .handle_request(ApiRequest::GetLogs {
                 name: "task1".to_string(),
+                project: None,
                 lines: Some(1),
                 offset: None,
                 limit: None,
@@ -2805,14 +2892,17 @@ mod tests {
         let mut engine = create_test_engine(groups);
 
         for i in 0..5 {
-            engine.push_log(
-                LogLine::process("task1", format!("error line {}", i)).with_group("mygroup"),
-            );
+            engine
+                .push_log(
+                    LogLine::process("task1", format!("error line {}", i)).with_group("mygroup"),
+                )
+                .unwrap();
         }
 
         let response = engine
             .handle_request(ApiRequest::GetLogs {
                 name: "task1".to_string(),
+                project: None,
                 lines: None,
                 offset: Some(1),
                 limit: Some(2),
@@ -2838,6 +2928,33 @@ mod tests {
             }
             other => panic!("expected logs response, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drains_pending_log_lines() {
+        let groups = vec![test_group("mygroup", &["task1"])];
+        let mut engine = create_test_engine(groups);
+
+        let sender = engine.log_sender();
+        sender
+            .send(LogLine::process("task1", "pre-shutdown 1").with_group("mygroup"))
+            .await
+            .unwrap();
+        sender
+            .send(LogLine::process("task1", "pre-shutdown 2").with_group("mygroup"))
+            .await
+            .unwrap();
+        drop(sender);
+
+        // Lines sit in the ingestion channel until shutdown drains them.
+        assert!(engine.get_logs("task1", None).unwrap().is_empty());
+
+        engine.shutdown().await.unwrap();
+
+        let logs = engine.get_logs("task1", None).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].content, "pre-shutdown 1");
+        assert_eq!(logs[1].content, "pre-shutdown 2");
     }
 
     #[tokio::test]

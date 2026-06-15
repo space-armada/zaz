@@ -45,6 +45,7 @@ pub async fn fetch_logs(socket_path: &Path, req: &LogsRequest) -> Result<LogsPag
     let response = client
         .request(&ApiRequest::GetLogs {
             name: name.clone(),
+            project: req.project.clone(),
             lines: None,
             offset: req.offset,
             limit: req.limit,
@@ -73,29 +74,36 @@ pub async fn fetch_logs(socket_path: &Path, req: &LogsRequest) -> Result<LogsPag
     }
 }
 
-/// Restart a single group by name.
-pub async fn restart_group(socket_path: &Path, name: &str) -> Result<String, McpError> {
+/// Restart a single group by name, optionally scoped to a workspace project.
+pub async fn restart_group(
+    socket_path: &Path,
+    name: &str,
+    project: Option<&str>,
+) -> Result<String, McpError> {
     send_mutation(
         socket_path,
         ApiRequest::RestartGroup {
             name: name.to_string(),
+            project: project.map(str::to_string),
         },
         "restart_group",
     )
     .await
 }
 
-/// Restart a single process within a group.
+/// Restart a single process within a group, optionally scoped to a project.
 pub async fn restart_process(
     socket_path: &Path,
     group: &str,
     process: &str,
+    project: Option<&str>,
 ) -> Result<String, McpError> {
     send_mutation(
         socket_path,
         ApiRequest::RestartProcess {
             group: group.to_string(),
             process: process.to_string(),
+            project: project.map(str::to_string),
         },
         "restart_process",
     )
@@ -184,7 +192,7 @@ mod tests {
     async fn restart_group_returns_daemon_not_running_when_socket_absent() {
         let tmp = TempDir::new().unwrap();
         let socket = missing_socket(tmp.path());
-        let err = restart_group(&socket, "backend").await.unwrap_err();
+        let err = restart_group(&socket, "backend", None).await.unwrap_err();
         assert!(
             matches!(err, McpError::DaemonNotRunning { .. }),
             "expected DaemonNotRunning, got: {err:?}"
@@ -195,7 +203,7 @@ mod tests {
     async fn restart_process_returns_daemon_not_running_when_socket_absent() {
         let tmp = TempDir::new().unwrap();
         let socket = missing_socket(tmp.path());
-        let err = restart_process(&socket, "backend", "server")
+        let err = restart_process(&socket, "backend", "server", None)
             .await
             .unwrap_err();
         assert!(

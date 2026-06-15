@@ -349,6 +349,7 @@ async fn background_task(
                     );
                     match c.request(&ApiRequest::GetLogs {
                         name: "*".to_string(),
+                        project: None,
                         lines: None, // Deprecated, use limit instead
                         offset: None,
                         limit: Some(500),
@@ -427,6 +428,7 @@ async fn handle_command(
         let response = client
             .request(&ApiRequest::GetLogs {
                 name: name.clone(),
+                project: None,
                 lines: None,
                 offset: Some(offset),
                 limit: Some(limit),
@@ -464,10 +466,15 @@ async fn handle_command(
 
     let request_name = command_name(&cmd);
     let request = match cmd {
-        ClientCommand::RestartGroup(name) => ApiRequest::RestartGroup { name },
-        ClientCommand::RestartProcess { group, process } => {
-            ApiRequest::RestartProcess { group, process }
-        }
+        ClientCommand::RestartGroup(name) => ApiRequest::RestartGroup {
+            name,
+            project: None,
+        },
+        ClientCommand::RestartProcess { group, process } => ApiRequest::RestartProcess {
+            group,
+            process,
+            project: None,
+        },
         ClientCommand::RestartAll => ApiRequest::RestartAll,
         ClientCommand::Shutdown => ApiRequest::Shutdown,
         ClientCommand::RefreshStatus => ApiRequest::Status,

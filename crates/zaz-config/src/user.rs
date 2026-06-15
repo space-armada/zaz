@@ -31,45 +31,108 @@ pub struct UserConfig {
     pub log_storage: LogStorageConfig,
 }
 
+/// Log storage backend selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LogStorageBackend {
+    /// In-memory ring buffer only. Logs are lost on daemon exit.
+    #[default]
+    #[serde(rename = "memory")]
+    Memory,
+    /// Persistent SQLite-backed storage plus an in-memory hot buffer.
+    #[serde(rename = "sqlite")]
+    Sqlite,
+}
+
 /// Log storage configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LogStorageConfig {
-    /// Maximum memory budget for log storage in bytes.
-    /// When approached, oldest logs are evicted.
-    /// Default: 100MB (104857600 bytes).
-    /// Use human-readable formats: "100MB", "1GB", etc.
-    #[serde(default = "default_memory_limit")]
-    pub memory_limit: String,
+    /// Storage backend selector. Default: `memory`.
+    pub backend: LogStorageBackend,
 
-    /// Maximum log lines to keep per process.
-    /// Default: 100000.
-    #[serde(default = "default_max_lines_per_process")]
-    pub max_lines_per_process: usize,
+    /// Maximum memory budget for the in-memory hot buffer.
+    /// When approached, oldest logs are evicted.
+    /// Default: 100MB. Use human-readable formats: "100MB", "1GB", etc.
+    /// The legacy field name `memory_limit` is accepted as an alias.
+    #[serde(default = "default_hot_memory_limit", alias = "memory_limit")]
+    pub hot_memory_limit: String,
+
+    /// Maximum log lines to keep per process in the hot buffer.
+    /// Default: 100000. The legacy field name `max_lines_per_process` is
+    /// accepted as an alias.
+    #[serde(
+        default = "default_hot_max_lines_per_process",
+        alias = "max_lines_per_process"
+    )]
+    pub hot_max_lines_per_process: usize,
+
+    /// SQLite-backend retention settings. Honored when `backend = "sqlite"`.
+    pub sqlite: SqliteStorageConfig,
 }
 
-fn default_memory_limit() -> String {
+fn default_hot_memory_limit() -> String {
     "100MB".to_string()
 }
 
-fn default_max_lines_per_process() -> usize {
+fn default_hot_max_lines_per_process() -> usize {
     100_000
 }
 
 impl Default for LogStorageConfig {
     fn default() -> Self {
         Self {
-            memory_limit: default_memory_limit(),
-            max_lines_per_process: default_max_lines_per_process(),
+            backend: LogStorageBackend::default(),
+            hot_memory_limit: default_hot_memory_limit(),
+            hot_max_lines_per_process: default_hot_max_lines_per_process(),
+            sqlite: SqliteStorageConfig::default(),
         }
     }
 }
 
 impl LogStorageConfig {
-    /// Parse the memory limit string and return bytes.
+    /// Parse the hot-buffer memory limit string and return bytes.
     /// Supports formats like "100MB", "1GB", "500KB", or plain number (bytes).
-    pub fn memory_limit_bytes(&self) -> usize {
-        parse_byte_size(&self.memory_limit).unwrap_or(100 * 1024 * 1024)
+    pub fn hot_memory_limit_bytes(&self) -> usize {
+        parse_byte_size(&self.hot_memory_limit).unwrap_or(100 * 1024 * 1024)
+    }
+}
+
+/// SQLite-backed log storage retention configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SqliteStorageConfig {
+    /// Maximum on-disk database size. Oldest rows are pruned when approached.
+    /// Default: 512MB. Use human-readable formats: "512MB", "1GB", etc.
+    #[serde(default = "default_sqlite_max_size")]
+    pub max_size: String,
+
+    /// Maximum persisted log lines to keep per process.
+    /// Default: 250000.
+    #[serde(default = "default_sqlite_max_lines_per_process")]
+    pub max_lines_per_process: usize,
+}
+
+fn default_sqlite_max_size() -> String {
+    "512MB".to_string()
+}
+
+fn default_sqlite_max_lines_per_process() -> usize {
+    250_000
+}
+
+impl Default for SqliteStorageConfig {
+    fn default() -> Self {
+        Self {
+            max_size: default_sqlite_max_size(),
+            max_lines_per_process: default_sqlite_max_lines_per_process(),
+        }
+    }
+}
+
+impl SqliteStorageConfig {
+    /// Parse the persistent max-size string and return bytes.
+    pub fn max_size_bytes(&self) -> usize {
+        parse_byte_size(&self.max_size).unwrap_or(512 * 1024 * 1024)
     }
 }
 
@@ -381,34 +444,156 @@ tui_style = "full"
     #[test]
     fn test_log_storage_config_default() {
         let config = LogStorageConfig::default();
-        assert_eq!(config.memory_limit, "100MB");
-        assert_eq!(config.max_lines_per_process, 100_000);
-        assert_eq!(config.memory_limit_bytes(), 100 * 1024 * 1024);
+        assert_eq!(config.backend, LogStorageBackend::Memory);
+        assert_eq!(config.hot_memory_limit, "100MB");
+        assert_eq!(config.hot_max_lines_per_process, 100_000);
+        assert_eq!(config.hot_memory_limit_bytes(), 100 * 1024 * 1024);
+        assert_eq!(config.sqlite.max_size, "512MB");
+        assert_eq!(config.sqlite.max_lines_per_process, 250_000);
     }
 
     #[test]
     fn test_parse_log_storage_config() {
         let toml = r#"
 [log_storage]
-memory_limit = "200MB"
-max_lines_per_process = 50000
+hot_memory_limit = "200MB"
+hot_max_lines_per_process = 50000
 "#;
         let config: UserConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.log_storage.memory_limit, "200MB");
-        assert_eq!(config.log_storage.max_lines_per_process, 50000);
-        assert_eq!(config.log_storage.memory_limit_bytes(), 200 * 1024 * 1024);
+        assert_eq!(config.log_storage.backend, LogStorageBackend::Memory);
+        assert_eq!(config.log_storage.hot_memory_limit, "200MB");
+        assert_eq!(config.log_storage.hot_max_lines_per_process, 50000);
+        assert_eq!(
+            config.log_storage.hot_memory_limit_bytes(),
+            200 * 1024 * 1024
+        );
     }
 
     #[test]
     fn test_log_storage_config_partial() {
-        // Only memory_limit set
+        // Only hot_memory_limit set
         let toml = r#"
 [log_storage]
-memory_limit = "1GB"
+hot_memory_limit = "1GB"
 "#;
         let config: UserConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.log_storage.memory_limit, "1GB");
-        assert_eq!(config.log_storage.max_lines_per_process, 100_000); // default
-        assert_eq!(config.log_storage.memory_limit_bytes(), 1024 * 1024 * 1024);
+        assert_eq!(config.log_storage.hot_memory_limit, "1GB");
+        assert_eq!(config.log_storage.hot_max_lines_per_process, 100_000); // default
+        assert_eq!(
+            config.log_storage.hot_memory_limit_bytes(),
+            1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_log_storage_backend_default() {
+        let config: UserConfig = toml::from_str("").unwrap();
+        assert_eq!(config.log_storage.backend, LogStorageBackend::Memory);
+    }
+
+    #[test]
+    fn test_parse_log_storage_memory_backend_explicit() {
+        let toml = r#"
+[log_storage]
+backend = "memory"
+"#;
+        let config: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.log_storage.backend, LogStorageBackend::Memory);
+        // Other fields retain defaults.
+        assert_eq!(config.log_storage.hot_memory_limit, "100MB");
+        assert_eq!(config.log_storage.sqlite.max_size, "512MB");
+    }
+
+    #[test]
+    fn test_parse_log_storage_sqlite_backend() {
+        let toml = r#"
+[log_storage]
+backend = "sqlite"
+hot_memory_limit = "16MB"
+hot_max_lines_per_process = 10000
+
+[log_storage.sqlite]
+max_size = "1GB"
+max_lines_per_process = 500000
+"#;
+        let config: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.log_storage.backend, LogStorageBackend::Sqlite);
+        assert_eq!(config.log_storage.hot_memory_limit, "16MB");
+        assert_eq!(config.log_storage.hot_max_lines_per_process, 10_000);
+        assert_eq!(
+            config.log_storage.hot_memory_limit_bytes(),
+            16 * 1024 * 1024
+        );
+        assert_eq!(config.log_storage.sqlite.max_size, "1GB");
+        assert_eq!(config.log_storage.sqlite.max_lines_per_process, 500_000);
+        assert_eq!(
+            config.log_storage.sqlite.max_size_bytes(),
+            1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_legacy_memory_limit_alias() {
+        // Old field name still parses into hot_memory_limit.
+        let toml = r#"
+[log_storage]
+memory_limit = "200MB"
+"#;
+        let config: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.log_storage.hot_memory_limit, "200MB");
+        assert_eq!(
+            config.log_storage.hot_memory_limit_bytes(),
+            200 * 1024 * 1024
+        );
+        assert_eq!(config.log_storage.hot_max_lines_per_process, 100_000);
+    }
+
+    #[test]
+    fn test_legacy_max_lines_per_process_alias() {
+        let toml = r#"
+[log_storage]
+max_lines_per_process = 50000
+"#;
+        let config: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.log_storage.hot_max_lines_per_process, 50_000);
+        assert_eq!(config.log_storage.hot_memory_limit, "100MB");
+    }
+
+    #[test]
+    fn test_sqlite_storage_config_default() {
+        let config = SqliteStorageConfig::default();
+        assert_eq!(config.max_size, "512MB");
+        assert_eq!(config.max_lines_per_process, 250_000);
+        assert_eq!(config.max_size_bytes(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_sqlite_section_partial() {
+        // Only sqlite.max_size set; sibling field falls back to default.
+        let toml = r#"
+[log_storage.sqlite]
+max_size = "2GB"
+"#;
+        let config: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.log_storage.sqlite.max_size, "2GB");
+        assert_eq!(config.log_storage.sqlite.max_lines_per_process, 250_000);
+        assert_eq!(
+            config.log_storage.sqlite.max_size_bytes(),
+            2 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_log_storage_unknown_field_tolerated() {
+        // User config is permissive (see docs/user-configuration.md);
+        // unknown keys should not break parsing.
+        let toml = r#"
+[log_storage]
+backend = "memory"
+unknown_future_option = "ignored"
+"#;
+        let config: UserConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.log_storage.backend, LogStorageBackend::Memory);
+        assert_eq!(config.log_storage.hot_memory_limit, "100MB");
     }
 }

@@ -97,6 +97,62 @@ pub fn discover_config_upward(start_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Walk upward from `start_dir` looking for a workspace root.
+///
+/// A workspace root is a directory that holds a `.zaz/` directory but no
+/// `zaz.toml`/`zaz.json`. The config-file exclusion is what distinguishes a
+/// workspace root from a member config directory: a member that owns its own
+/// `.zaz/daemon.sock` keeps it for the member daemon, so the walk steps past
+/// the member and the supervisor binds the root above it.
+///
+/// Returns the workspace root directory, or `None` if the walk reaches the
+/// filesystem root without finding one.
+pub fn discover_workspace_root_upward(start_dir: &Path) -> Option<PathBuf> {
+    let mut current = if start_dir.is_file() {
+        start_dir.parent()?.to_path_buf()
+    } else {
+        start_dir.to_path_buf()
+    };
+
+    loop {
+        let has_zaz_dir = current.join(".zaz").is_dir();
+        let has_config = zaz_config::CONFIG_FILES
+            .iter()
+            .any(|filename| current.join(filename).is_file());
+
+        if has_zaz_dir && !has_config {
+            return Some(current);
+        }
+
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Resolve the workspace supervisor's socket for a command invocation.
+///
+/// Resolution order mirrors [`resolve_socket`]:
+/// 1. Explicit `--socket` override, if provided
+/// 2. `<root>/.zaz/daemon.sock` for the nearest workspace root above `start_dir`
+/// 3. Actionable error if no workspace root can be found
+pub fn resolve_workspace_socket(
+    explicit_socket: Option<PathBuf>,
+    start_dir: &Path,
+) -> Result<PathBuf, DaemonError> {
+    if let Some(socket) = explicit_socket {
+        return Ok(socket);
+    }
+
+    let root = discover_workspace_root_upward(start_dir).ok_or_else(|| {
+        DaemonError::WorkspaceSocketResolution {
+            start_dir: start_dir.to_path_buf(),
+        }
+    })?;
+
+    Ok(root.join(".zaz").join("daemon.sock"))
+}
+
 /// Default socket path (legacy, for when no config is known).
 ///
 /// Uses `$XDG_RUNTIME_DIR/zaz.sock` if available (preferred).
@@ -436,6 +492,70 @@ mod tests {
         assert_eq!(
             err.hint(),
             Some("run this command from a zaz project directory or pass --socket <PATH>")
+        );
+    }
+
+    #[test]
+    fn test_resolve_workspace_socket_explicit_socket_wins() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".zaz")).unwrap();
+
+        let explicit = temp.path().join("custom.sock");
+        let resolved = resolve_workspace_socket(Some(explicit.clone()), temp.path()).unwrap();
+
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn test_resolve_workspace_socket_binds_root_daemon_sock() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".zaz")).unwrap();
+
+        let nested = temp.path().join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let resolved = resolve_workspace_socket(None, &nested).unwrap();
+
+        assert_eq!(resolved, temp.path().join(".zaz").join("daemon.sock"));
+    }
+
+    #[test]
+    fn test_resolve_workspace_socket_skips_member_dir_with_config() {
+        // A member directory holds both a config and its own `.zaz/`; the walk
+        // must step past it and bind the workspace root above instead.
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(".zaz")).unwrap();
+
+        let member = temp.path().join("member");
+        std::fs::create_dir_all(member.join(".zaz")).unwrap();
+        std::fs::write(member.join("zaz.toml"), "").unwrap();
+
+        let resolved = resolve_workspace_socket(None, &member).unwrap();
+
+        assert_eq!(resolved, temp.path().join(".zaz").join("daemon.sock"));
+    }
+
+    #[test]
+    fn test_resolve_workspace_socket_errors_when_no_root_found() {
+        let temp = TempDir::new().unwrap();
+        let nested = temp.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let err = resolve_workspace_socket(None, &nested).unwrap_err();
+
+        match &err {
+            DaemonError::WorkspaceSocketResolution { start_dir } => {
+                assert_eq!(start_dir, &nested)
+            }
+            other => panic!("expected WorkspaceSocketResolution error, got {:?}", other),
+        }
+
+        assert!(err
+            .to_string()
+            .contains("could not resolve workspace socket from"));
+        assert_eq!(
+            err.hint(),
+            Some("create a .zaz/ workspace root above your configs or pass --socket <PATH>")
         );
     }
 }

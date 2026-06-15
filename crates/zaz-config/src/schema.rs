@@ -139,6 +139,11 @@ pub struct Settings {
 
     /// Log output format.
     pub log_format: LogFormat,
+
+    /// Optional project token for workspace addressing. When unset, the
+    /// supervisor derives the token from the config directory basename.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl Default for Settings {
@@ -147,6 +152,7 @@ impl Default for Settings {
             shell: None,
             debounce: HumanDuration::from_millis(100),
             log_format: LogFormat::Pretty,
+            name: None,
         }
     }
 }

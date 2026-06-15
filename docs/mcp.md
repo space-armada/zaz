@@ -45,6 +45,16 @@ When the daemon refuses an operation — unknown group name, parse error on
 reload, and so on — its error message is returned verbatim so the agent can
 surface it to the user without paraphrase.
 
+`zaz_logs` consumes persistent history when the daemon runs with the
+SQLite backend (`backend = "sqlite"` in user config), so pre-restart
+lines remain queryable after the daemon has been restarted. Under the
+default `memory` backend the same call serves whatever is in the
+in-memory buffer at the moment of the request. The request shape
+(`name`, `offset`, `limit`, `search`) and the response fields are
+identical across both modes. See
+[user-configuration.md#log_storage](user-configuration.md#log_storage)
+for backend selection and the retention contract.
+
 ## Client configuration
 
 ### Claude Code
@@ -119,3 +129,35 @@ needs to target a specific project — pass `--socket` or `--config` in
 ```
 
 `--socket` wins over `--config` when both are passed.
+
+### Workspace supervisor
+
+A workspace covers the handful of zaz projects you are touching in a monorepo
+under one registration. Start it with two or more `--config` flags:
+
+```sh
+zaz start -c backend/zaz.toml -c frontend/zaz.toml
+```
+
+This launches a supervisor that owns one child daemon per member and binds a
+single workspace socket at `<workspace-root>/.zaz/daemon.sock`, where the
+workspace root is the nearest ancestor directory holding a `.zaz/` directory
+but no `zaz.toml` or `zaz.json`. Pin that socket once and a single MCP
+registration reaches the whole set:
+
+```json
+{
+  "mcpServers": {
+    "zaz-workspace": {
+      "command": "zaz",
+      "args": ["mcp", "--socket", "/abs/path/to/workspace/.zaz/daemon.sock"]
+    }
+  }
+}
+```
+
+`zaz_status` against the supervisor merges every member's groups under
+`project/group` keys. `zaz_logs`, `zaz_restart_group`, and `zaz_restart_process`
+take a structured `project` parameter to target one member; a log query without
+a `project` is rejected rather than fanned out, since each member keeps its own
+log database.

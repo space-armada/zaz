@@ -75,6 +75,9 @@ notify-rust = "4"
 # Human-readable durations
 humantime = "2"
 
+# SQLite (bundled libsqlite3 so workspace builds do not depend on a system library)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # MCP tool server
 rmcp = { version = "1.6", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = "1"

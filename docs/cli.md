@@ -121,11 +121,18 @@ Every subcommand resolves its target socket the same way:
 1. If `--socket <PATH>` is passed, use it verbatim. Explicit always wins.
 2. Otherwise, discover the project config by walking upward from CWD until
    `zaz.toml` or `zaz.json` is found (or the path supplied to `--config` is
-   used directly). The socket is derived deterministically from the
-   canonical config path via a hash, so two different project directories
-   never share a socket by accident.
+   used directly). The socket is then derived from that config's directory:
+   if the directory contains a `.zaz/` directory, the socket is
+   `<dir>/.zaz/daemon.sock`; otherwise it is derived deterministically from
+   the canonical config path via a hash (`~/.local/state/zaz/<hash>.sock`),
+   so two different project directories never share a socket by accident.
 3. If no config is found and no `--socket` is given, the command errors with
    an actionable message rather than falling back to a global default.
+
+A workspace supervisor follows the same `.zaz/` convention one level up: it
+binds `<workspace-root>/.zaz/daemon.sock`, where the workspace root is the
+nearest ancestor directory that holds a `.zaz/` directory but no `zaz.toml`
+or `zaz.json` of its own.
 
 `docs/mcp.md` defers to this section; the `--socket` and `--config` flags
 behave the same way for `zaz mcp`.
@@ -174,6 +181,35 @@ Rotation parameters:
 
 Oldest rotated files are pruned first when the budget is exceeded.
 
+## API log persistence
+
+The structured per-process log stream that `zaz_logs`, the TUI, and the
+daemon API read back is a separate surface from the debug log files
+described above. By default it lives in a bounded in-memory buffer that
+is lost when the daemon exits. With `backend = "sqlite"` in user config
+the same stream is also written to
+`$XDG_STATE_HOME/zaz/logs/<config-hash>.sqlite3` (falling back to
+`~/.local/state/zaz/logs/`), so historical queries return rows written
+before the most recent restart. The query shape and exit codes are
+unchanged across modes.
+
+See [user-configuration.md#log_storage](user-configuration.md#log_storage)
+for backend selection, retention limits, the database location
+convention, and the degraded-mode contract.
+
+Two behaviors are worth flagging for scripted consumers:
+
+- **Offset pagination under concurrent retention.** Pagination uses
+  `offset` and `limit`. When the daemon prunes rows mid-read — which
+  happens after every batch write and on a bounded periodic cadence —
+  the page after the one you just received may have shifted underneath
+  you. A cursor-based pagination contract is a future proposal; the
+  current MCP and CLI request shape stays offset-based.
+- **Group rename semantics.** `group_name` on each row is a write-time
+  snapshot, so renaming a group in `zaz.toml` does not retroactively
+  retag historical rows. Filter by process name or by the original
+  group name to reach logs written before the rename.
+
 ## Subcommands
 
 ### zaz (default, TUI mode)
@@ -201,7 +237,7 @@ zaz --stop-on-exit     # stop the daemon when the TUI exits
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-c`, `--config` `<CONFIG>` | — | Configuration file path |
+| `-c`, `--config` `<CONFIG>` | — | Configuration file path (repeatable; 2+ starts a workspace) |
 | `-d`, `--debug` | `false` | Enable debug logging |
 | `-s`, `--socket` `<SOCKET>` | — | Socket path for daemon communication |
 | `--full` | `false` | Use full TUI style (split panes with group tree) |
