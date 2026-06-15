@@ -1,4 +1,4 @@
-# rumdl configuration file for Electron Microscope
+# rumdl configuration file for zaz
 # Lenient ruleset with auto-fix enabled for developer-friendly workflow
 
 # Global configuration options
@@ -16,6 +16,11 @@ exclude = [
     "bin",
     "dist",
     "build",
+    "target",
+
+    # CI build caches relocated under the workspace (see cloudbuild.yaml)
+    ".cargo-home",
+    ".rustup",
 
     # Git and IDE
     ".git",

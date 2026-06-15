@@ -28,8 +28,7 @@ The subcommands fall into three exit-policy categories:
 - **Idempotent-mutating** — `start`, `stop`. Ensure a postcondition; `0`
   even when the daemon is already in the desired state.
 
-The categories are spelled out in `src/main.rs` above the `Commands` enum
-and codified in [ADR-0004](../spec/adrs/ADR-0004-cli-exit-code-categories.md).
+The categories are spelled out in `src/main.rs` above the `Commands` enum.
 
 ## Generated surfaces
 
@@ -64,10 +63,9 @@ the source of every table in this file.
 
 ### Error-message contract
 
-Operator-facing error wording follows a fixed shape established by the
-ZAZ-009 audit. The shape exists so scripted consumers can parse `zaz`
-output without regexing free-form prose, and so operators always know
-where the recovery suggestion lives.
+Operator-facing error wording follows a fixed shape. The shape exists so
+scripted consumers can parse `zaz` output without regexing free-form prose,
+and so operators always know where the recovery suggestion lives.
 
 - **Recovery hints are structured.** Error types whose recovery prose is
   fixed per variant — `DaemonError` in `crates/zaz-daemon/src/error.rs` and
@@ -118,8 +116,7 @@ under [zaz (default, TUI mode)](#zaz-default-tui-mode).
 
 ## Socket and config resolution
 
-Per [ADR-0003](../spec/adrs/ADR-0003-unified-socket-resolution.md), every
-subcommand resolves its target socket the same way:
+Every subcommand resolves its target socket the same way:
 
 1. If `--socket <PATH>` is passed, use it verbatim. Explicit always wins.
 2. Otherwise, discover the project config by walking upward from CWD until
@@ -153,9 +150,6 @@ Mapping to subcommands:
 | `stop` | stopped (already or just stopped) | stop failed | — |
 | `task` | all tasks finished cleanly | any task failed | — |
 | `check` | config is valid | config invalid or unreadable | — |
-
-See [ADR-0004](../spec/adrs/ADR-0004-cli-exit-code-categories.md) and
-ZAZ-005 for the rationale.
 
 ## Log files and rotation
 
@@ -236,8 +230,8 @@ This subcommand takes no arguments or flags.
 ### zaz daemon
 
 Runs the daemon in the foreground. Exits when the user interrupts it
-(Ctrl+C) or the daemon is asked to stop over its socket. Per ZAZ-002, this
-mode never daemonizes; use `zaz start` to launch a background daemon.
+(Ctrl+C) or the daemon is asked to stop over its socket. This mode never
+daemonizes; use `zaz start` to launch a background daemon.
 
 `--quiet` suppresses per-process stdout/stderr from the daemon's own log
 output; per-process logs are still recorded for the TUI and `zaz status` to
@@ -298,8 +292,8 @@ This subcommand takes no arguments or flags.
 ### zaz restart
 
 Strict-mutating: tells a running daemon to restart a single group, or every
-group when no name is given. Per ZAZ-003, the daemon executes the same
-startup hook chain it ran at boot, so `restart` is the supported way to
+group when no name is given. The daemon executes the same startup hook
+chain it ran at boot, so `restart` is the supported way to
 re-run prep tasks without bouncing the daemon itself.
 
 Exits `1` when no daemon is running on the resolved socket, when the named
@@ -318,8 +312,8 @@ group does not exist, or when the daemon API returns an error.
 
 Strict-mutating: tells a running daemon to reread its config file, validate
 it, and apply diffs. Reload preserves the daemon process and its socket;
-running daemons stay up if their definitions did not change. Per ZAZ-003,
-reload does not re-run startup tasks — use `zaz restart` for that.
+running daemons stay up if their definitions did not change. Reload does
+not re-run startup tasks — use `zaz restart` for that.
 
 Exits `1` when no daemon is running on the resolved socket or when the new
 config fails validation; the running daemon keeps its previous config in
