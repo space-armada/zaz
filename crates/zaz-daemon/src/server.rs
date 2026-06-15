@@ -128,13 +128,19 @@ pub struct Server {
     listener: UnixListener,
     socket_path: PathBuf,
     command_tx: mpsc::Sender<EngineCommand>,
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 impl Server {
     /// Create a new server bound to the given socket path.
+    ///
+    /// `shutdown_tx` is fired by a connection handler once it has written the
+    /// response to a `Shutdown` request, so the daemon only tears down after the
+    /// acknowledgement has reached the wire.
     pub async fn bind(
         path: impl AsRef<Path>,
         command_tx: mpsc::Sender<EngineCommand>,
+        shutdown_tx: mpsc::Sender<()>,
     ) -> Result<Self, DaemonError> {
         let path = path.as_ref();
 
@@ -156,6 +162,7 @@ impl Server {
             listener,
             socket_path: path.to_path_buf(),
             command_tx,
+            shutdown_tx,
         })
     }
 
@@ -171,8 +178,9 @@ impl Server {
                 Ok((stream, _)) => {
                     tracing::info!("client connected");
                     let command_tx = self.command_tx.clone();
+                    let shutdown_tx = self.shutdown_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, command_tx).await {
+                        if let Err(e) = handle_connection(stream, command_tx, shutdown_tx).await {
                             tracing::info!(error = %e, "client disconnected");
                         } else {
                             tracing::info!("client disconnected");
@@ -197,14 +205,18 @@ impl Drop for Server {
 async fn handle_connection(
     stream: UnixStream,
     command_tx: mpsc::Sender<EngineCommand>,
+    shutdown_tx: mpsc::Sender<()>,
 ) -> Result<(), DaemonError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
     while reader.read_line(&mut line).await? > 0 {
+        let mut is_shutdown = false;
         let response = match serde_json::from_str::<ApiRequest>(&line) {
             Ok(request) => {
+                is_shutdown = matches!(request, ApiRequest::Shutdown);
+
                 // Send command to engine and wait for response
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
                 let command = EngineCommand {
@@ -225,8 +237,20 @@ async fn handle_connection(
         };
 
         let response_json = serde_json::to_string(&response)?;
-        writer.write_all(response_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
+        let write_result = async {
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await
+        }
+        .await;
+
+        if is_shutdown {
+            // Trigger teardown only after the acknowledgement has been written,
+            // so the client reliably receives the response before the daemon
+            // drops the connection. Fire even on a write error so an explicit
+            // shutdown request is still honored when the client has gone away.
+            let _ = shutdown_tx.send(()).await;
+        }
+        write_result?;
 
         line.clear();
     }
@@ -281,9 +305,12 @@ mod tests {
         let socket_path = test_dir.join(format!("test-{}.sock", std::process::id()));
 
         let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
 
         // Start server
-        let server = Server::bind(&socket_path, command_tx).await.unwrap();
+        let server = Server::bind(&socket_path, command_tx, shutdown_tx)
+            .await
+            .unwrap();
         let server_handle = tokio::spawn(async move {
             let _ = server.run().await;
         });
