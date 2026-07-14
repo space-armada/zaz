@@ -909,8 +909,8 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
                 if let Err(e) = engine.poll().await {
                     tracing::error!(error = %e, "poll error");
                 }
-                if let Err(e) = engine.check_daemons().await {
-                    tracing::error!(error = %e, "daemon check error");
+                if let Err(e) = engine.check_services().await {
+                    tracing::error!(error = %e, "service check error");
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             } => {}
