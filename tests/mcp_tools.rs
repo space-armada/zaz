@@ -272,7 +272,7 @@ fn mcp_zaz_list_groups_returns_summary() {
     let group = &report.groups[0];
     assert_eq!(group.name, "backend");
     assert_eq!(group.task_count, 1, "task_count mismatch: {group:?}");
-    assert_eq!(group.daemon_count, 1, "daemon_count mismatch: {group:?}");
+    assert_eq!(group.service_count, 1, "service_count mismatch: {group:?}");
 }
 
 #[test]
@@ -310,8 +310,8 @@ fn mcp_zaz_config_returns_parsed_config() {
     assert_eq!(group.name, "backend");
     assert_eq!(group.tasks.len(), 1);
     assert_eq!(group.tasks[0].name, "noop");
-    assert_eq!(group.daemons.len(), 1);
-    assert_eq!(group.daemons[0].name, "sleeper");
+    assert_eq!(group.services.len(), 1);
+    assert_eq!(group.services[0].name, "sleeper");
 }
 
 #[test]

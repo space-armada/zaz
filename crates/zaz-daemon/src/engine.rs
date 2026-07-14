@@ -1320,8 +1320,8 @@ impl Engine {
                     service.signal_restart().map_err(DaemonError::Process)?;
                 }
 
-                group.state.daemons[idx].status = ProcessStatus::Running;
-                group.state.daemons[idx].pid = service.pid();
+                group.state.services[idx].status = ProcessStatus::Running;
+                group.state.services[idx].pid = service.pid();
             }
 
             group.services_started = true;
@@ -1428,8 +1428,8 @@ impl Engine {
                             ));
                         }
 
-                        group.state.daemons[idx].status = ProcessStatus::Running;
-                        group.state.daemons[idx].pid = service.pid();
+                        group.state.services[idx].status = ProcessStatus::Running;
+                        group.state.services[idx].pid = service.pid();
                         group.pending_restarts[idx] = None;
                     }
 
@@ -1440,8 +1440,8 @@ impl Engine {
                 // If service exited, update the state and schedule restart
                 let exit_info = service.check().await.map_err(DaemonError::Process)?;
                 if let Some(exit_info) = exit_info {
-                    group.state.daemons[idx].status = ProcessStatus::Backoff;
-                    group.state.daemons[idx].pid = None;
+                    group.state.services[idx].status = ProcessStatus::Backoff;
+                    group.state.services[idx].pid = None;
 
                     let delay = service.restart_delay();
                     tracing::info!(
@@ -2412,7 +2412,7 @@ fn build_group_state(group: &Group) -> GroupState {
                 ..Default::default()
             })
             .collect(),
-        daemons: group
+        services: group
             .services
             .iter()
             .map(|d| ProcessState {
@@ -4358,7 +4358,7 @@ mod tests {
             GroupStatus::Ready
         );
         assert_eq!(
-            engine.groups.get("a").unwrap().state.daemons[0].status,
+            engine.groups.get("a").unwrap().state.services[0].status,
             ProcessStatus::Running
         );
         assert!(engine.running_tasks.contains("b:task1"));
@@ -4555,8 +4555,8 @@ mod tests {
             let keep = engine.groups.get_mut("keep").unwrap();
             keep.services_started = true;
             keep.state.status = GroupStatus::Ready;
-            keep.state.daemons[0].status = ProcessStatus::Running;
-            keep.state.daemons[0].pid = Some(4242);
+            keep.state.services[0].status = ProcessStatus::Running;
+            keep.state.services[0].pid = Some(4242);
             keep.pending_restarts[0] = Some(Instant::now() + Duration::from_secs(5));
         }
 
@@ -4571,8 +4571,8 @@ mod tests {
         let keep = engine.groups.get("keep").unwrap();
         assert!(keep.services_started);
         assert_eq!(keep.state.status, GroupStatus::Ready);
-        assert_eq!(keep.state.daemons[0].status, ProcessStatus::Running);
-        assert_eq!(keep.state.daemons[0].pid, Some(4242));
+        assert_eq!(keep.state.services[0].status, ProcessStatus::Running);
+        assert_eq!(keep.state.services[0].pid, Some(4242));
         assert!(keep.pending_restarts[0].is_some());
 
         let change = engine.groups.get("change").unwrap();
@@ -4627,7 +4627,7 @@ command = "printf dependent >> '{dependent_log}'"
         engine.startup().await.unwrap();
         assert!(engine.wait_for_tasks().await);
 
-        let original_pid = engine.groups["server"].state.daemons[0].pid.unwrap();
+        let original_pid = engine.groups["server"].state.services[0].pid.unwrap();
         assert_eq!(std::fs::read_to_string(&source_log).unwrap(), "source");
         assert_eq!(
             std::fs::read_to_string(&dependent_log).unwrap(),
@@ -4706,7 +4706,7 @@ command = "sleep 30"
 
         assert!(engine.wait_for_tasks().await);
 
-        let reloaded_pid = engine.groups["server"].state.daemons[0].pid.unwrap();
+        let reloaded_pid = engine.groups["server"].state.services[0].pid.unwrap();
         assert_eq!(reloaded_pid, original_pid);
         assert_eq!(
             std::fs::read_to_string(&source_log).unwrap(),
@@ -4717,7 +4717,7 @@ command = "sleep 30"
             "dependent"
         );
         assert_eq!(std::fs::read_to_string(&changed_log).unwrap(), "startup");
-        assert!(engine.groups["new-service"].state.daemons[0].pid.is_some());
+        assert!(engine.groups["new-service"].state.services[0].pid.is_some());
 
         engine.shutdown().await.unwrap();
     }

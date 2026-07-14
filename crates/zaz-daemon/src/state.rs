@@ -46,8 +46,12 @@ pub struct GroupState {
     /// Task command states.
     pub tasks: Vec<ProcessState>,
 
-    /// Daemon states.
-    pub daemons: Vec<ProcessState>,
+    /// Service states.
+    ///
+    /// The `daemons` alias reads state emitted by a pre-rename daemon still
+    /// running across an upgrade.
+    #[serde(alias = "daemons")]
+    pub services: Vec<ProcessState>,
 }
 
 /// Group status.
@@ -64,7 +68,7 @@ pub enum GroupStatus {
     /// Tasks are running.
     Running,
 
-    /// All tasks completed, daemons running.
+    /// All tasks completed, services running.
     Ready,
 
     /// A task failed.
@@ -74,7 +78,7 @@ pub enum GroupStatus {
     Skipped,
 }
 
-/// State of a single process (task or daemon).
+/// State of a single process (task or service).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProcessState {
     /// Process name.
@@ -112,4 +116,41 @@ pub enum ProcessStatus {
 
     /// Waiting to restart (backoff).
     Backoff,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_state_serializes_services_key() {
+        let group = GroupState {
+            name: "server".to_string(),
+            services: vec![ProcessState {
+                name: "web".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&group).unwrap();
+        assert!(
+            json.contains("\"services\""),
+            "expected services key in {json}"
+        );
+        assert!(
+            !json.contains("\"daemons\""),
+            "daemons key must not be emitted: {json}"
+        );
+    }
+
+    #[test]
+    fn group_state_reads_legacy_daemons_key() {
+        let legacy = r#"{"name":"server","status":"ready","tasks":[],"daemons":[{"name":"web","status":"running","pid":4242,"exit_code":null,"duration_ms":null}]}"#;
+
+        let group: GroupState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(group.services.len(), 1);
+        assert_eq!(group.services[0].name, "web");
+        assert_eq!(group.services[0].pid, Some(4242));
+    }
 }

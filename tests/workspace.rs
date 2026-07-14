@@ -376,7 +376,7 @@ fn member_dir_command_reaches_member_daemon() {
     assert!(status.status.success(), "member-dir status failed");
     let stdout = String::from_utf8_lossy(&status.stdout);
     assert!(
-        stdout.contains("[daemon] d"),
+        stdout.contains("[service] d"),
         "member-dir status should report the member engine state, got: {stdout}"
     );
 
@@ -769,7 +769,7 @@ fn workspace_status_merges_members_under_qualified_names() {
         "status should merge groups under project/group: {stdout}"
     );
     assert!(
-        stdout.contains("[daemon] d"),
+        stdout.contains("[service] d"),
         "merged status should carry each member's processes: {stdout}"
     );
 

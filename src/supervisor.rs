@@ -396,7 +396,7 @@ impl Supervisor {
                         name: member.token.clone(),
                         status: GroupStatus::Failed,
                         tasks: Vec::new(),
-                        daemons: Vec::new(),
+                        services: Vec::new(),
                     };
                     merged.groups.insert(member.token.clone(), marker);
                 }
@@ -958,7 +958,7 @@ mod tests {
                     let group = state.groups.get(token).expect("marker for token");
                     assert_eq!(group.name, token);
                     assert_eq!(group.status, GroupStatus::Failed);
-                    assert!(group.tasks.is_empty() && group.daemons.is_empty());
+                    assert!(group.tasks.is_empty() && group.services.is_empty());
                 }
             }
             other => panic!("expected Status, got {:?}", other),

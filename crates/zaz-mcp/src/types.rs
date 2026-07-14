@@ -38,7 +38,7 @@ pub enum DaemonStatusReport {
     Stopping,
 }
 
-/// State of a single group, with tasks and daemons collapsed into a uniform
+/// State of a single group, with tasks and services collapsed into a uniform
 /// `processes` list distinguished by a `kind` field.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GroupReport {
@@ -59,7 +59,7 @@ pub enum GroupStatusReport {
     Skipped,
 }
 
-/// State of a single managed process (task or daemon).
+/// State of a single managed process (task or service).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProcessReport {
     pub name: String,
@@ -70,12 +70,12 @@ pub struct ProcessReport {
     pub duration_ms: Option<u64>,
 }
 
-/// Whether a process is a task (run-to-completion) or a daemon (long-running).
+/// Whether a process is a task (run-to-completion) or a service (long-running).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProcessKind {
     Task,
-    Daemon,
+    Service,
 }
 
 /// Process status.
@@ -101,7 +101,7 @@ pub struct GroupSummary {
     pub name: String,
     pub status: GroupStatusReport,
     pub task_count: usize,
-    pub daemon_count: usize,
+    pub service_count: usize,
 }
 
 /// Input parameters for the `zaz_logs` tool.
@@ -142,7 +142,7 @@ pub struct RestartGroupRequest {
 pub struct RestartProcessRequest {
     /// Group the process belongs to.
     pub group: String,
-    /// Process name. Matches the `name` field of a task or daemon entry inside the group.
+    /// Process name. Matches the `name` field of a task or service entry inside the group.
     pub process: String,
     /// Project token selecting one workspace member. Set against a workspace
     /// supervisor; omit for a single-config daemon.
@@ -247,7 +247,7 @@ pub struct ConfigGroup {
     pub working_dir: Option<String>,
     pub env: BTreeMap<String, String>,
     pub tasks: Vec<ConfigTask>,
-    pub daemons: Vec<ConfigDaemon>,
+    pub services: Vec<ConfigService>,
 }
 
 /// One configured task command.
@@ -261,9 +261,9 @@ pub struct ConfigTask {
     pub env: BTreeMap<String, String>,
 }
 
-/// One configured daemon command.
+/// One configured service command.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ConfigDaemon {
+pub struct ConfigService {
     pub name: String,
     pub command: String,
     pub signal: SignalReport,
@@ -320,7 +320,7 @@ impl From<DaemonStatus> for DaemonStatusReport {
 
 impl From<&GroupState> for GroupReport {
     fn from(group: &GroupState) -> Self {
-        let mut processes = Vec::with_capacity(group.tasks.len() + group.daemons.len());
+        let mut processes = Vec::with_capacity(group.tasks.len() + group.services.len());
         processes.extend(
             group
                 .tasks
@@ -329,9 +329,9 @@ impl From<&GroupState> for GroupReport {
         );
         processes.extend(
             group
-                .daemons
+                .services
                 .iter()
-                .map(|p| ProcessReport::from_state(p, ProcessKind::Daemon)),
+                .map(|p| ProcessReport::from_state(p, ProcessKind::Service)),
         );
         Self {
             name: group.name.clone(),
@@ -393,7 +393,7 @@ impl From<&GroupState> for GroupSummary {
             name: group.name.clone(),
             status: group.status.into(),
             task_count: group.tasks.len(),
-            daemon_count: group.daemons.len(),
+            service_count: group.services.len(),
         }
     }
 }
@@ -476,7 +476,7 @@ impl From<&Group> for ConfigGroup {
             working_dir: g.working_dir.clone(),
             env: g.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             tasks: g.tasks.iter().map(ConfigTask::from).collect(),
-            daemons: g.services.iter().map(ConfigDaemon::from).collect(),
+            services: g.services.iter().map(ConfigService::from).collect(),
         }
     }
 }
@@ -494,7 +494,7 @@ impl From<&TaskCommand> for ConfigTask {
     }
 }
 
-impl From<&ServiceCommand> for ConfigDaemon {
+impl From<&ServiceCommand> for ConfigService {
     fn from(d: &ServiceCommand) -> Self {
         Self {
             name: d.name().to_string(),
@@ -555,7 +555,7 @@ mod tests {
                     exit_code: Some(0),
                     duration_ms: Some(420),
                 }],
-                daemons: vec![ProcessState {
+                services: vec![ProcessState {
                     name: "server".to_string(),
                     status: ProcessStatus::Running,
                     pid: Some(4242),
@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn status_report_flattens_tasks_and_daemons() {
+    fn status_report_flattens_tasks_and_services() {
         let report: StatusReport = StatusReport::from(&sample_state());
         assert!(matches!(report.daemon_status, DaemonStatusReport::Running));
         assert_eq!(report.watched_files, 17);
@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(backend.processes.len(), 2);
         assert!(matches!(backend.processes[0].kind, ProcessKind::Task));
         assert_eq!(backend.processes[0].name, "build");
-        assert!(matches!(backend.processes[1].kind, ProcessKind::Daemon));
+        assert!(matches!(backend.processes[1].kind, ProcessKind::Service));
         assert_eq!(backend.processes[1].pid, Some(4242));
     }
 
@@ -595,7 +595,7 @@ mod tests {
         let summary = &report.groups[0];
         assert_eq!(summary.name, "backend");
         assert_eq!(summary.task_count, 1);
-        assert_eq!(summary.daemon_count, 1);
+        assert_eq!(summary.service_count, 1);
     }
 
     #[test]

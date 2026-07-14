@@ -1108,12 +1108,15 @@ async fn show_status(socket_path: &Path) -> Result<()> {
                         .unwrap_or_default();
                     println!("    [task] {} - {:?}{}", task.name, task.status, duration);
                 }
-                for daemon in &group.daemons {
-                    let pid = daemon
+                for service in &group.services {
+                    let pid = service
                         .pid
                         .map(|p| format!(" (pid {})", p))
                         .unwrap_or_default();
-                    println!("    [daemon] {} - {:?}{}", daemon.name, daemon.status, pid);
+                    println!(
+                        "    [service] {} - {:?}{}",
+                        service.name, service.status, pid
+                    );
                 }
             }
             if let Some(ts) = state.last_change {
