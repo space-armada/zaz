@@ -2413,7 +2413,7 @@ fn build_group_state(group: &Group) -> GroupState {
             })
             .collect(),
         daemons: group
-            .daemons
+            .services
             .iter()
             .map(|d| ProcessState {
                 name: d.name().to_string(),
@@ -2439,7 +2439,7 @@ fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) 
 
     // Create daemons with per-daemon working_dir and env overrides
     let daemons: Vec<Daemon> = group
-        .daemons
+        .services
         .iter()
         .map(|d| {
             let mut daemon_executor = executor.clone();
@@ -2603,7 +2603,7 @@ fn topological_sort(groups: &[Group]) -> Result<Vec<String>, DaemonError> {
 mod tests {
     use super::*;
     use crate::ApiRequest;
-    use zaz_config::{DaemonCommand, Group, Silence, TaskCommand};
+    use zaz_config::{Group, ServiceCommand, Silence, TaskCommand};
 
     // =========================================================================
     // Test helpers
@@ -2708,7 +2708,7 @@ mod tests {
         Group {
             name: name.to_string(),
             patterns: vec!["*.test".to_string()],
-            daemons: vec![DaemonCommand::new("daemon", command)],
+            services: vec![ServiceCommand::new("daemon", command)],
             ..Default::default()
         }
     }
@@ -4040,7 +4040,7 @@ mod tests {
         let groups = vec![Group {
             name: "daemon-only".to_string(),
             tasks: vec![],
-            daemons: vec![DaemonCommand::new("server", "sleep 1")],
+            services: vec![ServiceCommand::new("server", "sleep 1")],
             patterns: vec!["*.test".to_string()],
             ..Default::default()
         }];
@@ -4059,7 +4059,7 @@ mod tests {
         let daemon_only = Group {
             name: "a".to_string(),
             tasks: vec![],
-            daemons: vec![DaemonCommand::new("server", "sleep 1")],
+            services: vec![ServiceCommand::new("server", "sleep 1")],
             patterns: vec!["*.test".to_string()],
             ..Default::default()
         };

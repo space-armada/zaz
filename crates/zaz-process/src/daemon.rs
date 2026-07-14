@@ -4,7 +4,7 @@ use crate::pty::ManagedChild;
 use crate::{Executor, ProcessError, SignalHandler};
 use nix::sys::signal::Signal;
 use std::time::{Duration, Instant};
-use zaz_config::DaemonCommand;
+use zaz_config::ServiceCommand;
 
 /// Minimum restart delay.
 const MIN_RESTART_DELAY: Duration = Duration::from_millis(500);
@@ -42,7 +42,7 @@ pub enum DaemonState {
 
 /// Manages a long-running daemon process.
 pub struct Daemon {
-    config: DaemonCommand,
+    config: ServiceCommand,
     executor: Executor,
     child: Option<ManagedChild>,
     state: DaemonState,
@@ -52,7 +52,7 @@ pub struct Daemon {
 
 impl Daemon {
     /// Create a new daemon manager.
-    pub fn new(config: DaemonCommand, executor: Executor) -> Self {
+    pub fn new(config: ServiceCommand, executor: Executor) -> Self {
         Self {
             config,
             executor,

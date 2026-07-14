@@ -10,7 +10,7 @@ mod validate;
 
 pub use error::{ConfigError, Span, ValidationError, ValidationErrorKind, ValidationErrors};
 pub use schema::{
-    Config, DaemonCommand, Group, HumanDuration, LogFormat, Settings, Signal, Silence, TaskCommand,
+    Config, Group, HumanDuration, LogFormat, ServiceCommand, Settings, Signal, Silence, TaskCommand,
 };
 pub use toml_spanned::SpanInfo;
 pub use user::{
@@ -161,7 +161,7 @@ no_pty = false
         assert_eq!(config.groups.len(), 1);
         assert_eq!(config.groups[0].name, "backend");
         assert_eq!(config.groups[0].tasks.len(), 1);
-        assert_eq!(config.groups[0].daemons.len(), 1);
+        assert_eq!(config.groups[0].services.len(), 1);
     }
 
     #[test]
@@ -211,7 +211,7 @@ patterns = ["*.txt"]
 
     #[test]
     fn test_json_daemon_alias() {
-        // Test that "daemon" works as alias for "daemons"
+        // Test that the deprecated "daemon" key still works as an alias for "services"
         let json = r#"{
             "groups": [{
                 "name": "test",
@@ -223,7 +223,30 @@ patterns = ["*.txt"]
             }]
         }"#;
         let config = parse_json(json).unwrap();
-        assert_eq!(config.groups[0].daemons.len(), 1);
+        assert_eq!(config.groups[0].services.len(), 1);
+    }
+
+    #[test]
+    fn test_service_and_daemon_parse_identically() {
+        let body = r#"
+name = "server"
+command = "./server"
+signal = "SIGTERM"
+delay = "500ms"
+"#;
+        let service_toml = format!(
+            "[[group]]\nname = \"backend\"\npatterns = [\"*.rs\"]\n\n[[group.service]]{body}"
+        );
+        let daemon_toml = format!(
+            "[[group]]\nname = \"backend\"\npatterns = [\"*.rs\"]\n\n[[group.daemon]]{body}"
+        );
+
+        let from_service = parse_toml(&service_toml).unwrap();
+        let from_daemon = parse_toml(&daemon_toml).unwrap();
+
+        assert_eq!(from_service.groups[0].services.len(), 1);
+        assert_eq!(from_daemon.groups[0].services.len(), 1);
+        assert_eq!(from_service, from_daemon);
     }
 
     #[test]
@@ -247,7 +270,7 @@ command = "./srv"
 signal = "SIGHUP"
 "#;
         let config = parse_toml(toml).unwrap();
-        assert_eq!(config.groups[0].daemons[0].signal, Signal::Sighup);
+        assert_eq!(config.groups[0].services[0].signal, Signal::Sighup);
     }
 
     #[test]
@@ -311,7 +334,7 @@ silence = "stdout"
         // Task with silence = "stderr" (shows only stderr)
         assert_eq!(config.groups[0].tasks[1].silence, Silence::Stderr);
         // Daemon with silence = "stdout"
-        assert_eq!(config.groups[0].daemons[0].silence, Silence::Stdout);
+        assert_eq!(config.groups[0].services[0].silence, Silence::Stdout);
     }
 
     #[test]
@@ -372,7 +395,7 @@ working_dir = "./packages/server"
 
         // Daemon working_dir override
         assert_eq!(
-            config.groups[0].daemons[0].working_dir,
+            config.groups[0].services[0].working_dir,
             Some("./packages/server".to_string())
         );
     }
@@ -396,7 +419,7 @@ command = "./srv"
         // Default should be None
         assert!(config.groups[0].working_dir.is_none());
         assert!(config.groups[0].tasks[0].working_dir.is_none());
-        assert!(config.groups[0].daemons[0].working_dir.is_none());
+        assert!(config.groups[0].services[0].working_dir.is_none());
     }
 
     #[test]
@@ -418,9 +441,9 @@ command = "./worker"
         let config = parse_toml(toml).unwrap();
 
         // Daemon with delay
-        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(500));
+        assert_eq!(config.groups[0].services[0].delay_ms(), Some(500));
         // Daemon without delay (default)
-        assert_eq!(config.groups[0].daemons[1].delay_ms(), None);
+        assert_eq!(config.groups[0].services[1].delay_ms(), None);
     }
 
     #[test]
@@ -461,7 +484,7 @@ env = { PORT = "8080" }
 
         // Daemon env
         assert_eq!(
-            config.groups[0].daemons[0].env.get("PORT"),
+            config.groups[0].services[0].env.get("PORT"),
             Some(&"8080".to_string())
         );
     }
@@ -523,7 +546,7 @@ command = "./server"
 delay = "500ms"
 "#;
         let config = parse_toml(toml).unwrap();
-        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(500));
+        assert_eq!(config.groups[0].services[0].delay_ms(), Some(500));
 
         // Test seconds
         let toml = r#"
@@ -537,7 +560,7 @@ command = "./server"
 delay = "2s"
 "#;
         let config = parse_toml(toml).unwrap();
-        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(2000));
+        assert_eq!(config.groups[0].services[0].delay_ms(), Some(2000));
 
         // Test integer (backwards compatibility)
         let toml = r#"
@@ -551,7 +574,7 @@ command = "./server"
 delay = 750
 "#;
         let config = parse_toml(toml).unwrap();
-        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(750));
+        assert_eq!(config.groups[0].services[0].delay_ms(), Some(750));
 
         // Test delay_ms alias (backwards compatibility)
         let toml = r#"
@@ -565,7 +588,7 @@ command = "./server"
 delay_ms = 600
 "#;
         let config = parse_toml(toml).unwrap();
-        assert_eq!(config.groups[0].daemons[0].delay_ms(), Some(600));
+        assert_eq!(config.groups[0].services[0].delay_ms(), Some(600));
     }
 
     #[test]
@@ -587,6 +610,6 @@ command = "./srv"
         // Default should be empty
         assert!(config.groups[0].env.is_empty());
         assert!(config.groups[0].tasks[0].env.is_empty());
-        assert!(config.groups[0].daemons[0].env.is_empty());
+        assert!(config.groups[0].services[0].env.is_empty());
     }
 }

@@ -101,7 +101,7 @@ fn validate_groups(
         }
 
         // Check for empty patterns (warning-worthy but not an error)
-        if group.patterns.is_empty() && group.tasks.is_empty() && group.daemons.is_empty() {
+        if group.patterns.is_empty() && group.tasks.is_empty() && group.services.is_empty() {
             let mut error = ValidationError::new(ValidationErrorKind::EmptyGroup {
                 name: group.name.clone(),
             });
@@ -296,7 +296,7 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
 
         // Check daemon commands
         let mut daemon_names: HashSet<&str> = HashSet::new();
-        for daemon in &group.daemons {
+        for daemon in &group.services {
             let name = daemon.name();
             if daemon.command.is_empty() {
                 errors.push(ValidationError::new(
@@ -341,7 +341,7 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DaemonCommand, Group, TaskCommand};
+    use crate::{Group, ServiceCommand, TaskCommand};
 
     fn make_group(name: &str) -> Group {
         Group {
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn test_daemon_command_rejects_file_context_builtins() {
         let mut group = make_group("server");
-        group.daemons = vec![DaemonCommand::new(
+        group.services = vec![ServiceCommand::new(
             "watcher",
             "./bin/handler --files ${zaz:files}",
         )];
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn test_daemon_command_allows_user_variables_and_root() {
         let mut group = make_group("server");
-        group.daemons = vec![DaemonCommand::new(
+        group.services = vec![ServiceCommand::new(
             "watcher",
             "./bin/handler --root ${zaz:root} --lexicon ${lexicon}",
         )];
@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn test_daemon_command_allows_escaped_file_builtin() {
         let mut group = make_group("server");
-        group.daemons = vec![DaemonCommand::new(
+        group.services = vec![ServiceCommand::new(
             "watcher",
             r"./bin/handler --files \${zaz:files}",
         )];

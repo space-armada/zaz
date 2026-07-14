@@ -4,7 +4,7 @@
 //! to track source positions for better error messages.
 
 use crate::error::Span;
-use crate::schema::{Config, DaemonCommand, Group, Settings, TaskCommand};
+use crate::schema::{Config, Group, ServiceCommand, Settings, TaskCommand};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -61,8 +61,8 @@ struct SpannedGroup {
     env: HashMap<String, String>,
     #[serde(alias = "task")]
     tasks: Vec<TaskCommand>,
-    #[serde(alias = "daemon")]
-    daemons: Vec<DaemonCommand>,
+    #[serde(alias = "service", alias = "daemon", alias = "daemons")]
+    services: Vec<ServiceCommand>,
 }
 
 impl Default for SpannedGroup {
@@ -75,7 +75,7 @@ impl Default for SpannedGroup {
             working_dir: None,
             env: HashMap::new(),
             tasks: Vec::new(),
-            daemons: Vec::new(),
+            services: Vec::new(),
         }
     }
 }
@@ -118,7 +118,7 @@ pub fn parse_toml_with_spans(
                 working_dir: sg.working_dir,
                 env: sg.env,
                 tasks: sg.tasks,
-                daemons: sg.daemons,
+                services: sg.services,
             }
         })
         .collect();

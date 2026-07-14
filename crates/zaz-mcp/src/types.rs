@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use zaz_config::{Config, DaemonCommand, Group, LogFormat, Settings, Signal, Silence, TaskCommand};
+use zaz_config::{
+    Config, Group, LogFormat, ServiceCommand, Settings, Signal, Silence, TaskCommand,
+};
 use zaz_daemon::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, LogLine, LogSource, OutputKind,
     ProcessState, ProcessStatus,
@@ -474,7 +476,7 @@ impl From<&Group> for ConfigGroup {
             working_dir: g.working_dir.clone(),
             env: g.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             tasks: g.tasks.iter().map(ConfigTask::from).collect(),
-            daemons: g.daemons.iter().map(ConfigDaemon::from).collect(),
+            daemons: g.services.iter().map(ConfigDaemon::from).collect(),
         }
     }
 }
@@ -492,8 +494,8 @@ impl From<&TaskCommand> for ConfigTask {
     }
 }
 
-impl From<&DaemonCommand> for ConfigDaemon {
-    fn from(d: &DaemonCommand) -> Self {
+impl From<&ServiceCommand> for ConfigDaemon {
+    fn from(d: &ServiceCommand) -> Self {
         Self {
             name: d.name().to_string(),
             command: d.command.clone(),
