@@ -1,6 +1,6 @@
 # Backend + frontend monorepo with cross-group ordering.
 #
-# `frontend` waits for `backend` to finish its tasks (and start its daemon)
+# `frontend` waits for `backend` to finish its tasks (and start its service)
 # before its own tasks run. Per-group `working_dir` lets each side address
 # its own subtree without prefixing every command.
 
@@ -14,7 +14,7 @@ ignore = ["**/*_test.go", "build/**"]
   name = "build"
   command = "go build -o build/server ./cmd/server"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "server"
   command = "./build/server"
   signal = "SIGTERM"
@@ -30,7 +30,7 @@ depends_on = ["backend"]
   name = "typecheck"
   command = "npx tsc --noEmit"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "vite"
   command = "npx vite"
   signal = "SIGTERM"

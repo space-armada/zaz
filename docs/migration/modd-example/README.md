@@ -2,12 +2,12 @@
 
 The end state of the "Complete example" walkthrough in
 [../modd.md](../modd.md). A modd.conf with five blocks (a standalone
-daemon, Go test/build/server pair, a sqlc generator, and a UI install/dev
+service, Go test/build/server pair, a sqlc generator, and a UI install/dev
 pair) maps to five zaz groups in a single `zaz.toml`.
 
 ## Features used
 
-- `patterns = []` standalone daemon for the always-on `cloud-sql-proxy`.
+- `patterns = []` standalone service for the always-on `cloud-sql-proxy`.
 - `${zaz:dirs}` so `go test` runs against the directories that changed,
   matching modd's `@dirmods`.
 - `ignore = ["**/*_test.go"]` to express modd's `!**/*_test.go` negation.

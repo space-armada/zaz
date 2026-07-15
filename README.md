@@ -7,7 +7,7 @@ environments, heavily inspired by `modd`.
 
 ## Overview
 
-zaz watches files, runs tasks, and supervises long-running daemons. A
+zaz watches files, runs tasks, and supervises long-running services. A
 background daemon owns process state and exposes a Unix socket API; the TUI,
 one-shot CLI, and MCP tool server are all clients of that daemon.
 
@@ -41,7 +41,7 @@ patterns = ["**/*.go"]
 name = "build"
 command = "go build -o ./bin/server ./cmd/server"
 
-[[group.daemon]]
+[[group.service]]
 name = "server"
 command = "./bin/server"
 ```
@@ -60,10 +60,10 @@ for the full schema.
 ## Core concepts
 
 - **Groups** bind a set of file patterns to one or more commands. When a
-  watched file changes, the group's tasks and daemons are re-run.
+  watched file changes, the group's tasks and services are re-run.
 - **Tasks** run to completion. Use them for builds, tests, codegen, or any
   step that finishes.
-- **Daemons** are long-running processes. zaz starts them on launch and
+- **Services** are long-running processes. zaz starts them on launch and
   signals them on change so they restart cleanly.
 - **Patterns** are glob expressions over the working tree; a group can also
   list `ignore` patterns.

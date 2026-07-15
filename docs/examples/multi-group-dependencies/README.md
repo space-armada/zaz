@@ -2,12 +2,12 @@
 
 A monorepo split into a Go `backend` and a TypeScript `frontend`. The
 frontend group declares `depends_on = ["backend"]`, so its tasks and
-daemon do not start until the backend group's tasks have completed and
-its daemon is running.
+service do not start until the backend group's tasks have completed and
+its service is running.
 
 ## Features used
 
-- Two groups, each with its own patterns, ignores, tasks, and daemon.
+- Two groups, each with its own patterns, ignores, tasks, and service.
 - Per-group `working_dir` so commands stay short and each group operates
   inside its own subtree.
 - Cross-group ordering via `depends_on`.
@@ -29,8 +29,8 @@ its daemon is running.
 ```sh
 zaz check
 zaz                           # TUI shows both groups side by side
-zaz status                    # snapshot of every group, task, and daemon
-zaz reload                    # re-read this config without dropping daemons
+zaz status                    # snapshot of every group, task, and service
+zaz reload                    # re-read this config without dropping services
 ```
 
 ## See also

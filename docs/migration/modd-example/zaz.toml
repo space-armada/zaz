@@ -4,12 +4,12 @@
 # ../modd.md, "Complete example". It is parsed by tests/example_configs.rs
 # against the live schema, so the guide and the schema stay aligned.
 
-# Standalone daemon: empty patterns, no file watching, just keeps running.
+# Standalone service: empty patterns, no file watching, just keeps running.
 [[group]]
 name = "cloud-sql-proxy"
 patterns = []
 
-  [[group.daemon]]
+  [[group.service]]
   name = "cloud-sql-proxy"
   command = "cloud-sql-proxy"
 
@@ -35,12 +35,12 @@ depends_on = ["go-test"]
   name = "build"
   command = "make build"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "ems-server"
   command = "bin/ems server"
   signal = "SIGTERM"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "ems-testfeeds"
   command = "bin/ems testfeeds"
   signal = "SIGTERM"
@@ -65,6 +65,6 @@ working_dir = "./ui"
   name = "install"
   command = "pnpm install"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "dev"
   command = "pnpm run dev"

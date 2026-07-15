@@ -8,7 +8,7 @@ launched by the bare `zaz` invocation; for the launch flags `--full`,
 ## Overview
 
 The TUI connects to a running daemon over the resolved Unix socket and shows
-group, task, and daemon state plus per-process logs. It autostarts a daemon
+group, task, and service state plus per-process logs. It autostarts a daemon
 when one is not already running unless `--no-autostart` is passed. The
 default style and other operator preferences are read from the user config
 documented in [user-configuration.md](user-configuration.md); CLI flags
@@ -68,7 +68,7 @@ Manual scrolling disables follow mode for the affected logs / pane until
 
 | Key | Action |
 |-----|--------|
-| `r` | Restart the selected group, task, or daemon |
+| `r` | Restart the selected group, task, or service |
 | `R` | Restart all groups |
 | `c` | Clear the focused logs / pane (client-local view cutoff; daemon retains the full log) |
 | `F` | Toggle follow mode for the focused logs / pane |

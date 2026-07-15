@@ -100,7 +100,7 @@ Desktop notification preferences. `enabled` is the master switch: when
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `enabled` | bool | `false` | Master switch for desktop notifications. |
-| `on_failure` | bool | `true` | Notify when a task or daemon exits with a failure. |
+| `on_failure` | bool | `true` | Notify when a task or service exits with a failure. |
 | `on_success` | bool | `false` | Notify when a task completes successfully. |
 | `on_group_complete` | bool | `true` | Notify when every group has reached a steady state. |
 

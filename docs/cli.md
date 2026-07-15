@@ -252,7 +252,7 @@ zaz --stop-on-exit     # stop the daemon when the TUI exits
 
 Runs every group's tasks once, sequentially with fail-fast semantics, and
 exits. Tasks are run-to-completion units (as opposed to long-running
-daemons). Useful for one-shot builds, lints, or test runs from a script
+services). Useful for one-shot builds, lints, or test runs from a script
 without the TUI or a persistent daemon.
 
 Exits `0` only if every task in every group exits cleanly; `1` if any task
@@ -411,8 +411,8 @@ Validation error codes (from `crates/zaz-config/src/error.rs`):
 | `invalid_ignore_pattern` | An `ignore` entry failed glob parsing. |
 | `empty_task_command` | Task has an empty `command`. |
 | `duplicate_task_name` | Two tasks in the same group share an explicit name. |
-| `empty_daemon_command` | Daemon has an empty `command`. |
-| `duplicate_daemon_name` | Two daemons in the same group share an explicit name. |
+| `empty_service_command` | Service has an empty `command`. |
+| `duplicate_service_name` | Two services in the same group share an explicit name. |
 
 Parse-level failures (TOML/JSON syntax errors, unknown fields, I/O errors)
 are reported as a single error with code `parse_error`.
