@@ -20,6 +20,25 @@
 # for every project, so no extra setup is needed. Only /workspace is shared
 # between steps, so CARGO_HOME, RUSTUP_HOME, and the rumdl cache are pinned
 # under /workspace to make them cacheable.
+#
+# macOS cross-compile check:
+#
+#   - The CI-macOS step cross-compiles the workspace for aarch64-apple-darwin
+#     using zig (via bin/zig and cargo-zigbuild) to verify build correctness
+#     without a macOS test runner. zaz-daemon depends on notify-rust, whose
+#     macOS backend compiles Objective-C against Cocoa/Foundation headers in
+#     its build.rs, so zig alone isn't enough; it needs a real macOS SDK.
+#
+#   - The SDK is vendored privately rather than fetched from a public mirror,
+#     since Apple's SDK isn't redistributable. To produce and upload one:
+#
+#       1. On a Mac with Xcode or the Command Line Tools installed:
+#            SDK="$(xcrun --show-sdk-path)"
+#            tar -cJf macos-sdk.tar.xz -C "$(dirname "$SDK")" "$(basename "$SDK")"
+#       2. gsutil cp macos-sdk.tar.xz "${_MACOS_SDK_OBJECT}"
+#
+#     Keep the destination bucket private; this SDK is for this project's own
+#     CI, not for redistribution.
 
 steps:
   - id: Restore-Cache
@@ -28,7 +47,7 @@ steps:
     args:
       - '-c'
       - |
-        # A missing cache is normal on the first build; never fail on it.
+        # A missing cargo cache is normal on the first build; never fail on it.
         set +e
         if [[ -n "$TAG_NAME" ]]; then
           echo "Build type: TAG $TAG_NAME"
@@ -49,7 +68,16 @@ steps:
         else
           echo "No cache for key $$KEY; building cold"
         fi
-        exit 0
+
+        # Unlike the cargo cache above, the macOS SDK is a required input for
+        # the CI-macOS step, not an optimization, so a missing object is a
+        # hard failure here rather than a cold-build fallback. See the setup
+        # notes in this file's header for how to produce and upload one.
+        set -e
+        echo "Fetching macOS SDK for cross-compile check..."
+        gsutil cp "${_MACOS_SDK_OBJECT}" /workspace/macos-sdk.tar.xz
+        mkdir -p /workspace/macos-sdk
+        tar -xJf /workspace/macos-sdk.tar.xz -C /workspace/macos-sdk --strip-components=1
 
   - id: CI
     name: 'rust:1-trixie'
@@ -67,6 +95,21 @@ steps:
         set -e
         export PATH="$$CARGO_HOME/bin:$$PATH"
         make ci
+
+  - id: CI-macOS
+    name: 'rust:1-trixie'
+    env:
+      - 'CARGO_HOME=/workspace/.cargo-home'
+      - 'RUSTUP_HOME=/workspace/.rustup'
+      - 'CARGO_TERM_COLOR=always'
+      - 'SDKROOT=/workspace/macos-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+        export PATH="$$CARGO_HOME/bin:$$PATH"
+        make build-macos
 
   - id: Save-Cache
     name: 'gcr.io/cloud-builders/gsutil'
@@ -107,8 +150,9 @@ steps:
 
 substitutions:
   _CACHE_BUCKET: 'gs://${PROJECT_ID}_cloudbuild/zaz-cache'
+  _MACOS_SDK_OBJECT: 'gs://${PROJECT_ID}_cloudbuild/zaz-cache/macos-sdk.tar.xz'
 
-timeout: 1800s
+timeout: 2700s
 
 options:
   dynamicSubstitutions: true
