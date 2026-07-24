@@ -4,7 +4,7 @@
 all: check
 
 build:
-	cargo build
+	cargo build --locked
 
 release:
 	cargo build --release
@@ -13,12 +13,12 @@ install:
 	cargo install --path .
 
 test:
-	cargo test --workspace
+	cargo test --workspace --locked
 
 lint: lint-rust lint-md
 
 lint-rust:
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets --all-features --locked -- -D warnings
 
 lint-md:
 	bin/rumdl check .
@@ -37,7 +37,7 @@ docs-cli:
 	cargo run --quiet -p xtask -- docs-cli --write
 
 docs-check:
-	cargo run --quiet -p xtask -- docs-cli
+	cargo run --quiet --locked -p xtask -- docs-cli
 
 clean:
 	cargo clean
