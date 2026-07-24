@@ -39,6 +39,21 @@
 #
 #     Keep the destination bucket private; this SDK is for this project's own
 #     CI, not for redistribution.
+#
+# GitHub release on tags:
+#
+#   - On a tag push, the CI and CI-macOS steps also build optimized binaries
+#     for x86_64-unknown-linux-gnu and aarch64-apple-darwin, staging them under
+#     /workspace/dist via `make dist-linux` and `make dist-macos`. Branch and PR
+#     builds skip this and only run the checks.
+#
+#   - The Release step then publishes those binaries to a GitHub release. It
+#     authenticates as a GitHub App: the app private key (from Secret Manager)
+#     signs a short-lived JWT, which is exchanged for a repo-scoped installation
+#     token. Release notes come from the annotated tag verbatim.
+#
+#   - The app key lives in Secret Manager as `beermaid-app-key`. Grant the Cloud
+#     Build service account roles/secretmanager.secretAccessor to read it.
 
 steps:
   - id: Restore-Cache
@@ -95,6 +110,10 @@ steps:
         set -e
         export PATH="$$CARGO_HOME/bin:$$PATH"
         make ci
+        if [[ -n "$TAG_NAME" ]]; then
+          echo "Tag build; staging Linux release binary"
+          make dist-linux DIST_DIR=/workspace/dist
+        fi
 
   - id: CI-macOS
     name: 'rust:1-trixie'
@@ -109,7 +128,14 @@ steps:
       - |
         set -e
         export PATH="$$CARGO_HOME/bin:$$PATH"
-        make build-macos
+        # On tag builds the release compile validates the cross-build, so it
+        # replaces the debug-only check. Other builds just verify it compiles.
+        if [[ -n "$TAG_NAME" ]]; then
+          echo "Tag build; building and staging macOS release binary"
+          make dist-macos DIST_DIR=/workspace/dist
+        else
+          make build-macos
+        fi
 
   - id: Save-Cache
     name: 'gcr.io/cloud-builders/gsutil'
@@ -148,6 +174,47 @@ steps:
         gsutil cp /workspace/cache.tar.gz "$$OBJ"
         echo "Saved cache to $$OBJ"
 
+  - id: Release
+    name: 'gcr.io/${PROJECT_ID}/home_port:debian-13-20260723'
+    entrypoint: 'bash'
+    secretEnv: ['APP_PRIVATE_KEY']
+    env:
+      - 'APP_ID=2176292'
+    args:
+      - '-c'
+      - |
+        set -e
+        # Only tag pushes cut a release; branch and PR builds stop after CI.
+        if [[ -z "$TAG_NAME" ]]; then
+          echo "Not a tag build; skipping release"
+          exit 0
+        fi
+
+        api=https://api.github.com
+        repo=space-armada/zaz
+
+        # Authenticate as the GitHub App. The private key signs a short-lived JWT
+        # (RS256, 9-minute window). GitHub can't be handed the key directly, so the
+        # JWT is the credential the app presents.
+        b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+        now=$(date +%s)
+        header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+        payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$$((now-60))" "$$((now+540))" "$$APP_ID" | b64url)
+        sig=$(printf '%s.%s' "$$header" "$$payload" \
+          | openssl dgst -sha256 -sign <(printf '%s' "$$APP_PRIVATE_KEY") | b64url)
+        jwt="$$header.$$payload.$$sig"
+
+        # Exchange the app JWT for a 1-hour installation token scoped to this repo.
+        # The installation is looked up by repo, so no installation ID is hardcoded.
+        inst_id=$(curl -sf -H "Authorization: Bearer $$jwt" \
+          -H "Accept: application/vnd.github+json" "$$api/repos/$$repo/installation" | jq -r '.id')
+        export GH_TOKEN=$(curl -sf -X POST -H "Authorization: Bearer $$jwt" \
+          -H "Accept: application/vnd.github+json" \
+          "$$api/app/installations/$$inst_id/access_tokens" | jq -r '.token')
+
+        # Publish the staged binaries. Notes come from the annotated tag verbatim.
+        gh release create "$TAG_NAME" --repo "$$repo" --verify-tag --notes-from-tag /workspace/dist/*
+
 substitutions:
   _CACHE_BUCKET: 'gs://${PROJECT_ID}_cloudbuild/zaz-cache'
   _MACOS_SDK_OBJECT: 'gs://${PROJECT_ID}_cloudbuild/zaz-cache/macos-sdk.tar.xz'
@@ -156,3 +223,8 @@ timeout: 2700s
 
 options:
   dynamicSubstitutions: true
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/${PROJECT_ID}/secrets/beermaid-app-key/versions/latest
+      env: 'APP_PRIVATE_KEY'
