@@ -61,6 +61,9 @@ regex = "1"
 # Testing
 tempfile = "3"
 
+# Benchmarking
+criterion = "0.5"
+
 # Logging
 tracing = "0.1"
 tracing-appender = "0.2"

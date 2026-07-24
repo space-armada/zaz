@@ -17,3 +17,10 @@ tokio.workspace = true
 tracing.workspace = true
 zaz-config.workspace = true
 zaz-daemon.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "ansi"
+harness = false
