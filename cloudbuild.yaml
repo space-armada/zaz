@@ -212,8 +212,19 @@ steps:
           -H "Accept: application/vnd.github+json" \
           "$$api/app/installations/$$inst_id/access_tokens" | jq -r '.token')
 
-        # Publish the staged binaries. Notes come from the annotated tag verbatim.
-        gh release create "$TAG_NAME" --repo "$$repo" --verify-tag --notes-from-tag /workspace/dist/*
+        # Read the annotated tag's message for the release body. gh refuses
+        # `--notes-from-tag` together with `--repo`, and the checkout has no tag
+        # object, so fetch the annotation over the API instead. The tag ref points
+        # at the tag object; that object carries the message.
+        tag_sha=$(curl -sf -H "Authorization: token $$GH_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "$$api/repos/$$repo/git/ref/tags/$TAG_NAME" | jq -r '.object.sha')
+        notes=$(curl -sf -H "Authorization: token $$GH_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          "$$api/repos/$$repo/git/tags/$$tag_sha" | jq -r '.message')
+
+        # Publish the staged binaries with the tag message as the release body.
+        gh release create "$TAG_NAME" --repo "$$repo" --verify-tag --notes "$$notes" /workspace/dist/*
 
 substitutions:
   _CACHE_BUCKET: 'gs://${PROJECT_ID}_cloudbuild/zaz-cache'
