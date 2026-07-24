@@ -1,0 +1,87 @@
+# GCB (cloudbuild) config for the zaz benchmark harness.
+#
+# Policy: benchmarks are non-gating. This config is NOT the CI gate and must
+# never block a PR. Wire it to its own trigger that fires on push to main, so it
+# runs after a change merges rather than while it is under review. The gating
+# checks live in cloudbuild.yaml (make ci); `bench` is deliberately absent from
+# the `make ci` chain, so this build never blocks a merge either.
+#
+# Why non-gating: the project has no benchmark baselines yet, and shared CI
+# runners have 10-30% run-to-run variance that would mask real regressions and
+# produce noisy failures. The harness runs the Criterion microbenchmarks and
+# archives the results so they can be tracked over time. It can graduate to
+# PR-visible reporting once baselines stabilize.
+#
+# What it does:
+#
+#   - Restores the cargo registry and rustup toolchain from the same cache the
+#     gating pipeline maintains (read-only; this config never writes the cache).
+#   - Runs `make bench` (cargo bench across the workspace).
+#   - Archives target/criterion to GCS keyed by commit so runs are comparable
+#     over time.
+
+steps:
+  - id: Restore-Cache
+    name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # A missing cache is never fatal here; benchmarks tolerate a cold build.
+        set +e
+        # Key on the same inputs as the gating pipeline so this reads the cache
+        # that pipeline writes on main.
+        KEY=$(sha256sum Cargo.lock rust-toolchain.toml | sha256sum | cut -c1-16)
+        OBJ="${_CACHE_BUCKET}/cache-$$KEY.tar.gz"
+        echo "Cache key: $$KEY"
+        gsutil cp "$$OBJ" /workspace/cache.tar.gz
+        if [[ -f /workspace/cache.tar.gz ]]; then
+          tar -xzf /workspace/cache.tar.gz -C /workspace
+          echo "Restored cache from $$OBJ"
+        else
+          echo "No cache for key $$KEY; building cold"
+        fi
+
+  - id: Bench
+    name: 'rust:1-trixie'
+    env:
+      # Match the gating pipeline: pin CARGO_HOME and RUSTUP_HOME under
+      # /workspace so the restored cache is used instead of a fresh download.
+      - 'CARGO_HOME=/workspace/.cargo-home'
+      - 'RUSTUP_HOME=/workspace/.rustup'
+      - 'CARGO_TERM_COLOR=always'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+        export PATH="$$CARGO_HOME/bin:$$PATH"
+        make bench
+
+  - id: Upload-Results
+    name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
+        # Key the archive on the commit when available; manual submits without a
+        # source revision fall back to the build id, which is always set.
+        REV="$SHORT_SHA"
+        [[ -n "$$REV" ]] || REV="$BUILD_ID"
+        if [[ -d /workspace/target/criterion ]]; then
+          tar -czf /workspace/criterion.tar.gz -C /workspace/target criterion
+          gsutil cp /workspace/criterion.tar.gz "${_BENCH_BUCKET}/bench-$$REV.tar.gz"
+          echo "Uploaded results to ${_BENCH_BUCKET}/bench-$$REV.tar.gz"
+        else
+          echo "No target/criterion output found; nothing to upload"
+        fi
+
+substitutions:
+  _CACHE_BUCKET: 'gs://${PROJECT_ID}_cloudbuild/zaz-cache'
+  _BENCH_BUCKET: 'gs://${PROJECT_ID}_cloudbuild/zaz-bench'
+
+timeout: 2700s
+
+options:
+  dynamicSubstitutions: true

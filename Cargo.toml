@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2026.6.2"
+version = "2026.7.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
@@ -60,6 +60,9 @@ regex = "1"
 
 # Testing
 tempfile = "3"
+
+# Benchmarking
+criterion = "0.5"
 
 # Logging
 tracing = "0.1"

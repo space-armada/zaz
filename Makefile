@@ -1,4 +1,4 @@
-.PHONY: all build build-macos check ci clean docs-check docs-cli fmt fmt-check lint lint-md lint-rust test
+.PHONY: all bench build build-macos check ci clean docs-check docs-cli fmt fmt-check lint lint-md lint-rust test
 
 # Default target
 all: check
@@ -42,6 +42,12 @@ fmt-check:
 	bin/rumdl check .
 
 ci: fmt-check lint build test docs-check
+
+# Runs the Criterion benchmark harness. Deliberately kept out of the `ci` gate:
+# benchmarks are non-gating and run on a manual or scheduled trigger only. See
+# cloudbuild.bench.yaml for the policy and how results are tracked over time.
+bench:
+	cargo bench --workspace --locked
 
 docs-cli:
 	cargo run --quiet -p xtask -- docs-cli --write

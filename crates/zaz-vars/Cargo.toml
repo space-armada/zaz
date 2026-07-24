@@ -7,3 +7,10 @@ description = "Variable expansion for zaz"
 
 [dependencies]
 thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "vars"
+harness = false
