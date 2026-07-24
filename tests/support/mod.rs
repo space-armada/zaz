@@ -11,10 +11,13 @@
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
+use zaz_daemon::{ApiRequest, ApiResponse, LogLine};
 
 pub fn zaz_bin() -> &'static str {
     env!("CARGO_BIN_EXE_zaz")
@@ -176,5 +179,118 @@ impl StartedDaemon {
 impl Drop for StartedDaemon {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+pub struct DaemonLogs {
+    pub lines: Vec<LogLine>,
+    pub total_count: Option<usize>,
+    pub has_more: Option<bool>,
+}
+
+/// Send `ApiRequest::GetLogs` over the raw daemon socket and return the
+/// response as-is, without assuming it's the `Logs` variant. Callers that
+/// expect an error response (e.g. a rejected query) need this instead of
+/// [`get_logs`].
+pub fn get_logs_response(
+    socket: &Path,
+    project: Option<&str>,
+    name: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    search: Option<&str>,
+) -> ApiResponse {
+    let request = ApiRequest::GetLogs {
+        name: name.to_string(),
+        project: project.map(str::to_string),
+        lines: None,
+        offset,
+        limit,
+        search: search.map(str::to_string),
+    };
+    let mut stream = UnixStream::connect(socket).expect("connect daemon socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut payload = serde_json::to_string(&request).expect("serialize ApiRequest");
+    payload.push('\n');
+    stream
+        .write_all(payload.as_bytes())
+        .expect("write GetLogs request");
+    let mut response = String::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut buf).expect("read daemon response");
+        if n == 0 {
+            break;
+        }
+        response.push_str(std::str::from_utf8(&buf[..n]).expect("utf-8 response"));
+        if response.contains('\n') {
+            break;
+        }
+    }
+    let trimmed = response.trim_end_matches('\n');
+    serde_json::from_str(trimmed)
+        .unwrap_or_else(|e| panic!("parse ApiResponse failed ({e}): {trimmed}"))
+}
+
+pub fn get_logs(
+    socket: &Path,
+    project: Option<&str>,
+    name: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    search: Option<&str>,
+) -> DaemonLogs {
+    match get_logs_response(socket, project, name, offset, limit, search) {
+        ApiResponse::Logs {
+            lines,
+            total_count,
+            has_more,
+            ..
+        } => DaemonLogs {
+            lines,
+            total_count,
+            has_more,
+        },
+        other => panic!("expected ApiResponse::Logs, got {other:?}"),
+    }
+}
+
+/// Poll `get_logs` every 50ms until at least `min_count` lines matching
+/// `search` are seen, returning those lines. Panics with the last-observed
+/// lines if `timeout` elapses first.
+pub fn await_log_lines(
+    socket: &Path,
+    project: Option<&str>,
+    name: &str,
+    search: &str,
+    min_count: usize,
+    timeout: Duration,
+) -> Vec<LogLine> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let logs = get_logs(socket, project, name, None, Some(1024), Some(search));
+        let count = logs.total_count.unwrap_or(logs.lines.len());
+        if count >= min_count {
+            return logs.lines;
+        }
+        if Instant::now() >= deadline {
+            let observed: Vec<String> = logs
+                .lines
+                .iter()
+                .map(|l| {
+                    format!(
+                        "[{:?}/{:?}] {}: {}",
+                        l.source, l.output_kind, l.process, l.content
+                    )
+                })
+                .collect();
+            panic!(
+                "timed out waiting for {min_count} `{name}` log lines matching {search:?}; last observed {count} within {timeout:?}\nlines:\n{}",
+                observed.join("\n")
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
