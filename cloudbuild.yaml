@@ -199,7 +199,7 @@ steps:
         b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
         now=$(date +%s)
         header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
-        payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$$((now-60))" "$$((now+540))" "$APP_ID" | b64url)
+        payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$$((now-60))" "$$((now+540))" "$$APP_ID" | b64url)
         sig=$(printf '%s.%s' "$$header" "$$payload" \
           | openssl dgst -sha256 -sign <(printf '%s' "$$APP_PRIVATE_KEY") | b64url)
         jwt="$$header.$$payload.$$sig"
