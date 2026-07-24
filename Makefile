@@ -1,7 +1,10 @@
-.PHONY: all bench build build-macos check ci clean docs-check docs-cli fmt fmt-check lint lint-md lint-rust test
+.PHONY: all bench build build-macos check ci clean dist-linux dist-macos docs-check docs-cli fmt fmt-check lint lint-md lint-rust test
 
 # Default target
 all: check
+
+help: ## Show this help
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
 build:
 	cargo build --locked
@@ -15,6 +18,26 @@ build-macos:
 	rustup target add aarch64-apple-darwin
 	cargo install --locked cargo-zigbuild@0.23.0
 	CARGO_ZIGBUILD_ZIG_PATH=$(CURDIR)/bin/zig cargo zigbuild --target aarch64-apple-darwin --locked
+
+# Directory where release binaries are staged for upload. Cloud Build checks the
+# repo out at /workspace, so the release step overrides this to /workspace/dist.
+DIST_DIR ?= dist
+
+# Builds the optimized Linux binary and stages it under DIST_DIR with a triple-suffixed name.
+dist-linux:
+	cargo build --release --locked --bin zaz
+	mkdir -p $(DIST_DIR)
+	cp target/release/zaz $(DIST_DIR)/zaz-x86_64-unknown-linux-gnu
+
+# Cross-compiles the optimized macOS binary via zigbuild and stages it. Needs SDKROOT, like
+# build-macos; see that target and the setup comment in cloudbuild.yaml.
+dist-macos:
+	@test -n "$(SDKROOT)" || (echo "SDKROOT must point to a macOS SDK; see the setup comment in cloudbuild.yaml" >&2 && exit 1)
+	rustup target add aarch64-apple-darwin
+	cargo install --locked cargo-zigbuild@0.23.0
+	CARGO_ZIGBUILD_ZIG_PATH=$(CURDIR)/bin/zig cargo zigbuild --release --target aarch64-apple-darwin --locked --bin zaz
+	mkdir -p $(DIST_DIR)
+	cp target/aarch64-apple-darwin/release/zaz $(DIST_DIR)/zaz-aarch64-apple-darwin
 
 release:
 	cargo build --release
