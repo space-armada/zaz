@@ -1,33 +1,16 @@
+mod support;
+
 use serde_json::to_writer;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::{run_zaz, stderr_string, stdout_string, zaz_bin, StartedDaemon};
 use tempfile::TempDir;
 use zaz_daemon::{ApiRequest, ApiResponse};
-
-fn zaz_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zaz")
-}
-
-fn run_zaz(current_dir: &Path, args: &[&str]) -> Output {
-    Command::new(zaz_bin())
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .expect("failed to run zaz binary")
-}
-
-fn stdout_string(output: &Output) -> String {
-    String::from_utf8(output.stdout.clone()).expect("stdout should be valid utf-8")
-}
-
-fn stderr_string(output: &Output) -> String {
-    String::from_utf8(output.stderr.clone()).expect("stderr should be valid utf-8")
-}
 
 fn write_task_config(temp: &TempDir, command: &str) -> std::path::PathBuf {
     let config_path = temp.path().join("zaz.toml");
@@ -528,52 +511,6 @@ command = "true"
     config_path
 }
 
-struct StartedDaemon<'a> {
-    current_dir: &'a Path,
-    socket: String,
-}
-
-impl<'a> StartedDaemon<'a> {
-    fn launch(current_dir: &'a Path, config_path: &Path, socket_path: &Path) -> Self {
-        let log_path = current_dir.join("zaz.log");
-        let socket = socket_path
-            .to_str()
-            .expect("socket path should be utf-8")
-            .to_string();
-        let output = run_zaz(
-            current_dir,
-            &[
-                "--config",
-                config_path.to_str().expect("config path should be utf-8"),
-                "--socket",
-                &socket,
-                "--log-file",
-                log_path.to_str().expect("log path should be utf-8"),
-                "start",
-            ],
-        );
-        let stdout = stdout_string(&output);
-        let stderr = stderr_string(&output);
-        assert!(
-            output.status.success(),
-            "zaz start exited with {:?}\nstdout: {stdout}\nstderr: {stderr}",
-            output.status.code()
-        );
-        wait_for_daemon(current_dir, socket_path);
-
-        Self {
-            current_dir,
-            socket,
-        }
-    }
-}
-
-impl Drop for StartedDaemon<'_> {
-    fn drop(&mut self) {
-        let _ = run_zaz(self.current_dir, &["--socket", &self.socket, "stop"]);
-    }
-}
-
 #[test]
 fn start_then_status_reports_running() {
     let temp = TempDir::new().unwrap();
@@ -681,6 +618,112 @@ fn start_is_idempotent_when_daemon_already_running() {
     assert!(
         stdout.contains("daemon already running"),
         "expected idempotent start message, got: {stdout}"
+    );
+}
+
+#[test]
+fn start_then_reload_with_no_changes_reports_zero_diff() {
+    let temp = TempDir::new().unwrap();
+    let config_path = write_lifecycle_config(&temp, "backend");
+    let socket_path = temp.path().join("daemon.sock");
+
+    let _guard = StartedDaemon::launch(temp.path(), &config_path, &socket_path);
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "reload"]);
+    let stdout = stdout_string(&output);
+    let stderr = stderr_string(&output);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("config reloaded: 0 added, 0 removed, 0 modified"),
+        "expected zero-diff reload summary, got: {stdout}"
+    );
+}
+
+#[test]
+fn start_then_reload_applies_added_group() {
+    let temp = TempDir::new().unwrap();
+    let config_path = write_lifecycle_config(&temp, "backend");
+    let socket_path = temp.path().join("daemon.sock");
+
+    let _guard = StartedDaemon::launch(temp.path(), &config_path, &socket_path);
+
+    std::fs::write(
+        &config_path,
+        r#"
+[[group]]
+name = "backend"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "noop"
+command = "true"
+
+[[group]]
+name = "frontend"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "noop"
+command = "true"
+"#,
+    )
+    .unwrap();
+
+    let socket = socket_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["--socket", socket, "reload"]);
+    let stdout = stdout_string(&output);
+    let stderr = stderr_string(&output);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("config reloaded: 1 added, 0 removed, 0 modified"),
+        "expected one-group-added reload summary, got: {stdout}"
+    );
+
+    let status_output = run_zaz(temp.path(), &["--socket", socket, "status"]);
+    let status_stdout = stdout_string(&status_output);
+    assert!(
+        status_stdout.contains("frontend"),
+        "status should reflect the newly reloaded group: {status_stdout}"
+    );
+}
+
+#[test]
+fn start_reports_crash_when_config_is_invalid() {
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("zaz.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[[group]]
+name = "backend"
+patterns = ["**/*.rs"
+"#,
+    )
+    .unwrap();
+    let socket_path = temp.path().join("daemon.sock");
+    let log_path = temp.path().join("zaz.log");
+
+    let output = run_zaz(
+        temp.path(),
+        &[
+            "--config",
+            config_path.to_str().unwrap(),
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "--log-file",
+            log_path.to_str().unwrap(),
+            "start",
+        ],
+    );
+    let stderr = stderr_string(&output);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("daemon exited before becoming ready"),
+        "expected crash-detection message, got: {stderr}"
     );
 }
 

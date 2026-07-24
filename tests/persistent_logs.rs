@@ -10,6 +10,8 @@
 //! `XDG_STATE_HOME` is overridden per test so the SQLite DB lands under a
 //! per-test tempdir instead of the user's real state directory.
 
+mod support;
+
 use serde_json::{json, Value};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -18,13 +20,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::{zaz_bin, StartedDaemon};
 use tempfile::TempDir;
 use zaz_daemon::{ApiRequest, ApiResponse, LogLine};
 use zaz_mcp::LogsReport;
-
-fn zaz_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zaz")
-}
 
 const INITIALIZE_REQUEST: &str = concat!(
     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
@@ -44,6 +43,15 @@ const INITIALIZED_NOTIFICATION: &str = concat!(
 struct XdgDirs {
     state: PathBuf,
     config: PathBuf,
+}
+
+impl XdgDirs {
+    fn as_envs(&self) -> [(&str, &Path); 2] {
+        [
+            ("XDG_STATE_HOME", self.state.as_path()),
+            ("XDG_CONFIG_HOME", self.config.as_path()),
+        ]
+    }
 }
 
 fn xdg_dirs(temp: &TempDir) -> XdgDirs {
@@ -69,20 +77,6 @@ max_lines_per_process = 100000
 "#,
     )
     .expect("write user config");
-}
-
-fn run_zaz<I, S>(current_dir: &Path, xdg: &XdgDirs, args: I) -> std::process::Output
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    Command::new(zaz_bin())
-        .args(args)
-        .current_dir(current_dir)
-        .env("XDG_STATE_HOME", &xdg.state)
-        .env("XDG_CONFIG_HOME", &xdg.config)
-        .output()
-        .expect("failed to run zaz binary")
 }
 
 fn unique_socket_path(temp: &TempDir, label: &str) -> PathBuf {
@@ -176,125 +170,21 @@ command = "sleep 600"
 "#
 }
 
-struct StartedDaemon {
-    current_dir: PathBuf,
-    socket: PathBuf,
-    xdg: XdgDirs,
-    config: PathBuf,
-    stopped: bool,
-}
-
-impl StartedDaemon {
-    fn launch(current_dir: &Path, xdg: &XdgDirs, config: &Path, socket: &Path) -> Self {
-        let log_path = current_dir.join("zaz.log");
-        let args: Vec<&OsStr> = vec![
-            OsStr::new("--config"),
-            config.as_os_str(),
-            OsStr::new("--socket"),
-            socket.as_os_str(),
-            OsStr::new("--log-file"),
-            log_path.as_os_str(),
-            OsStr::new("start"),
-        ];
-        let output = run_zaz(current_dir, xdg, args);
-        if !output.status.success() {
-            let daemon_log = current_dir.join("zaz.daemon-output.log");
-            let daemon_log_contents = std::fs::read_to_string(&daemon_log).unwrap_or_else(|e| {
-                format!("(no daemon-output.log at {}: {e})", daemon_log.display())
-            });
-            panic!(
-                "zaz start exited with {:?}\nstdout: {}\nstderr: {}\ndaemon-output.log:\n{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-                daemon_log_contents,
-            );
-        }
-        Self::wait_for_ready(current_dir, xdg, socket);
-        Self {
-            current_dir: current_dir.to_path_buf(),
-            socket: socket.to_path_buf(),
-            xdg: xdg.clone(),
-            config: config.to_path_buf(),
-            stopped: false,
-        }
-    }
-
-    fn wait_for_ready(current_dir: &Path, xdg: &XdgDirs, socket: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let out = run_zaz(
-                current_dir,
-                xdg,
-                [
-                    OsStr::new("--socket"),
-                    socket.as_os_str(),
-                    OsStr::new("status"),
-                ],
-            );
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if out.status.code() == Some(0) && stdout.contains("Daemon Status:") {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        panic!("daemon did not become ready in time");
-    }
-
-    /// Stop the daemon and wait for the socket file to disappear so a
-    /// subsequent `zaz start` can bind cleanly.
-    fn stop(&mut self) {
-        if self.stopped {
-            return;
-        }
-        let _ = run_zaz(
-            &self.current_dir,
-            &self.xdg,
-            [
-                OsStr::new("--socket"),
-                self.socket.as_os_str(),
-                OsStr::new("stop"),
-            ],
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if !self.socket.exists() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-        self.stopped = true;
-    }
-}
-
-impl Drop for StartedDaemon {
-    fn drop(&mut self) {
-        if !self.stopped {
-            let _ = run_zaz(
-                &self.current_dir,
-                &self.xdg,
-                [
-                    OsStr::new("--socket"),
-                    self.socket.as_os_str(),
-                    OsStr::new("stop"),
-                ],
-            );
-        }
-    }
+fn launch_daemon(current_dir: &Path, xdg: &XdgDirs, config: &Path, socket: &Path) -> StartedDaemon {
+    StartedDaemon::launch_with_envs(current_dir, config, socket, &xdg.as_envs())
 }
 
 /// Stop the daemon, swap the config file in place, and relaunch against the
 /// same socket and config path so the SQLite hash resolves to the same DB.
-fn restart_daemon(guard: StartedDaemon, new_config_body: &str) -> StartedDaemon {
-    let current_dir = guard.current_dir.clone();
-    let xdg = guard.xdg.clone();
-    let config = guard.config.clone();
-    let socket = guard.socket.clone();
+fn restart_daemon(guard: StartedDaemon, xdg: &XdgDirs, new_config_body: &str) -> StartedDaemon {
+    let current_dir = guard.current_dir().to_path_buf();
+    let config = guard.config_path().to_path_buf();
+    let socket = guard.socket_path().to_path_buf();
     let mut guard = guard;
     guard.stop();
     drop(guard);
     write_config(&config, new_config_body);
-    StartedDaemon::launch(&current_dir, &xdg, &config, &socket)
+    launch_daemon(&current_dir, xdg, &config, &socket)
 }
 
 fn spawn_mcp(socket: &Path, cwd: &Path, xdg: &XdgDirs) -> Child {
@@ -531,10 +421,10 @@ fn persisted_logs_survive_daemon_restart() {
     let socket = unique_socket_path(&temp, "persist-restart");
 
     write_config(&config_path, &emitter_config("PRE-LINE", 5));
-    let guard = StartedDaemon::launch(temp.path(), &xdg, &config_path, &socket);
+    let guard = launch_daemon(temp.path(), &xdg, &config_path, &socket);
     await_log_count(&socket, "emitter", "PRE-LINE", 5, Duration::from_secs(10));
 
-    let guard = restart_daemon(guard, quiet_config());
+    let guard = restart_daemon(guard, &xdg, quiet_config());
 
     let api = daemon_get_logs(&socket, "emitter", None, Some(10), Some("PRE-LINE"));
     assert_eq!(api.total_count, Some(5), "daemon API total_count");
@@ -584,10 +474,10 @@ fn paginated_and_search_queries_against_persisted_logs() {
         &emitter_with_needle_config("LINE", 25, &needle_indices),
     );
 
-    let guard = StartedDaemon::launch(temp.path(), &xdg, &config_path, &socket);
+    let guard = launch_daemon(temp.path(), &xdg, &config_path, &socket);
     await_log_count(&socket, "emitter", "LINE-", 25, Duration::from_secs(15));
 
-    let guard = restart_daemon(guard, quiet_config());
+    let guard = restart_daemon(guard, &xdg, quiet_config());
 
     // First page. `search = "LINE-"` scopes assertions to the 25 emitter
     // stdout lines, skipping internal daemon-source entries the engine
@@ -716,11 +606,11 @@ fn process_filter_against_persisted_logs() {
     let socket = unique_socket_path(&temp, "persist-filter");
 
     write_config(&config_path, &two_emitters_config());
-    let guard = StartedDaemon::launch(temp.path(), &xdg, &config_path, &socket);
+    let guard = launch_daemon(temp.path(), &xdg, &config_path, &socket);
     await_log_count(&socket, "emitter-a", "A-LINE-", 3, Duration::from_secs(10));
     await_log_count(&socket, "emitter-b", "B-LINE-", 3, Duration::from_secs(10));
 
-    let guard = restart_daemon(guard, quiet_config());
+    let guard = restart_daemon(guard, &xdg, quiet_config());
 
     let api_a = daemon_get_logs(&socket, "emitter-a", None, Some(20), Some("A-LINE-"));
     assert_eq!(api_a.total_count, Some(3));

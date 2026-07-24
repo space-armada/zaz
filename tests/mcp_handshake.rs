@@ -1,11 +1,10 @@
+mod support;
+
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-fn zaz_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zaz")
-}
+use support::zaz_bin;
 
 const INITIALIZE_REQUEST: &str = concat!(
     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,

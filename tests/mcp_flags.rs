@@ -5,16 +5,15 @@
 //! - default behavior surfaces `DaemonNotRunning` when no daemon is up
 //! - `--autostart` brings a daemon online before tool calls are serviced
 
+mod support;
+
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use support::zaz_bin;
 use tempfile::TempDir;
-
-fn zaz_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zaz")
-}
 
 const INITIALIZE_REQUEST: &str = concat!(
     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,

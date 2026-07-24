@@ -9,6 +9,8 @@
 //! The supervisor is driven through the real `zaz` binary: `zaz start` with 2+
 //! `--config` flags launches it, and `zaz stop --socket <ws>` tears it down.
 
+mod support;
+
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
@@ -17,12 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::zaz_bin;
 use tempfile::TempDir;
 use zaz_daemon::{socket_path_for_config, ApiRequest, ApiResponse, LogLine};
-
-fn zaz_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zaz")
-}
 
 /// A workspace layout under a tempdir: the workspace root holds `.zaz/` but no
 /// config; each member is its own project directory with a `.zaz/` and a config.
