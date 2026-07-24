@@ -11,6 +11,7 @@
 
 mod support;
 
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,11 @@ struct Workspace {
     home: PathBuf,
     root: PathBuf,
     ws_socket: PathBuf,
+    /// Every socket a daemon might be bound to during the test. Recorded so the
+    /// `Drop` teardown can stop each one even when a test panics before its
+    /// explicit cleanup runs. Interior mutability keeps the `&self` builder
+    /// methods and the `let ws = ...` bindings in each test unchanged.
+    sockets: RefCell<Vec<PathBuf>>,
 }
 
 impl Workspace {
@@ -43,6 +49,7 @@ impl Workspace {
             home,
             root,
             ws_socket,
+            sockets: RefCell::new(Vec::new()),
         }
     }
 
@@ -53,6 +60,9 @@ impl Workspace {
         std::fs::create_dir_all(dir.join(".zaz")).expect("member .zaz");
         let config = dir.join("zaz.toml");
         std::fs::write(&config, body).expect("write member config");
+        self.sockets
+            .borrow_mut()
+            .push(socket_path_for_config(&config));
         config
     }
 
@@ -79,6 +89,7 @@ impl Workspace {
     /// independent of the config's own resolved socket. Used to plant a foreign
     /// daemon at a member's socket path.
     fn start_single_at(&self, config: &Path, socket: &Path) -> Output {
+        self.sockets.borrow_mut().push(socket.to_path_buf());
         self.run(&[
             OsStr::new("-c"),
             config.as_os_str(),
@@ -176,6 +187,31 @@ impl Workspace {
             thread::sleep(Duration::from_millis(25));
         }
         false
+    }
+}
+
+impl Drop for Workspace {
+    /// Stop every daemon this workspace may have started, so a panicking test
+    /// never leaks a detached daemon. Each daemon is spawned via `setsid`, so it
+    /// outlives the test process unless it receives an explicit shutdown. The
+    /// struct's own drop runs before its fields, so `root` and `home` are still
+    /// valid here. The supervisor is stopped first; its shutdown tears down the
+    /// members it spawned. Each member socket is then stopped directly, covering
+    /// members started outside the supervisor and the case where the supervisor
+    /// never bound. Every stop is best-effort and idempotent.
+    fn drop(&mut self) {
+        let mut sockets = vec![self.ws_socket.clone()];
+        sockets.extend(self.sockets.borrow().iter().cloned());
+
+        for socket in sockets {
+            let _ = Command::new(zaz_bin())
+                .arg("--socket")
+                .arg(&socket)
+                .arg("stop")
+                .current_dir(&self.root)
+                .env("HOME", &self.home)
+                .output();
+        }
     }
 }
 
