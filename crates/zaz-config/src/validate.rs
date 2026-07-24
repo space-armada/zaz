@@ -101,7 +101,7 @@ fn validate_groups(
         }
 
         // Check for empty patterns (warning-worthy but not an error)
-        if group.patterns.is_empty() && group.tasks.is_empty() && group.daemons.is_empty() {
+        if group.patterns.is_empty() && group.tasks.is_empty() && group.services.is_empty() {
             let mut error = ValidationError::new(ValidationErrorKind::EmptyGroup {
                 name: group.name.clone(),
             });
@@ -294,38 +294,38 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
             task_names.insert(name);
         }
 
-        // Check daemon commands
-        let mut daemon_names: HashSet<&str> = HashSet::new();
-        for daemon in &group.daemons {
-            let name = daemon.name();
-            if daemon.command.is_empty() {
+        // Check service commands
+        let mut service_names: HashSet<&str> = HashSet::new();
+        for service in &group.services {
+            let name = service.name();
+            if service.command.is_empty() {
                 errors.push(ValidationError::new(
-                    ValidationErrorKind::EmptyDaemonCommand {
+                    ValidationErrorKind::EmptyServiceCommand {
                         group: group.name.clone(),
-                        daemon: name.to_string(),
+                        service: name.to_string(),
                     },
                 ));
             }
-            if daemon_names.contains(name) {
-                let mut error = ValidationError::new(ValidationErrorKind::DuplicateDaemonName {
+            if service_names.contains(name) {
+                let mut error = ValidationError::new(ValidationErrorKind::DuplicateServiceName {
                     group: group.name.clone(),
                     name: name.to_string(),
                 });
-                if !daemon.has_explicit_name() {
+                if !service.has_explicit_name() {
                     error = error.with_hint("use explicit 'name' field to disambiguate");
                 }
                 errors.push(error);
             }
-            daemon_names.insert(name);
+            service_names.insert(name);
 
-            // Daemons run wholesale, not per-file. References to file-context
+            // Services run wholesale, not per-file. References to file-context
             // built-ins would silently expand to empty strings at spawn time.
-            for var_name in zaz_vars::references(&daemon.command) {
+            for var_name in zaz_vars::references(&service.command) {
                 if zaz_vars::FILE_CONTEXT_BUILTINS.contains(&var_name) {
                     errors.push(
-                        ValidationError::new(ValidationErrorKind::DaemonCommandFileBuiltin {
+                        ValidationError::new(ValidationErrorKind::ServiceCommandFileBuiltin {
                             group: group.name.clone(),
-                            daemon: name.to_string(),
+                            service: name.to_string(),
                             builtin: var_name.to_string(),
                         })
                         .with_hint(
@@ -341,7 +341,7 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DaemonCommand, Group, TaskCommand};
+    use crate::{Group, ServiceCommand, TaskCommand};
 
     fn make_group(name: &str) -> Group {
         Group {
@@ -611,9 +611,9 @@ mod tests {
     }
 
     #[test]
-    fn test_daemon_command_rejects_file_context_builtins() {
+    fn test_service_command_rejects_file_context_builtins() {
         let mut group = make_group("server");
-        group.daemons = vec![DaemonCommand::new(
+        group.services = vec![ServiceCommand::new(
             "watcher",
             "./bin/handler --files ${zaz:files}",
         )];
@@ -629,8 +629,8 @@ mod tests {
             msg
         );
         assert!(
-            msg.contains("daemon 'watcher'"),
-            "expected daemon name in error, got: {}",
+            msg.contains("service 'watcher'"),
+            "expected service name in error, got: {}",
             msg
         );
         assert!(
@@ -641,9 +641,9 @@ mod tests {
     }
 
     #[test]
-    fn test_daemon_command_allows_user_variables_and_root() {
+    fn test_service_command_allows_user_variables_and_root() {
         let mut group = make_group("server");
-        group.daemons = vec![DaemonCommand::new(
+        group.services = vec![ServiceCommand::new(
             "watcher",
             "./bin/handler --root ${zaz:root} --lexicon ${lexicon}",
         )];
@@ -651,13 +651,13 @@ mod tests {
             groups: vec![group],
             ..Default::default()
         };
-        validate(&config).expect("user vars and ${zaz:root} must be allowed in daemon commands");
+        validate(&config).expect("user vars and ${zaz:root} must be allowed in service commands");
     }
 
     #[test]
-    fn test_daemon_command_allows_escaped_file_builtin() {
+    fn test_service_command_allows_escaped_file_builtin() {
         let mut group = make_group("server");
-        group.daemons = vec![DaemonCommand::new(
+        group.services = vec![ServiceCommand::new(
             "watcher",
             r"./bin/handler --files \${zaz:files}",
         )];
@@ -665,7 +665,7 @@ mod tests {
             groups: vec![group],
             ..Default::default()
         };
-        validate(&config).expect("escaped ${zaz:files} must be allowed in daemon commands");
+        validate(&config).expect("escaped ${zaz:files} must be allowed in service commands");
     }
 
     #[test]

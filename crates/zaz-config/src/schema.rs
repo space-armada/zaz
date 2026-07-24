@@ -174,7 +174,7 @@ pub enum LogFormat {
     Json,
 }
 
-/// Log suppression level for tasks and daemons.
+/// Log suppression level for tasks and services.
 ///
 /// Controls which output streams are suppressed in the TUI.
 /// Suppressed output is still captured for API/debugging purposes.
@@ -219,9 +219,9 @@ pub struct Group {
     #[serde(alias = "task")]
     pub tasks: Vec<TaskCommand>,
 
-    /// Daemon commands (long-running).
-    #[serde(alias = "daemon")]
-    pub daemons: Vec<DaemonCommand>,
+    /// Service commands (long-running).
+    #[serde(alias = "service", alias = "daemon", alias = "daemons")]
+    pub services: Vec<ServiceCommand>,
 }
 
 /// A task command that runs to completion.
@@ -309,11 +309,11 @@ fn derive_name(command: &str) -> &str {
     command[..end].trim()
 }
 
-/// A daemon command that runs continuously.
+/// A service command that runs continuously.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DaemonCommand {
-    /// Display name for this daemon (derived from command if not set).
+pub struct ServiceCommand {
+    /// Display name for this service (derived from command if not set).
     #[serde(default)]
     name: Option<String>,
 
@@ -333,23 +333,23 @@ pub struct DaemonCommand {
     #[serde(default)]
     pub silence: Silence,
 
-    /// Working directory for this daemon (overrides group working_dir).
+    /// Working directory for this service (overrides group working_dir).
     #[serde(default)]
     pub working_dir: Option<String>,
 
-    /// Delay before starting the daemon (after tasks complete).
+    /// Delay before starting the service (after tasks complete).
     /// Accepts human-readable strings ("500ms", "2s") or integer milliseconds.
     /// This is different from `debounce` which controls file change batching.
     #[serde(default, alias = "delay_ms")]
     pub delay: Option<HumanDuration>,
 
-    /// Environment variables for this daemon (merged with group env).
+    /// Environment variables for this service (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
 }
 
-impl DaemonCommand {
-    /// Create a new daemon command with explicit name.
+impl ServiceCommand {
+    /// Create a new service command with explicit name.
     pub fn new(name: impl Into<String>, command: impl Into<String>) -> Self {
         Self {
             name: Some(name.into()),
@@ -363,7 +363,7 @@ impl DaemonCommand {
         }
     }
 
-    /// Create a daemon command where name is derived from command.
+    /// Create a service command where name is derived from command.
     pub fn from_command(command: impl Into<String>) -> Self {
         Self {
             name: None,
@@ -384,7 +384,7 @@ impl DaemonCommand {
             .unwrap_or_else(|| derive_name(&self.command))
     }
 
-    /// Returns true if this daemon has an explicitly set name.
+    /// Returns true if this service has an explicitly set name.
     pub fn has_explicit_name(&self) -> bool {
         self.name.is_some()
     }

@@ -7,7 +7,7 @@ preferences, see [user-configuration.md](user-configuration.md).
 ## Overview
 
 A project config is committed alongside the project it controls. It declares
-the watch groups, tasks, daemons, and global settings that zaz will operate
+the watch groups, tasks, services, and global settings that zaz will operate
 on. TOML and JSON forms describe the same schema; the only differences are
 the table syntax and a small set of singular/plural aliases listed below.
 
@@ -52,7 +52,7 @@ same internal schema; either spelling is accepted in either format.
 |-----------------|---------------|---------------|
 | `[[group]]` | `"groups"` | Watch groups. |
 | `[[group.task]]` | `"tasks"` | Run-to-completion tasks within a group. |
-| `[[group.daemon]]` | `"daemons"` | Long-running daemons within a group. |
+| `[[group.service]]` | `"services"` | Long-running services within a group. |
 
 ## `[settings]`
 
@@ -60,7 +60,7 @@ Global settings that apply to the whole config.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
-| `shell` | string | unset | Shell used to run task/daemon commands. Falls back to `$SHELL` when unset. |
+| `shell` | string | unset | Shell used to run task/service commands. Falls back to `$SHELL` when unset. |
 | `debounce` | duration | `100ms` | File-change batching window. Alias: `debounce_ms`. |
 | `log_format` | enum | `pretty` | Log output format. See [`log_format`](#log_format) below. |
 
@@ -76,7 +76,7 @@ log_format = "json"
 ## `[variables]`
 
 User-defined string variables for `${var}` substitution inside any task or
-daemon `command` (and inside group-level `working_dir` / `env` values).
+service `command` (and inside group-level `working_dir` / `env` values).
 
 ```toml
 [variables]
@@ -118,7 +118,7 @@ it's mine      -> 'it'\''s mine'
 
 ## Groups (`[[group]]`)
 
-A group pairs a set of file patterns with the tasks and daemons that
+A group pairs a set of file patterns with the tasks and services that
 should react when those files change.
 
 | Field | Type | Default | Notes |
@@ -127,12 +127,12 @@ should react when those files change.
 | `patterns` | array of glob | empty | Globs that select files to watch. |
 | `ignore` | array of glob | empty | Globs that exclude files from `patterns`. |
 | `depends_on` | array of string | empty | Names of other groups that must finish before this one runs. |
-| `working_dir` | string | unset | CWD for tasks/daemons; defaults to the config file's directory. |
-| `env` | table | empty | Environment variables merged into every task and daemon in the group. |
+| `working_dir` | string | unset | CWD for tasks/services; defaults to the config file's directory. |
+| `env` | table | empty | Environment variables merged into every task and service in the group. |
 | `tasks` | array | empty | See [Tasks](#tasks-grouptask). TOML alias: `[[group.task]]`. |
-| `daemons` | array | empty | See [Daemons](#daemons-groupdaemon). TOML alias: `[[group.daemon]]`. |
+| `services` | array | empty | See [Services](#services-groupservice). TOML alias: `[[group.service]]`. |
 
-A group with no `patterns`, no `tasks`, and no `daemons` is rejected by
+A group with no `patterns`, no `tasks`, and no `services` is rejected by
 validation as empty.
 
 ```toml
@@ -164,10 +164,14 @@ and `cargo -V` both derive to `cargo` and would collide. The
 duplicate-task-name validator detects this and points at the
 `name` field as a fix.
 
-## Daemons (`[[group.daemon]]`)
+## Services (`[[group.service]]`)
 
-Daemons are long-running processes that zaz keeps alive and restarts on
+Services are long-running processes that zaz keeps alive and restarts on
 relevant file changes.
+
+The TOML table `[[group.daemon]]` and the JSON `daemons` key are accepted as
+deprecated aliases for backwards compatibility. New configs should use
+`[[group.service]]`.
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
@@ -177,11 +181,11 @@ relevant file changes.
 | `no_pty` | bool | `false` | Disable PTY allocation. PTY is on by default so tools like `tailwind --watch` work. |
 | `silence` | enum | `none` | TUI suppression level. See [`Silence`](#silence). |
 | `delay` | duration | unset | Wait this long after preceding tasks before starting. Alias: `delay_ms`. |
-| `working_dir` | string | inherits | Overrides the group's `working_dir` for this daemon. |
-| `env` | table | empty | Per-daemon variables; merged on top of the group's `env`. |
+| `working_dir` | string | inherits | Overrides the group's `working_dir` for this service. |
+| `env` | table | empty | Per-service variables; merged on top of the group's `env`. |
 
 ```toml
-[[group.daemon]]
+[[group.service]]
 name = "server"
 command = "./bin/server"
 signal = "SIGUSR2"
@@ -205,7 +209,7 @@ still captured for the API and for log files.
 
 ### `Signal`
 
-Signal names are serialized in uppercase. The default for daemon restart
+Signal names are serialized in uppercase. The default for service restart
 is `SIGTERM`.
 
 | Value | Notes |
@@ -262,13 +266,13 @@ human message.
 | Invalid glob in `ignore` | `group '{name}': invalid ignore pattern '{p}': {err}` |
 | Empty task command | `group '{g}': task '{n}' has empty command` |
 | Duplicate task name | `group '{g}': duplicate task name '{n}'` |
-| Empty daemon command | `group '{g}': daemon '{n}' has empty command` |
-| Duplicate daemon name | `group '{g}': duplicate daemon name '{n}'` |
+| Empty service command | `group '{g}': service '{n}' has empty command` |
+| Duplicate service name | `group '{g}': duplicate service name '{n}'` |
 
 Unknown-dependency errors include a "did you mean '{x}'?" hint when a
 group name within Levenshtein distance 2 exists, otherwise an
 `available groups are: ...` hint listing up to four candidates.
-Duplicate-task and duplicate-daemon errors append
+Duplicate-task and duplicate-service errors append
 `(use explicit 'name' field to disambiguate)` when the duplicate came
 from name derivation rather than an explicit `name = "..."`.
 

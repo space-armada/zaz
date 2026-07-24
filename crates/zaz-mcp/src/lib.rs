@@ -11,7 +11,7 @@ mod types;
 pub use error::McpError;
 pub use server::{run, McpRunOptions, ZazMcpServer};
 pub use types::{
-    ConfigDaemon, ConfigGroup, ConfigReport, ConfigSettings, ConfigTask, DaemonStatusReport,
+    ConfigGroup, ConfigReport, ConfigService, ConfigSettings, ConfigTask, DaemonStatusReport,
     GroupReport, GroupStatusReport, GroupSummary, GroupsReport, LogEntry, LogFormatReport,
     LogSourceReport, LogsReport, LogsRequest, MutationReport, OutputKindReport, ProcessKind,
     ProcessReport, ProcessStatusReport, RestartGroupRequest, RestartProcessRequest, SignalReport,

@@ -9,20 +9,17 @@
 //! The supervisor is driven through the real `zaz` binary: `zaz start` with 2+
 //! `--config` flags launches it, and `zaz stop --socket <ws>` tears it down.
 
+mod support;
+
 use std::ffi::OsStr;
-use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::{await_log_lines, get_logs_response, zaz_bin};
 use tempfile::TempDir;
-use zaz_daemon::{socket_path_for_config, ApiRequest, ApiResponse, LogLine};
-
-fn zaz_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zaz")
-}
+use zaz_daemon::{socket_path_for_config, ApiResponse};
 
 /// A workspace layout under a tempdir: the workspace root holds `.zaz/` but no
 /// config; each member is its own project directory with a `.zaz/` and a config.
@@ -376,7 +373,7 @@ fn member_dir_command_reaches_member_daemon() {
     assert!(status.status.success(), "member-dir status failed");
     let stdout = String::from_utf8_lossy(&status.stdout);
     assert!(
-        stdout.contains("[daemon] d"),
+        stdout.contains("[service] d"),
         "member-dir status should report the member engine state, got: {stdout}"
     );
 
@@ -691,63 +688,6 @@ command = "echo {marker}; sleep 600"
     )
 }
 
-/// Send a `GetLogs` to `socket` with an optional project token, returning the raw
-/// `ApiResponse` so callers can assert on `Logs` or `Error`.
-fn get_logs(socket: &Path, project: Option<&str>, name: &str, search: Option<&str>) -> ApiResponse {
-    let request = ApiRequest::GetLogs {
-        name: name.to_string(),
-        project: project.map(str::to_string),
-        lines: None,
-        offset: None,
-        limit: Some(1024),
-        search: search.map(str::to_string),
-    };
-    let mut stream = UnixStream::connect(socket).expect("connect socket");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set read timeout");
-    let mut payload = serde_json::to_string(&request).expect("serialize request");
-    payload.push('\n');
-    stream.write_all(payload.as_bytes()).expect("write request");
-    let mut response = String::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = stream.read(&mut buf).expect("read response");
-        if n == 0 {
-            break;
-        }
-        response.push_str(std::str::from_utf8(&buf[..n]).expect("utf-8"));
-        if response.contains('\n') {
-            break;
-        }
-    }
-    serde_json::from_str(response.trim_end_matches('\n')).expect("parse ApiResponse")
-}
-
-/// The `Logs` lines of a response, panicking on any other variant.
-fn logs_lines(response: ApiResponse) -> Vec<LogLine> {
-    match response {
-        ApiResponse::Logs { lines, .. } => lines,
-        other => panic!("expected Logs, got {other:?}"),
-    }
-}
-
-/// Poll the supervisor for `project`'s logs until a line containing `marker`
-/// appears or the deadline trips.
-fn await_marker(socket: &Path, project: &str, marker: &str, timeout: Duration) -> Vec<LogLine> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let lines = logs_lines(get_logs(socket, Some(project), "*", Some(marker)));
-        if lines.iter().any(|l| l.content.contains(marker)) {
-            return lines;
-        }
-        if Instant::now() >= deadline {
-            return lines;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
 #[test]
 fn workspace_status_merges_members_under_qualified_names() {
     let ws = Workspace::new();
@@ -769,7 +709,7 @@ fn workspace_status_merges_members_under_qualified_names() {
         "status should merge groups under project/group: {stdout}"
     );
     assert!(
-        stdout.contains("[daemon] d"),
+        stdout.contains("[service] d"),
         "merged status should carry each member's processes: {stdout}"
     );
 
@@ -824,7 +764,14 @@ fn workspace_logs_scope_to_one_member() {
     assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
     assert!(ws.wait_running(&b_sock, Duration::from_secs(10)));
 
-    let a_lines = await_marker(&ws.ws_socket, "a", "MARK-A", Duration::from_secs(10));
+    let a_lines = await_log_lines(
+        &ws.ws_socket,
+        Some("a"),
+        "*",
+        "MARK-A",
+        1,
+        Duration::from_secs(10),
+    );
     assert!(
         a_lines.iter().any(|l| l.content.contains("MARK-A")),
         "project a should return its own line"
@@ -834,7 +781,14 @@ fn workspace_logs_scope_to_one_member() {
         "project a must not surface b's rows"
     );
 
-    let b_lines = await_marker(&ws.ws_socket, "b", "MARK-B", Duration::from_secs(10));
+    let b_lines = await_log_lines(
+        &ws.ws_socket,
+        Some("b"),
+        "*",
+        "MARK-B",
+        1,
+        Duration::from_secs(10),
+    );
     assert!(
         b_lines.iter().any(|l| l.content.contains("MARK-B")),
         "project b should return its own line"
@@ -858,7 +812,7 @@ fn workspace_logs_without_project_are_rejected() {
     assert!(ws.start_workspace(&[&a, &b]).status.success());
     assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
 
-    let response = get_logs(&ws.ws_socket, None, "*", None);
+    let response = get_logs_response(&ws.ws_socket, None, "*", None, Some(1024), None);
     match response {
         ApiResponse::Error { message } => assert!(
             message.contains("requires a project"),

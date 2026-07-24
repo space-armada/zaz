@@ -270,7 +270,7 @@ impl App {
         self.state
             .groups
             .values()
-            .map(|g| g.tasks.len() + g.daemons.len())
+            .map(|g| g.tasks.len() + g.services.len())
             .sum()
     }
 
@@ -423,8 +423,8 @@ impl App {
                     for task in &group.tasks {
                         processes.push(task.name.clone());
                     }
-                    for daemon in &group.daemons {
-                        processes.push(daemon.name.clone());
+                    for service in &group.services {
+                        processes.push(service.name.clone());
                     }
                 }
 

@@ -253,12 +253,12 @@ impl StyleRenderer for FullStyle {
                 idx += 1;
             }
 
-            // Check daemons
-            for daemon in &group.daemons {
+            // Check services
+            for service in &group.services {
                 if app.selected_item == idx {
                     return Some(SelectedProcess {
                         group: group.name.clone(),
-                        process: daemon.name.clone(),
+                        process: service.name.clone(),
                         is_group: false,
                     });
                 }
@@ -297,13 +297,13 @@ impl FullStyle {
                 max_width = max_width.max(task_width);
             }
 
-            for daemon in &group.daemons {
-                let suffix_len = daemon
+            for service in &group.services {
+                let suffix_len = service
                     .pid
                     .map(|p| format!(" (pid {})", p).len())
                     .unwrap_or(0);
-                let daemon_width = 10 + daemon.name.len() + suffix_len;
-                max_width = max_width.max(daemon_width);
+                let service_width = 10 + service.name.len() + suffix_len;
+                max_width = max_width.max(service_width);
             }
         }
 
@@ -368,7 +368,7 @@ impl FullStyle {
         app.state
             .groups
             .values()
-            .map(|g| 1 + g.tasks.len() + g.daemons.len())
+            .map(|g| 1 + g.tasks.len() + g.services.len())
             .sum()
     }
 
@@ -439,8 +439,8 @@ impl FullStyle {
                 ),
             ])));
 
-            // Tasks and daemons
-            let total_children = group.tasks.len() + group.daemons.len();
+            // Tasks and services
+            let total_children = group.tasks.len() + group.services.len();
             let mut child_idx = 0;
 
             for task in &group.tasks {
@@ -505,14 +505,14 @@ impl FullStyle {
                 ])));
             }
 
-            for daemon in &group.daemons {
+            for service in &group.services {
                 child_idx += 1;
                 let is_last = child_idx == total_children;
                 let tree_branch = if is_last { "└─" } else { "├─" };
                 let is_selected = flat_idx == app.selected_item;
                 flat_idx += 1;
 
-                let daemon_icon = match daemon.status {
+                let service_icon = match service.status {
                     zaz_daemon::ProcessStatus::Pending => "○",
                     zaz_daemon::ProcessStatus::Running => {
                         if app.blink_on() {
@@ -526,7 +526,7 @@ impl FullStyle {
                     zaz_daemon::ProcessStatus::Backoff => "⟳",
                 };
 
-                let daemon_color = match daemon.status {
+                let service_color = match service.status {
                     zaz_daemon::ProcessStatus::Pending => Color::DarkGray,
                     zaz_daemon::ProcessStatus::Running => Color::Yellow,
                     zaz_daemon::ProcessStatus::Success => Color::Green,
@@ -534,8 +534,8 @@ impl FullStyle {
                     zaz_daemon::ProcessStatus::Backoff => Color::Yellow,
                 };
 
-                let suffix = match daemon.status {
-                    zaz_daemon::ProcessStatus::Running => daemon
+                let suffix = match service.status {
+                    zaz_daemon::ProcessStatus::Running => service
                         .pid
                         .map(|p| format!(" (pid {})", p))
                         .unwrap_or_default(),
@@ -556,10 +556,10 @@ impl FullStyle {
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(
-                        format!("[{}] ", daemon_icon),
-                        Style::default().fg(daemon_color),
+                        format!("[{}] ", service_icon),
+                        Style::default().fg(service_color),
                     ),
-                    Span::styled(&daemon.name, name_style),
+                    Span::styled(&service.name, name_style),
                     Span::styled(suffix, Style::default().fg(Color::DarkGray)),
                 ])));
             }

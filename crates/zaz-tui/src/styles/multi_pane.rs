@@ -470,11 +470,11 @@ impl MultiPaneStyle {
                     pid: None,
                 });
             }
-            for daemon in &group.daemons {
+            for service in &group.services {
                 processes.push(ProcessInfo {
-                    name: daemon.name.clone(),
+                    name: service.name.clone(),
                     group: group_name.clone(),
-                    status: match daemon.status {
+                    status: match service.status {
                         zaz_daemon::ProcessStatus::Pending => ProcessStatus::Pending,
                         zaz_daemon::ProcessStatus::Running => ProcessStatus::Running,
                         zaz_daemon::ProcessStatus::Success => ProcessStatus::Ready,
@@ -483,7 +483,7 @@ impl MultiPaneStyle {
                     },
                     kind: ProcessKind::Daemon,
                     duration_ms: None,
-                    pid: daemon.pid,
+                    pid: service.pid,
                 });
             }
         }

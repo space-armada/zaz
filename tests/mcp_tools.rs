@@ -5,18 +5,17 @@
 //! the structured response. The daemon is torn down by an RAII guard so a
 //! failed assertion does not leak processes.
 
+mod support;
+
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::{zaz_bin, StartedDaemon};
 use tempfile::TempDir;
 use zaz_mcp::{ConfigReport, GroupsReport, LogsReport, MutationReport, StatusReport};
-
-fn zaz_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zaz")
-}
 
 const INITIALIZE_REQUEST: &str = concat!(
     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
@@ -29,14 +28,6 @@ const INITIALIZED_NOTIFICATION: &str = concat!(
     r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
     "\n",
 );
-
-fn run_zaz(current_dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(zaz_bin())
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .expect("failed to run zaz binary")
-}
 
 fn write_test_config(temp: &TempDir) -> PathBuf {
     let config_path = temp.path().join("zaz.toml");
@@ -66,66 +57,6 @@ fn unique_socket_path(temp: &TempDir, label: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     temp.path().join(format!("{label}-{nanos}.sock"))
-}
-
-struct StartedDaemon<'a> {
-    current_dir: &'a Path,
-    socket: String,
-}
-
-impl<'a> StartedDaemon<'a> {
-    fn launch(current_dir: &'a Path, config_path: &Path, socket_path: &Path) -> Self {
-        let log_path = current_dir.join("zaz.log");
-        let socket = socket_path
-            .to_str()
-            .expect("socket path should be utf-8")
-            .to_string();
-        let output = run_zaz(
-            current_dir,
-            &[
-                "--config",
-                config_path.to_str().expect("config path should be utf-8"),
-                "--socket",
-                &socket,
-                "--log-file",
-                log_path.to_str().expect("log path should be utf-8"),
-                "start",
-            ],
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "zaz start exited with {:?}\nstdout: {stdout}\nstderr: {stderr}",
-            output.status.code()
-        );
-        Self::wait_for_ready(current_dir, socket_path);
-
-        Self {
-            current_dir,
-            socket,
-        }
-    }
-
-    fn wait_for_ready(current_dir: &Path, socket_path: &Path) {
-        let socket = socket_path.to_str().expect("socket path should be utf-8");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let output = run_zaz(current_dir, &["--socket", socket, "status"]);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if output.status.code() == Some(0) && stdout.contains("Daemon Status:") {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        panic!("daemon did not become ready in time");
-    }
-}
-
-impl Drop for StartedDaemon<'_> {
-    fn drop(&mut self) {
-        let _ = run_zaz(self.current_dir, &["--socket", &self.socket, "stop"]);
-    }
 }
 
 fn spawn_mcp(socket_str: &str, cwd: &Path) -> Child {
@@ -272,7 +203,7 @@ fn mcp_zaz_list_groups_returns_summary() {
     let group = &report.groups[0];
     assert_eq!(group.name, "backend");
     assert_eq!(group.task_count, 1, "task_count mismatch: {group:?}");
-    assert_eq!(group.daemon_count, 1, "daemon_count mismatch: {group:?}");
+    assert_eq!(group.service_count, 1, "service_count mismatch: {group:?}");
 }
 
 #[test]
@@ -310,8 +241,8 @@ fn mcp_zaz_config_returns_parsed_config() {
     assert_eq!(group.name, "backend");
     assert_eq!(group.tasks.len(), 1);
     assert_eq!(group.tasks[0].name, "noop");
-    assert_eq!(group.daemons.len(), 1);
-    assert_eq!(group.daemons[0].name, "sleeper");
+    assert_eq!(group.services.len(), 1);
+    assert_eq!(group.services[0].name, "sleeper");
 }
 
 #[test]

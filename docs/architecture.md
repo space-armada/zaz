@@ -48,7 +48,7 @@ supports explicit `depends_on` declarations between groups.
 | **Stdin handling** | PTY allocation by default (`no_pty = true` to disable) |
 | **Dependencies** | Named groups with `depends_on = ["group_name"]` |
 | **Config validation** | `deny_unknown_fields` to catch typos |
-| **Command naming** | "task" for run-to-completion, "daemon" for long-running |
+| **Command naming** | "task" for run-to-completion, "service" for long-running |
 
 ## Component Architecture
 
@@ -70,7 +70,7 @@ regardless of mode:
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
 │  │   Config    │  │    File     │  │    Process Manager      │ │
 │  │   Parser    │  │   Watcher   │  │  ┌─────┐ ┌─────┐       │ │
-│  │ (TOML/JSON) │  │  (notify)   │  │  │Prep │ │Daemon│ ...   │ │
+│  │ (TOML/JSON) │  │  (notify)   │  │  │Prep │ │Service│ ...  │ │
 │  └─────────────┘  └─────────────┘  │  └─────┘ └─────┘       │ │
 │                                     └─────────────────────────┘ │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
@@ -89,7 +89,7 @@ them, leaving the single-config path byte-for-byte unchanged.
 1. **Config Parser** - Loads TOML/JSON, validates, provides typed config
 2. **File Watcher** - Monitors filesystem, batches events, filters by patterns
 3. **Variable System** - Expands `${zaz:files}`, `${zaz:dirs}`, custom variables
-4. **Process Manager** - Runs tasks/daemons, handles signals, manages PTYs
+4. **Process Manager** - Runs tasks/services, handles signals, manages PTYs
 5. **Log Manager** - Captures output per-process, supports filtering
 6. **API Server** - Unix socket for IPC, allows external tooling integration
 7. **TUI** - Ratatui-based interface with keyboard shortcuts

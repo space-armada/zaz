@@ -1,10 +1,10 @@
-//! Daemon process management.
+//! Service process management.
 
 use crate::pty::ManagedChild;
 use crate::{Executor, ProcessError, SignalHandler};
 use nix::sys::signal::Signal;
 use std::time::{Duration, Instant};
-use zaz_config::DaemonCommand;
+use zaz_config::ServiceCommand;
 
 /// Minimum restart delay.
 const MIN_RESTART_DELAY: Duration = Duration::from_millis(500);
@@ -15,18 +15,18 @@ const MAX_RESTART_DELAY: Duration = Duration::from_secs(8);
 /// Multiplier for exponential backoff.
 const BACKOFF_MULTIPLIER: u32 = 2;
 
-/// Information about a daemon that has exited.
+/// Information about a service that has exited.
 #[derive(Debug)]
-pub struct DaemonExitInfo {
-    /// How long the daemon was running before it exited.
+pub struct ServiceExitInfo {
+    /// How long the service was running before it exited.
     pub duration: Duration,
     /// The exit code, if available.
     pub exit_code: Option<i32>,
 }
 
-/// State of a daemon process.
+/// State of a service process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DaemonState {
+pub enum ServiceState {
     /// Not yet started.
     Stopped,
 
@@ -40,30 +40,30 @@ pub enum DaemonState {
     Stopping,
 }
 
-/// Manages a long-running daemon process.
-pub struct Daemon {
-    config: DaemonCommand,
+/// Manages a long-running service process.
+pub struct Service {
+    config: ServiceCommand,
     executor: Executor,
     child: Option<ManagedChild>,
-    state: DaemonState,
+    state: ServiceState,
     restart_delay: Duration,
     last_start: Option<Instant>,
 }
 
-impl Daemon {
-    /// Create a new daemon manager.
-    pub fn new(config: DaemonCommand, executor: Executor) -> Self {
+impl Service {
+    /// Create a new service manager.
+    pub fn new(config: ServiceCommand, executor: Executor) -> Self {
         Self {
             config,
             executor,
             child: None,
-            state: DaemonState::Stopped,
+            state: ServiceState::Stopped,
             restart_delay: MIN_RESTART_DELAY,
             last_start: None,
         }
     }
 
-    /// Get the daemon name.
+    /// Get the service name.
     pub fn name(&self) -> &str {
         self.config.name()
     }
@@ -74,7 +74,7 @@ impl Daemon {
     }
 
     /// Get the current state.
-    pub fn state(&self) -> DaemonState {
+    pub fn state(&self) -> ServiceState {
         self.state
     }
 
@@ -83,26 +83,26 @@ impl Daemon {
         self.child.as_ref().and_then(|c| c.id())
     }
 
-    /// Start the daemon with the given fully expanded command.
+    /// Start the service with the given fully expanded command.
     ///
-    /// Variable expansion happens at the caller layer so the daemon does not
+    /// Variable expansion happens at the caller layer so the service does not
     /// need to know about `zaz_vars` or the engine's expansion context.
     pub fn start(&mut self, command: &str) -> Result<(), ProcessError> {
-        if self.state == DaemonState::Running {
+        if self.state == ServiceState::Running {
             return Ok(());
         }
 
-        tracing::info!(name = %self.config.name(), "starting daemon");
+        tracing::info!(name = %self.config.name(), "starting service");
 
         let child = self.executor.spawn(command, !self.config.no_pty)?;
         self.child = Some(child);
-        self.state = DaemonState::Running;
+        self.state = ServiceState::Running;
         self.last_start = Some(Instant::now());
 
         Ok(())
     }
 
-    /// Send restart signal to the daemon.
+    /// Send restart signal to the service.
     pub fn signal_restart(&mut self) -> Result<(), ProcessError> {
         if let Some(child) = &self.child {
             if let Some(pid) = child.id() {
@@ -119,13 +119,13 @@ impl Daemon {
         Ok(())
     }
 
-    /// Stop the daemon gracefully (SIGTERM).
+    /// Stop the service gracefully (SIGTERM).
     pub fn stop(&mut self) -> Result<(), ProcessError> {
-        self.state = DaemonState::Stopping;
+        self.state = ServiceState::Stopping;
 
         if let Some(child) = &self.child {
             if let Some(pid) = child.id() {
-                tracing::info!(name = %self.config.name(), pid = pid, "stopping daemon");
+                tracing::info!(name = %self.config.name(), pid = pid, "stopping service");
                 SignalHandler::send_to_group(pid as i32, Signal::SIGTERM)?;
             }
         }
@@ -133,20 +133,20 @@ impl Daemon {
         Ok(())
     }
 
-    /// Force kill the daemon (SIGKILL).
+    /// Force kill the service (SIGKILL).
     pub fn kill(&mut self) -> Result<(), ProcessError> {
         if let Some(child) = &self.child {
             if let Some(pid) = child.id() {
-                tracing::warn!(name = %self.config.name(), pid = pid, "force killing daemon");
+                tracing::warn!(name = %self.config.name(), pid = pid, "force killing service");
                 SignalHandler::send_to_group(pid as i32, Signal::SIGKILL)?;
             }
         }
         self.child = None;
-        self.state = DaemonState::Stopped;
+        self.state = ServiceState::Stopped;
         Ok(())
     }
 
-    /// Check if the daemon is still running.
+    /// Check if the service is still running.
     pub fn is_running(&mut self) -> bool {
         let Some(child) = &mut self.child else {
             return false;
@@ -155,10 +155,10 @@ impl Daemon {
         matches!(child.try_wait(), Ok(None))
     }
 
-    /// Check if the daemon has exited and handle restart logic.
+    /// Check if the service has exited and handle restart logic.
     ///
-    /// Returns `Some(DaemonExitInfo)` if the daemon has exited, `None` if still running.
-    pub async fn check(&mut self) -> Result<Option<DaemonExitInfo>, ProcessError> {
+    /// Returns `Some(ServiceExitInfo)` if the service has exited, `None` if still running.
+    pub async fn check(&mut self) -> Result<Option<ServiceExitInfo>, ProcessError> {
         let Some(child) = &mut self.child else {
             return Ok(None);
         };
@@ -184,12 +184,12 @@ impl Daemon {
                     name = %self.config.name(),
                     status = ?status,
                     next_delay = ?self.restart_delay,
-                    "daemon exited"
+                    "service exited"
                 );
 
                 self.child = None;
-                self.state = DaemonState::Stopped;
-                Ok(Some(DaemonExitInfo {
+                self.state = ServiceState::Stopped;
+                Ok(Some(ServiceExitInfo {
                     duration,
                     exit_code: status.code(),
                 }))
@@ -204,7 +204,7 @@ impl Daemon {
         self.restart_delay
     }
 
-    /// Get the startup delay configured for this daemon.
+    /// Get the startup delay configured for this service.
     /// Returns None if no delay is configured.
     pub fn startup_delay(&self) -> Option<Duration> {
         self.config.delay.map(|d| d.as_duration())
@@ -213,13 +213,13 @@ impl Daemon {
     /// Get a reader for PTY output, if available.
     ///
     /// Returns None if:
-    /// - The daemon is not running
-    /// - The daemon is not using a PTY
+    /// - The service is not running
+    /// - The service is not using a PTY
     pub fn try_clone_reader(&self) -> Option<Box<dyn std::io::Read + Send>> {
         self.child.as_ref().and_then(|c| c.try_clone_reader())
     }
 
-    /// Check if this daemon uses a PTY.
+    /// Check if this service uses a PTY.
     pub fn is_pty(&self) -> bool {
         self.child.as_ref().map(|c| c.is_pty()).unwrap_or(false)
     }

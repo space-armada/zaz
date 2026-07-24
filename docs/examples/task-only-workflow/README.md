@@ -1,6 +1,6 @@
 # Task-only workflow
 
-A lint-and-test loop with no daemons. Useful as a local pre-commit check
+A lint-and-test loop with no services. Useful as a local pre-commit check
 or as the body of a CI job invoked through `zaz check` and `zaz task`.
 
 `silence = "stdout"` keeps the noisy passing output off the TUI; the full
@@ -9,7 +9,7 @@ unix-socket API.
 
 ## Features used
 
-- A group with `tasks` and no `daemons`.
+- A group with `tasks` and no `services`.
 - Per-task `silence` to control TUI noise without losing the underlying
   log capture.
 - Tasks declared as TOML array-of-tables so the order matches the

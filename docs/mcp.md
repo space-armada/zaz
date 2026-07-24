@@ -29,11 +29,11 @@ written to stderr or to `--log-file`. Never redirect stdout when invoking
 | Tool | Args | Purpose |
 |------|------|---------|
 | `zaz_status` | (none) | Daemon state, all groups and processes (pid, exit code, duration). |
-| `zaz_list_groups` | (none) | Slim group listing: name, status, task and daemon counts. |
+| `zaz_list_groups` | (none) | Slim group listing: name, status, task and service counts. |
 | `zaz_logs` | `name?`, `offset?`, `limit?`, `search?` | Paginated log lines for one process, or `*` for all. |
-| `zaz_config` | (none) | Parsed config: settings, variables, groups, tasks, daemons. |
+| `zaz_config` | (none) | Parsed config: settings, variables, groups, tasks, services. |
 | `zaz_restart_group` | `name` | Restart every process in one group. |
-| `zaz_restart_process` | `group`, `process` | Restart a single task or daemon. |
+| `zaz_restart_process` | `group`, `process` | Restart a single task or service. |
 | `zaz_restart_all` | (none) | Restart every group, respecting `depends_on`. |
 | `zaz_reload_config` | (none) | Re-read `zaz.toml`/`zaz.json` from disk and apply diffs. |
 

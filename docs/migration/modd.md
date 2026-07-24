@@ -3,7 +3,7 @@
 A guide for converting [modd](https://github.com/cortesi/modd) configs to
 zaz. zaz cites modd as direct inspiration; phase 9 implemented the
 parity features (`silence`, per-command `working_dir`, `delay`,
-per-group/task/daemon `env`) that the trickier conversions rely on. The
+per-group/task/service `env`) that the trickier conversions rely on. The
 guide below walks every modd directive that has a zaz equivalent and ends
 with a [Behavioral differences](#behavioral-differences) section
 covering the cases where translation changes runtime semantics.
@@ -20,10 +20,10 @@ The Complete example at the bottom converts to
 | `prep:` | `[[group.task]]` |
 | `prep +onchange:` | task with `on_change_only = true` |
 | `prep +silent:` | task with `silence = "all"` |
-| `daemon:` | `[[group.daemon]]` |
-| `daemon +sigterm:` (or other `+sig*`) | daemon with `signal = "SIGTERM"` |
-| `daemon -delay 500ms:` | daemon with `delay = "500ms"` |
-| `indir:` | group or per-task/daemon `working_dir` |
+| `daemon:` | `[[group.service]]` |
+| `daemon +sigterm:` (or other `+sig*`) | service with `signal = "SIGTERM"` |
+| `daemon -delay 500ms:` | service with `delay = "500ms"` |
+| `indir:` | group or per-task/service `working_dir` |
 | `!pattern` (negation) | `ignore = ["pattern"]` |
 | `prep: \|` (multiline) | `command = """…"""` |
 | `@var = …` (preamble) | `[variables]` table, `${var}` in commands |
@@ -128,7 +128,7 @@ patterns = ["**/*.go"]
   [[group.task]]
   command = "go build"
 
-  [[group.daemon]]
+  [[group.service]]
   command = "./bin/server"
 ```
 
@@ -149,7 +149,7 @@ depends_on = ["go-test"]
   [[group.task]]
   command = "go build"
 
-  [[group.daemon]]
+  [[group.service]]
   command = "./bin/server"
 ```
 
@@ -192,9 +192,9 @@ and `"stderr"` suppress one stream while letting the other through.
 Suppressed output is still captured for the API and log file; the
 filtering is at the TUI render layer.
 
-## Daemons
+## Services
 
-`daemon:` becomes `[[group.daemon]]`. The signal flags map to the
+`daemon:` becomes `[[group.service]]`. The signal flags map to the
 `signal` field, which accepts the canonical signal name as a string.
 
 ```text
@@ -211,11 +211,11 @@ filtering is at the TUI render layer.
 name = "go"
 patterns = ["**/*.go"]
 
-  [[group.daemon]]
+  [[group.service]]
   command = "./bin/server"
   signal = "SIGTERM"
 
-  [[group.daemon]]
+  [[group.service]]
   command = "./bin/worker"
   signal = "SIGHUP"
 ```
@@ -224,10 +224,10 @@ Supported signal names: `SIGTERM` (zaz default), `SIGINT`, `SIGHUP`,
 `SIGKILL`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`. See
 [../configuration.md](../configuration.md) for the canonical list.
 
-### Delay before daemon startup
+### Delay before service startup
 
-modd's `-delay 500ms:` delays the daemon launch after preps complete.
-zaz uses the `delay` field on the daemon, which takes the same
+modd's `-delay 500ms:` delays the service launch after preps complete.
+zaz uses the `delay` field on the service, which takes the same
 human-readable durations as `[settings] debounce`:
 
 ```text
@@ -243,12 +243,12 @@ human-readable durations as `[settings] debounce`:
 name = "go"
 patterns = ["**/*.go"]
 
-  [[group.daemon]]
+  [[group.service]]
   command = "./bin/server"
   delay = "500ms"
 ```
 
-`delay` is per-daemon and gates the daemon's startup, not file-change
+`delay` is per-service and gates the service's startup, not file-change
 batching. The global `[settings] debounce` is the file-change batching
 window.
 
@@ -299,7 +299,7 @@ modd's `@shell = bash` preamble becomes `[settings] shell = "bash"`. See
 
 modd's `indir:` directive sets the working directory for every command
 in the block. zaz supports `working_dir` at the group level (covers all
-tasks and daemons) and at the per-task or per-daemon level (overrides
+tasks and services) and at the per-task or per-service level (overrides
 the group setting).
 
 ```text
@@ -321,13 +321,13 @@ working_dir = "./ui"
   [[group.task]]
   command = "pnpm install"
 
-  [[group.daemon]]
+  [[group.service]]
   command = "pnpm run dev"
 ```
 
 modd allows multiple `indir:` directives within one block to target
 different commands. In zaz, set `working_dir` on the individual task or
-daemon:
+service:
 
 ```toml
 [[group]]
@@ -347,7 +347,7 @@ patterns = ["**/*.ts"]
 
 modd inlines env vars into the command (`prep: ENV=test go test ./...`).
 That continues to work in zaz commands, but zaz also has explicit `env`
-tables on groups, tasks, and daemons. Per-task and per-daemon `env`
+tables on groups, tasks, and services. Per-task and per-service `env`
 merges on top of group `env`.
 
 ```toml
@@ -395,7 +395,7 @@ echo "Done!"
 
 Both forms are passed to the shell as a single script.
 
-## Standalone daemons
+## Standalone services
 
 modd allows a block with no patterns and a single `daemon:` directive to
 run a process for the lifetime of modd. zaz expresses the same idea with
@@ -414,13 +414,13 @@ run a process for the lifetime of modd. zaz expresses the same idea with
 name = "cloud-sql-proxy"
 patterns = []
 
-  [[group.daemon]]
+  [[group.service]]
   command = "cloud-sql-proxy"
 ```
 
 A group with empty `patterns` and no tasks is rejected as empty; once it
-has at least one daemon or task it validates. The daemon starts with the
-rest of the daemon set and stays up until zaz exits.
+has at least one service or task it validates. The service starts with the
+rest of the service set and stays up until zaz exits.
 
 ## Behavioral differences
 
@@ -428,16 +428,16 @@ Some directives have an obvious one-to-one mapping but the runtime
 behavior changes after translation. These are the cases worth checking
 during a migration.
 
-### Default daemon signal
+### Default service signal
 
 modd defaults to `SIGHUP` when no signal flag is given; zaz defaults to
-`SIGTERM`. A modd `daemon: ./bin/server` translated as a zaz daemon with
+`SIGTERM`. A modd `daemon: ./bin/server` translated as a zaz service with
 no `signal` field will receive `SIGTERM` on restart instead of `SIGHUP`.
 Set `signal = "SIGHUP"` explicitly to preserve the modd behavior.
 
 ### PTY allocation
 
-zaz allocates a PTY for daemons by default; modd does not. A daemon
+zaz allocates a PTY for services by default; modd does not. A service
 that misbehaves under a PTY (printing escape codes, refusing to start
 without a TTY in the right state) needs `no_pty = true` to match modd's
 behavior. The `pty-less-environment` example covers this case.
@@ -452,7 +452,7 @@ group's `ignore` array.
 
 ### One-shot vs always-on invocation
 
-modd has two top-level modes: default (run preps, start daemons, watch),
+modd has two top-level modes: default (run preps, start services, watch),
 and `-p` / `--prep` which runs preps and exits. The mapping:
 
 | modd | zaz |
@@ -533,7 +533,7 @@ is exercised by `tests/example_configs.rs`.
 name = "cloud-sql-proxy"
 patterns = []
 
-  [[group.daemon]]
+  [[group.service]]
   name = "cloud-sql-proxy"
   command = "cloud-sql-proxy"
 
@@ -555,12 +555,12 @@ depends_on = ["go-test"]
   name = "build"
   command = "make build"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "ems-server"
   command = "bin/ems server"
   signal = "SIGTERM"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "ems-testfeeds"
   command = "bin/ems testfeeds"
   signal = "SIGTERM"
@@ -582,7 +582,7 @@ working_dir = "./ui"
   name = "install"
   command = "pnpm install"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "dev"
   command = "pnpm run dev"
 ```

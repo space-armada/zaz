@@ -1,4 +1,4 @@
-# Task-only loop: lint, typecheck, test. No daemons.
+# Task-only loop: lint, typecheck, test. No services.
 #
 # Useful for pre-commit-style local feedback or CI dry-runs via `zaz check`.
 # `silence = "stdout"` keeps the noisy passing output out of the TUI while

@@ -1,16 +1,16 @@
 # Go dev server
 
 Watch a Go service, format and test on every change, build a binary, and run
-it as a daemon. Tasks inside a group run sequentially before the daemon
-starts; if any task fails the daemon is not (re)started.
+it as a service. Tasks inside a group run sequentially before the service
+starts; if any task fails the service is not (re)started.
 
 ## Features used
 
-- Sequential tasks followed by a long-running daemon in the same group.
+- Sequential tasks followed by a long-running service in the same group.
 - Glob `ignore` for test files and the build output directory.
 - `${zaz:dirs}` to scope `go test` to the directories that actually changed.
 - `on_change_only = true` on `test` so it skips the initial startup pass.
-- `signal = "SIGTERM"` for graceful daemon shutdown on restart. PTY is on
+- `signal = "SIGTERM"` for graceful service shutdown on restart. PTY is on
   by default, which keeps colored output and any TTY-only behavior intact.
 
 ## Try it

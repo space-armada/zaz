@@ -21,6 +21,19 @@ use crate::types::{
     RestartProcessRequest, StatusReport,
 };
 
+/// Canonical vocabulary advertised in the server `instructions` field so an
+/// agent can tell the background daemon from the process-type service.
+const SERVER_INSTRUCTIONS: &str = "\
+zaz MCP tool server.
+
+Vocabulary:
+- supervisor: the workspace parent. Owns one daemon per member config.
+- daemon: the background process serving one config over a Unix socket.
+- group: a named set of processes sharing file-watch patterns. The unit of depends_on ordering.
+- task: a process that runs to completion.
+- service: a long-running process. Does not exit on its own.
+- process: the umbrella for a task or a service.";
+
 /// Inputs the bin passes to [`run`] after socket and config resolution.
 #[derive(Debug, Clone)]
 pub struct McpRunOptions {
@@ -63,7 +76,7 @@ impl ZazMcpServer {
     /// Return the current state of the zaz daemon: groups, processes, watched files.
     #[tool(
         name = "zaz_status",
-        description = "Get the current state of the zaz daemon, including all groups, their processes (tasks and daemons), PIDs, and recent file-change activity. Use this to answer 'is the daemon running?' and 'is process X up?'."
+        description = "Get the current state of the zaz daemon, including all groups, their processes (tasks and services), PIDs, and recent file-change activity. Use this to answer 'is the daemon running?' and 'is process X up?'."
     )]
     async fn zaz_status(&self) -> Result<Json<StatusReport>, ErrorData> {
         let state = client::fetch_status(&self.socket_path)
@@ -108,7 +121,7 @@ impl ZazMcpServer {
     /// Return the parsed project configuration from disk.
     #[tool(
         name = "zaz_config",
-        description = "Return the parsed zaz project configuration: groups, file patterns, task and daemon commands, and global settings. Use this to understand how the project is wired up before diagnosing why something isn't restarting."
+        description = "Return the parsed zaz project configuration: groups, file patterns, task and service commands, and global settings. Use this to understand how the project is wired up before diagnosing why something isn't restarting."
     )]
     async fn zaz_config(&self) -> Result<Json<ConfigReport>, ErrorData> {
         let cwd = self.cwd.clone();
@@ -124,7 +137,7 @@ impl ZazMcpServer {
     /// Restart every process in a single group.
     #[tool(
         name = "zaz_restart_group",
-        description = "Restart all tasks and daemons in the named group. Reversible: equivalent to a file-change-triggered restart. Use after editing code that the group watches when you want to skip the file event and restart immediately. Against a workspace supervisor, set `project` to select the member."
+        description = "Restart all tasks and services in the named group. Reversible: equivalent to a file-change-triggered restart. Use after editing code that the group watches when you want to skip the file event and restart immediately. Against a workspace supervisor, set `project` to select the member."
     )]
     async fn zaz_restart_group(
         &self,
@@ -139,7 +152,7 @@ impl ZazMcpServer {
     /// Restart a single task or daemon within a group.
     #[tool(
         name = "zaz_restart_process",
-        description = "Restart a single process inside a group. `group` is the group name and `process` is the task or daemon `name` field as declared in the config. Reversible: starts a fresh instance the same way a file change would. Against a workspace supervisor, set `project` to select the member."
+        description = "Restart a single process inside a group. `group` is the group name and `process` is the task or service `name` field as declared in the config. Reversible: starts a fresh instance the same way a file change would. Against a workspace supervisor, set `project` to select the member."
     )]
     async fn zaz_restart_process(
         &self,
@@ -190,7 +203,7 @@ impl ServerHandler for ZazMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_protocol_version(ProtocolVersion::LATEST)
-            .with_instructions("zaz MCP tool server".to_string())
+            .with_instructions(SERVER_INSTRUCTIONS.to_string())
     }
 }
 
@@ -233,7 +246,48 @@ mod tests {
         let info = server().get_info();
         assert_eq!(info.server_info.name, "zaz-mcp");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(info.instructions.as_deref(), Some("zaz MCP tool server"));
+        assert_eq!(info.instructions.as_deref(), Some(SERVER_INSTRUCTIONS));
+    }
+
+    #[test]
+    fn instructions_carry_the_canonical_glossary() {
+        let info = server().get_info();
+        let instructions = info.instructions.expect("instructions must be set");
+        for term in [
+            "supervisor:",
+            "daemon:",
+            "group:",
+            "task:",
+            "service:",
+            "process:",
+        ] {
+            assert!(
+                instructions.contains(term),
+                "glossary missing {term} in {instructions}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_type_descriptions_say_services() {
+        let router = ZazMcpServer::tool_router();
+        let tools = router.list_all();
+        let describe = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .and_then(|t| t.description.as_ref())
+                .map(|d| d.to_string())
+                .unwrap_or_default()
+        };
+
+        assert!(describe("zaz_restart_group").contains("tasks and services"));
+        assert!(describe("zaz_status").contains("tasks and services"));
+        assert!(describe("zaz_config").contains("task and service commands"));
+        assert!(describe("zaz_restart_process").contains("task or service"));
+
+        // The background-process sense must survive untouched.
+        assert!(describe("zaz_status").contains("is the daemon running?"));
     }
 
     #[test]

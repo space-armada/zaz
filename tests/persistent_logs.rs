@@ -10,21 +10,18 @@
 //! `XDG_STATE_HOME` is overridden per test so the SQLite DB lands under a
 //! per-test tempdir instead of the user's real state directory.
 
+mod support;
+
 use serde_json::{json, Value};
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+use support::{await_log_lines, get_logs, zaz_bin, StartedDaemon};
 use tempfile::TempDir;
-use zaz_daemon::{ApiRequest, ApiResponse, LogLine};
 use zaz_mcp::LogsReport;
-
-fn zaz_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zaz")
-}
 
 const INITIALIZE_REQUEST: &str = concat!(
     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
@@ -44,6 +41,15 @@ const INITIALIZED_NOTIFICATION: &str = concat!(
 struct XdgDirs {
     state: PathBuf,
     config: PathBuf,
+}
+
+impl XdgDirs {
+    fn as_envs(&self) -> [(&str, &Path); 2] {
+        [
+            ("XDG_STATE_HOME", self.state.as_path()),
+            ("XDG_CONFIG_HOME", self.config.as_path()),
+        ]
+    }
 }
 
 fn xdg_dirs(temp: &TempDir) -> XdgDirs {
@@ -69,20 +75,6 @@ max_lines_per_process = 100000
 "#,
     )
     .expect("write user config");
-}
-
-fn run_zaz<I, S>(current_dir: &Path, xdg: &XdgDirs, args: I) -> std::process::Output
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    Command::new(zaz_bin())
-        .args(args)
-        .current_dir(current_dir)
-        .env("XDG_STATE_HOME", &xdg.state)
-        .env("XDG_CONFIG_HOME", &xdg.config)
-        .output()
-        .expect("failed to run zaz binary")
 }
 
 fn unique_socket_path(temp: &TempDir, label: &str) -> PathBuf {
@@ -176,125 +168,21 @@ command = "sleep 600"
 "#
 }
 
-struct StartedDaemon {
-    current_dir: PathBuf,
-    socket: PathBuf,
-    xdg: XdgDirs,
-    config: PathBuf,
-    stopped: bool,
-}
-
-impl StartedDaemon {
-    fn launch(current_dir: &Path, xdg: &XdgDirs, config: &Path, socket: &Path) -> Self {
-        let log_path = current_dir.join("zaz.log");
-        let args: Vec<&OsStr> = vec![
-            OsStr::new("--config"),
-            config.as_os_str(),
-            OsStr::new("--socket"),
-            socket.as_os_str(),
-            OsStr::new("--log-file"),
-            log_path.as_os_str(),
-            OsStr::new("start"),
-        ];
-        let output = run_zaz(current_dir, xdg, args);
-        if !output.status.success() {
-            let daemon_log = current_dir.join("zaz.daemon-output.log");
-            let daemon_log_contents = std::fs::read_to_string(&daemon_log).unwrap_or_else(|e| {
-                format!("(no daemon-output.log at {}: {e})", daemon_log.display())
-            });
-            panic!(
-                "zaz start exited with {:?}\nstdout: {}\nstderr: {}\ndaemon-output.log:\n{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-                daemon_log_contents,
-            );
-        }
-        Self::wait_for_ready(current_dir, xdg, socket);
-        Self {
-            current_dir: current_dir.to_path_buf(),
-            socket: socket.to_path_buf(),
-            xdg: xdg.clone(),
-            config: config.to_path_buf(),
-            stopped: false,
-        }
-    }
-
-    fn wait_for_ready(current_dir: &Path, xdg: &XdgDirs, socket: &Path) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let out = run_zaz(
-                current_dir,
-                xdg,
-                [
-                    OsStr::new("--socket"),
-                    socket.as_os_str(),
-                    OsStr::new("status"),
-                ],
-            );
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if out.status.code() == Some(0) && stdout.contains("Daemon Status:") {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        panic!("daemon did not become ready in time");
-    }
-
-    /// Stop the daemon and wait for the socket file to disappear so a
-    /// subsequent `zaz start` can bind cleanly.
-    fn stop(&mut self) {
-        if self.stopped {
-            return;
-        }
-        let _ = run_zaz(
-            &self.current_dir,
-            &self.xdg,
-            [
-                OsStr::new("--socket"),
-                self.socket.as_os_str(),
-                OsStr::new("stop"),
-            ],
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if !self.socket.exists() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
-        self.stopped = true;
-    }
-}
-
-impl Drop for StartedDaemon {
-    fn drop(&mut self) {
-        if !self.stopped {
-            let _ = run_zaz(
-                &self.current_dir,
-                &self.xdg,
-                [
-                    OsStr::new("--socket"),
-                    self.socket.as_os_str(),
-                    OsStr::new("stop"),
-                ],
-            );
-        }
-    }
+fn launch_daemon(current_dir: &Path, xdg: &XdgDirs, config: &Path, socket: &Path) -> StartedDaemon {
+    StartedDaemon::launch_with_envs(current_dir, config, socket, &xdg.as_envs())
 }
 
 /// Stop the daemon, swap the config file in place, and relaunch against the
 /// same socket and config path so the SQLite hash resolves to the same DB.
-fn restart_daemon(guard: StartedDaemon, new_config_body: &str) -> StartedDaemon {
-    let current_dir = guard.current_dir.clone();
-    let xdg = guard.xdg.clone();
-    let config = guard.config.clone();
-    let socket = guard.socket.clone();
+fn restart_daemon(guard: StartedDaemon, xdg: &XdgDirs, new_config_body: &str) -> StartedDaemon {
+    let current_dir = guard.current_dir().to_path_buf();
+    let config = guard.config_path().to_path_buf();
+    let socket = guard.socket_path().to_path_buf();
     let mut guard = guard;
     guard.stop();
     drop(guard);
     write_config(&config, new_config_body);
-    StartedDaemon::launch(&current_dir, &xdg, &config, &socket)
+    launch_daemon(&current_dir, xdg, &config, &socket)
 }
 
 fn spawn_mcp(socket: &Path, cwd: &Path, xdg: &XdgDirs) -> Child {
@@ -421,107 +309,6 @@ fn mcp_logs(
     parse_logs_report(&response)
 }
 
-/// Direct daemon-API client: raw Unix socket, one newline-terminated JSON
-/// request, one newline-terminated JSON response. Returns the
-/// `(lines, total_count, has_more, offset)` fields of `ApiResponse::Logs`.
-struct DaemonLogs {
-    lines: Vec<LogLine>,
-    total_count: Option<usize>,
-    has_more: Option<bool>,
-}
-
-fn daemon_get_logs(
-    socket: &Path,
-    name: &str,
-    offset: Option<usize>,
-    limit: Option<usize>,
-    search: Option<&str>,
-) -> DaemonLogs {
-    let request = ApiRequest::GetLogs {
-        name: name.to_string(),
-        project: None,
-        lines: None,
-        offset,
-        limit,
-        search: search.map(|s| s.to_string()),
-    };
-    let mut stream = UnixStream::connect(socket).expect("connect daemon socket");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("set read timeout");
-    let mut payload = serde_json::to_string(&request).expect("serialize ApiRequest");
-    payload.push('\n');
-    stream
-        .write_all(payload.as_bytes())
-        .expect("write GetLogs request");
-    let mut response = String::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = stream.read(&mut buf).expect("read daemon response");
-        if n == 0 {
-            break;
-        }
-        response.push_str(std::str::from_utf8(&buf[..n]).expect("utf-8 response"));
-        if response.contains('\n') {
-            break;
-        }
-    }
-    let trimmed = response.trim_end_matches('\n').to_string();
-    let parsed: ApiResponse = serde_json::from_str(&trimmed)
-        .unwrap_or_else(|e| panic!("parse ApiResponse failed ({e}): {trimmed}"));
-    match parsed {
-        ApiResponse::Logs {
-            lines,
-            total_count,
-            has_more,
-            ..
-        } => DaemonLogs {
-            lines,
-            total_count,
-            has_more,
-        },
-        other => panic!("expected ApiResponse::Logs, got {other:?}"),
-    }
-}
-
-/// Poll the daemon API until the count of lines matching `search` under
-/// `name` reaches `expected` or the deadline trips. Scoping by `search`
-/// keeps the count off internal daemon-source lines that share the same
-/// `process` field as their owning daemon entry.
-fn await_log_count(
-    socket: &Path,
-    name: &str,
-    search: &str,
-    expected: usize,
-    timeout: Duration,
-) -> usize {
-    let deadline = Instant::now() + timeout;
-    let mut last = 0;
-    let mut last_lines: Vec<LogLine> = Vec::new();
-    while Instant::now() < deadline {
-        let logs = daemon_get_logs(socket, name, None, Some(1024), Some(search));
-        last = logs.total_count.unwrap_or(logs.lines.len());
-        last_lines = logs.lines;
-        if last >= expected {
-            return last;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let observed: Vec<String> = last_lines
-        .iter()
-        .map(|l| {
-            format!(
-                "[{:?}/{:?}] {}: {}",
-                l.source, l.output_kind, l.process, l.content
-            )
-        })
-        .collect();
-    panic!(
-        "timed out waiting for {expected} `{name}` log lines matching {search:?}; last observed {last} within {timeout:?}\nlines:\n{}",
-        observed.join("\n")
-    );
-}
-
 #[test]
 fn persisted_logs_survive_daemon_restart() {
     let temp = TempDir::new().unwrap();
@@ -531,12 +318,19 @@ fn persisted_logs_survive_daemon_restart() {
     let socket = unique_socket_path(&temp, "persist-restart");
 
     write_config(&config_path, &emitter_config("PRE-LINE", 5));
-    let guard = StartedDaemon::launch(temp.path(), &xdg, &config_path, &socket);
-    await_log_count(&socket, "emitter", "PRE-LINE", 5, Duration::from_secs(10));
+    let guard = launch_daemon(temp.path(), &xdg, &config_path, &socket);
+    await_log_lines(
+        &socket,
+        None,
+        "emitter",
+        "PRE-LINE",
+        5,
+        Duration::from_secs(10),
+    );
 
-    let guard = restart_daemon(guard, quiet_config());
+    let guard = restart_daemon(guard, &xdg, quiet_config());
 
-    let api = daemon_get_logs(&socket, "emitter", None, Some(10), Some("PRE-LINE"));
+    let api = get_logs(&socket, None, "emitter", None, Some(10), Some("PRE-LINE"));
     assert_eq!(api.total_count, Some(5), "daemon API total_count");
     assert_eq!(api.lines.len(), 5, "daemon API page size");
     assert_eq!(api.has_more, Some(false));
@@ -584,15 +378,22 @@ fn paginated_and_search_queries_against_persisted_logs() {
         &emitter_with_needle_config("LINE", 25, &needle_indices),
     );
 
-    let guard = StartedDaemon::launch(temp.path(), &xdg, &config_path, &socket);
-    await_log_count(&socket, "emitter", "LINE-", 25, Duration::from_secs(15));
+    let guard = launch_daemon(temp.path(), &xdg, &config_path, &socket);
+    await_log_lines(
+        &socket,
+        None,
+        "emitter",
+        "LINE-",
+        25,
+        Duration::from_secs(15),
+    );
 
-    let guard = restart_daemon(guard, quiet_config());
+    let guard = restart_daemon(guard, &xdg, quiet_config());
 
     // First page. `search = "LINE-"` scopes assertions to the 25 emitter
     // stdout lines, skipping internal daemon-source entries the engine
     // logs under the same process name.
-    let api_p0 = daemon_get_logs(&socket, "emitter", None, Some(10), Some("LINE-"));
+    let api_p0 = get_logs(&socket, None, "emitter", None, Some(10), Some("LINE-"));
     assert_eq!(api_p0.total_count, Some(25));
     assert_eq!(api_p0.has_more, Some(true));
     assert_eq!(api_p0.lines.len(), 10);
@@ -621,7 +422,7 @@ fn paginated_and_search_queries_against_persisted_logs() {
     assert_eq!(mcp_p0_contents, expected_p0_refs, "mcp page 0 contents");
 
     // Second page.
-    let api_p1 = daemon_get_logs(&socket, "emitter", Some(10), Some(10), Some("LINE-"));
+    let api_p1 = get_logs(&socket, None, "emitter", Some(10), Some(10), Some("LINE-"));
     assert_eq!(api_p1.total_count, Some(25));
     assert_eq!(api_p1.has_more, Some(true));
     let api_p1_contents: Vec<&str> = api_p1.lines.iter().map(|l| l.content.as_str()).collect();
@@ -647,7 +448,7 @@ fn paginated_and_search_queries_against_persisted_logs() {
     assert_eq!(mcp_p1_contents, expected_p1_refs, "mcp page 1 contents");
 
     // Third (partial) page.
-    let api_p2 = daemon_get_logs(&socket, "emitter", Some(20), Some(10), Some("LINE-"));
+    let api_p2 = get_logs(&socket, None, "emitter", Some(20), Some(10), Some("LINE-"));
     assert_eq!(api_p2.total_count, Some(25));
     assert_eq!(api_p2.has_more, Some(false));
     assert_eq!(api_p2.lines.len(), 5);
@@ -666,7 +467,7 @@ fn paginated_and_search_queries_against_persisted_logs() {
     assert_eq!(mcp_p2.entries.len(), 5);
 
     // Search.
-    let api_search = daemon_get_logs(&socket, "emitter", None, Some(50), Some("needle"));
+    let api_search = get_logs(&socket, None, "emitter", None, Some(50), Some("needle"));
     assert_eq!(api_search.total_count, Some(needle_indices.len()));
     assert_eq!(api_search.lines.len(), needle_indices.len());
     for line in &api_search.lines {
@@ -716,13 +517,27 @@ fn process_filter_against_persisted_logs() {
     let socket = unique_socket_path(&temp, "persist-filter");
 
     write_config(&config_path, &two_emitters_config());
-    let guard = StartedDaemon::launch(temp.path(), &xdg, &config_path, &socket);
-    await_log_count(&socket, "emitter-a", "A-LINE-", 3, Duration::from_secs(10));
-    await_log_count(&socket, "emitter-b", "B-LINE-", 3, Duration::from_secs(10));
+    let guard = launch_daemon(temp.path(), &xdg, &config_path, &socket);
+    await_log_lines(
+        &socket,
+        None,
+        "emitter-a",
+        "A-LINE-",
+        3,
+        Duration::from_secs(10),
+    );
+    await_log_lines(
+        &socket,
+        None,
+        "emitter-b",
+        "B-LINE-",
+        3,
+        Duration::from_secs(10),
+    );
 
-    let guard = restart_daemon(guard, quiet_config());
+    let guard = restart_daemon(guard, &xdg, quiet_config());
 
-    let api_a = daemon_get_logs(&socket, "emitter-a", None, Some(20), Some("A-LINE-"));
+    let api_a = get_logs(&socket, None, "emitter-a", None, Some(20), Some("A-LINE-"));
     assert_eq!(api_a.total_count, Some(3));
     let a_contents: Vec<&str> = api_a.lines.iter().map(|l| l.content.as_str()).collect();
     assert_eq!(a_contents, vec!["A-LINE-1", "A-LINE-2", "A-LINE-3"]);
@@ -730,7 +545,7 @@ fn process_filter_against_persisted_logs() {
         assert_eq!(line.process, "emitter-a");
     }
 
-    let api_b = daemon_get_logs(&socket, "emitter-b", None, Some(20), Some("B-LINE-"));
+    let api_b = get_logs(&socket, None, "emitter-b", None, Some(20), Some("B-LINE-"));
     assert_eq!(api_b.total_count, Some(3));
     let b_contents: Vec<&str> = api_b.lines.iter().map(|l| l.content.as_str()).collect();
     assert_eq!(b_contents, vec!["B-LINE-1", "B-LINE-2", "B-LINE-3"]);
@@ -740,7 +555,7 @@ fn process_filter_against_persisted_logs() {
 
     // "LINE-" matches both A-LINE-* and B-LINE-* but no daemon-source
     // text, so the cross-process query returns exactly six entries.
-    let api_all = daemon_get_logs(&socket, "*", None, Some(20), Some("LINE-"));
+    let api_all = get_logs(&socket, None, "*", None, Some(20), Some("LINE-"));
     assert_eq!(api_all.total_count, Some(6));
     let processes: std::collections::HashSet<&str> =
         api_all.lines.iter().map(|l| l.process.as_str()).collect();

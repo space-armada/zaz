@@ -213,28 +213,28 @@ pub enum ValidationErrorKind {
         /// The duplicated name.
         name: String,
     },
-    /// Daemon has empty command.
-    EmptyDaemonCommand {
+    /// Service has empty command.
+    EmptyServiceCommand {
         /// Name of the group.
         group: String,
-        /// Name of the daemon.
-        daemon: String,
+        /// Name of the service.
+        service: String,
     },
-    /// Duplicate daemon name.
-    DuplicateDaemonName {
+    /// Duplicate service name.
+    DuplicateServiceName {
         /// Name of the group.
         group: String,
         /// The duplicated name.
         name: String,
     },
-    /// Daemon command references a file-context built-in variable
+    /// Service command references a file-context built-in variable
     /// (`${zaz:files}`, `${zaz:dirs}`, `${zaz:prefix}`) which is never
-    /// populated for daemon spawns.
-    DaemonCommandFileBuiltin {
+    /// populated for service spawns.
+    ServiceCommandFileBuiltin {
         /// Name of the group.
         group: String,
-        /// Name of the daemon.
-        daemon: String,
+        /// Name of the service.
+        service: String,
         /// The offending built-in name, e.g. `zaz:files`.
         builtin: String,
     },
@@ -254,9 +254,9 @@ impl ValidationErrorKind {
             Self::InvalidIgnorePattern { .. } => "invalid_ignore_pattern",
             Self::EmptyTaskCommand { .. } => "empty_task_command",
             Self::DuplicateTaskName { .. } => "duplicate_task_name",
-            Self::EmptyDaemonCommand { .. } => "empty_daemon_command",
-            Self::DuplicateDaemonName { .. } => "duplicate_daemon_name",
-            Self::DaemonCommandFileBuiltin { .. } => "daemon_command_file_builtin",
+            Self::EmptyServiceCommand { .. } => "empty_service_command",
+            Self::DuplicateServiceName { .. } => "duplicate_service_name",
+            Self::ServiceCommandFileBuiltin { .. } => "service_command_file_builtin",
         }
     }
 }
@@ -322,26 +322,26 @@ impl fmt::Display for ValidationErrorKind {
             Self::DuplicateTaskName { group, name } => {
                 write!(f, "group '{}': duplicate task name '{}'", group, name)
             }
-            Self::EmptyDaemonCommand { group, daemon } => {
+            Self::EmptyServiceCommand { group, service } => {
                 write!(
                     f,
-                    "group '{}': daemon '{}' has empty command",
-                    group, daemon
+                    "group '{}': service '{}' has empty command",
+                    group, service
                 )
             }
-            Self::DuplicateDaemonName { group, name } => {
-                write!(f, "group '{}': duplicate daemon name '{}'", group, name)
+            Self::DuplicateServiceName { group, name } => {
+                write!(f, "group '{}': duplicate service name '{}'", group, name)
             }
-            Self::DaemonCommandFileBuiltin {
+            Self::ServiceCommandFileBuiltin {
                 group,
-                daemon,
+                service,
                 builtin,
             } => {
                 write!(
                     f,
-                    "group '{}': daemon '{}' references ${{{}}}, which is only \
-                     populated for file-change triggers and is unavailable to daemons",
-                    group, daemon, builtin
+                    "group '{}': service '{}' references ${{{}}}, which is only \
+                     populated for file-change triggers and is unavailable to services",
+                    group, service, builtin
                 )
             }
         }

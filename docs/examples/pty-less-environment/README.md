@@ -1,6 +1,6 @@
 # Headless / PTY-less environment
 
-For containers, systemd units, and CI runners that lack a TTY. The daemon
+For containers, systemd units, and CI runners that lack a TTY. The service
 runs without PTY allocation, the migration task gets a 500ms grace period
 before the worker connects, and logs come out as newline-delimited JSON
 for log aggregators.
@@ -10,9 +10,9 @@ for log aggregators.
 - `no_pty = true` disables PTY allocation. Use this when the host has no
   controlling terminal, or when a process misbehaves under a PTY.
 - `delay = "500ms"` waits half a second after the migration task completes
-  before launching the worker daemon.
-- Per-daemon `[group.daemon.env]` table for environment variables scoped
-  to a single daemon.
+  before launching the worker service.
+- Per-service `[group.service.env]` table for environment variables scoped
+  to a single service.
 - `[settings] log_format = "json"` so each log event is a single JSON
   object per line, friendly to log shippers.
 - `signal = "SIGINT"` so the worker receives the same signal it would

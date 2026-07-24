@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+GLOOBIN_NAME="zig"
+GLOOBIN_VERSION="0.16.0"
+
+GLOOBIN_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+GLOOBIN_ARCH="$(uname -m)"
+
+# Map OS/arch to zig's release naming convention
+case "${GLOOBIN_OS}" in
+  darwin) ZIG_OS="macos" ;;
+  linux)  ZIG_OS="linux" ;;
+  *)      echo "Unsupported OS: ${GLOOBIN_OS}" >&2; exit 1 ;;
+esac
+
+case "${GLOOBIN_ARCH}" in
+  x86_64)  ZIG_ARCH="x86_64" ;;
+  arm64)   ZIG_ARCH="aarch64" ;;
+  aarch64) ZIG_ARCH="aarch64" ;;
+  *)       echo "Unsupported architecture: ${GLOOBIN_ARCH}" >&2; exit 1 ;;
+esac
+
+ZIG_ASSET_NAME="zig-${ZIG_ARCH}-${ZIG_OS}-${GLOOBIN_VERSION}"
+GLOOPKG_URL="https://ziglang.org/download/${GLOOBIN_VERSION}/${ZIG_ASSET_NAME}.tar.xz"
+
+CACHE_DIR="./.cache"
+# zig's release tarball is a directory: the `zig` binary looks up its bundled
+# `lib/` (std library, libc headers, cross-compilation sysroots) relative to
+# its own path, so the whole extracted tree has to be kept intact rather than
+# just lifting the binary out.
+CACHE_TREE="${CACHE_DIR}/${GLOOBIN_NAME}-${GLOOBIN_VERSION}"
+CACHE_BIN="${CACHE_TREE}/zig"
+
+if [ ! -d "${CACHE_DIR}" ]; then
+  mkdir -p "${CACHE_DIR}"
+fi
+
+if [ ! -f "${CACHE_BIN}" ]; then
+  echo "Downloading ${GLOOBIN_NAME} ${GLOOBIN_VERSION}..." >&2
+
+  GLOOBIN_TMP=$(mktemp -d "${TMPDIR:-/tmp}/zig-install.XXXXXX")
+  trap 'rm -rf "${GLOOBIN_TMP}"' EXIT
+
+  (
+    cd "${GLOOBIN_TMP}"
+    curl -fsSL "${GLOOPKG_URL}" -o "${ZIG_ASSET_NAME}.tar.xz"
+    tar -xJf "${ZIG_ASSET_NAME}.tar.xz"
+  )
+
+  echo "Installing ${GLOOBIN_NAME} into cache..." >&2
+  rm -rf "${CACHE_TREE}"
+  mv "${GLOOBIN_TMP}/${ZIG_ASSET_NAME}" "${CACHE_TREE}"
+fi
+
+exec "${CACHE_BIN}" "$@"

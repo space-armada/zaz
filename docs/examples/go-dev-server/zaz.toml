@@ -1,6 +1,6 @@
 # Go dev server: format, test, build, run.
 #
-# Tasks run sequentially before the daemon starts. The daemon receives
+# Tasks run sequentially before the service starts. The service receives
 # SIGTERM on restart and runs under a PTY (the default).
 
 [[group]]
@@ -21,7 +21,7 @@ ignore = ["**/*_test.go", "**/testdata/**", "build/**"]
   name = "build"
   command = "go build -o build/server ./cmd/server"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "server"
   command = "./build/server"
   signal = "SIGTERM"

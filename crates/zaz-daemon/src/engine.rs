@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group, LogStorageBackend};
-use zaz_process::{Daemon, Executor, OutputLine, TaskRunner};
+use zaz_process::{Executor, OutputLine, Service, TaskRunner};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
 
-const DAEMON_START_TASK_ID: &str = "__daemon_start__";
-const DAEMON_RESTART_TASK_ID: &str = "__daemon_restart__";
+const SERVICE_START_TASK_ID: &str = "__service_start__";
+const SERVICE_RESTART_TASK_ID: &str = "__service_restart__";
 
 /// Period for the persistent-log retention tick.
 ///
@@ -233,9 +233,9 @@ pub enum TriggerSource {
         /// Group whose task completed.
         group: String,
     },
-    /// Daemon restarted, triggering dependent groups.
-    DaemonRestart {
-        /// Group whose daemon restarted.
+    /// Service restarted, triggering dependent groups.
+    ServiceRestart {
+        /// Group whose service restarted.
         group: String,
     },
     /// Manual restart via API request.
@@ -269,8 +269,8 @@ impl fmt::Display for TriggerSource {
             TriggerSource::TaskCompletion { group } => {
                 write!(f, "task completion in '{}'", group)
             }
-            TriggerSource::DaemonRestart { group } => {
-                write!(f, "daemon restart in '{}'", group)
+            TriggerSource::ServiceRestart { group } => {
+                write!(f, "service restart in '{}'", group)
             }
             TriggerSource::ManualRestart { scope } => {
                 write!(f, "manual restart ({})", scope)
@@ -300,7 +300,7 @@ pub enum RestartScope {
     Process {
         /// Group name.
         group: String,
-        /// Process name (task or daemon).
+        /// Process name (task or service).
         process: String,
     },
     /// Restart all groups.
@@ -400,7 +400,7 @@ pub struct Engine {
     /// Notification configuration from user config.
     notification_config: zaz_config::NotificationConfig,
 
-    /// Whether this engine should skip daemon startup entirely.
+    /// Whether this engine should skip service startup entirely.
     task_only: bool,
 }
 
@@ -433,17 +433,17 @@ struct ManagedGroup {
     /// Task executor.
     executor: Executor,
 
-    /// Managed daemons.
-    daemons: Vec<Daemon>,
+    /// Managed services.
+    services: Vec<Service>,
 
     /// Current group state.
     state: GroupState,
 
-    /// Whether daemons have been started at least once.
-    /// Used to determine if we should start daemons (first time) or signal them (subsequent).
-    daemons_started: bool,
+    /// Whether services have been started at least once.
+    /// Used to determine if we should start services (first time) or signal them (subsequent).
+    services_started: bool,
 
-    /// Pending restart times for daemons
+    /// Pending restart times for services
     pending_restarts: Vec<Option<Instant>>,
 }
 
@@ -627,10 +627,10 @@ impl Engine {
             .unwrap_or(false)
     }
 
-    fn group_has_daemons(&self, group_name: &str) -> bool {
+    fn group_has_services(&self, group_name: &str) -> bool {
         self.groups
             .get(group_name)
-            .map(|g| !g.daemons.is_empty())
+            .map(|g| !g.services.is_empty())
             .unwrap_or(false)
     }
 
@@ -743,9 +743,9 @@ impl Engine {
 
     /// Run the initial startup sequence.
     ///
-    /// This runs all tasks (respecting on_change_only) and starts all daemons.
-    /// Groups with no tasks (or only on_change_only tasks) will have their daemons
-    /// started immediately. Groups with tasks will have daemons started after
+    /// This runs all tasks (respecting on_change_only) and starts all services.
+    /// Groups with no tasks (or only on_change_only tasks) will have their services
+    /// started immediately. Groups with tasks will have services started after
     /// all tasks complete successfully.
     pub async fn startup(&mut self) -> Result<(), DaemonError> {
         tracing::info!("starting initial run");
@@ -849,24 +849,24 @@ impl Engine {
 
             if self.task_only {
                 self.set_group_status(group_name, GroupStatus::Ready);
-            } else if self.group_has_daemons(group_name) {
+            } else if self.group_has_services(group_name) {
                 let should_start = self
                     .groups
                     .get(group_name)
-                    .map(|group| !group.daemons_started)
+                    .map(|group| !group.services_started)
                     .unwrap_or(true);
 
-                if let Err(e) = self.handle_daemon_action(group_name, should_start).await {
+                if let Err(e) = self.handle_service_action(group_name, should_start).await {
                     tracing::error!(
                         group = %group_name,
                         error = %e,
-                        "failed to handle daemon action during group execution"
+                        "failed to handle service action during group execution"
                     );
                     continue;
                 }
             } else {
                 // Groups with nothing runnable still become Ready so dependency
-                // markers and task-only daemon groups can unblock dependents.
+                // markers and task-only service groups can unblock dependents.
                 self.set_group_status(group_name, GroupStatus::Ready);
             }
 
@@ -996,28 +996,28 @@ impl Engine {
     /// Process completed task executions and handle pending re-runs.
     ///
     /// When all tasks in a group complete successfully:
-    /// - If daemons haven't been started yet, start them
-    /// - If daemons are already running, signal them to restart
+    /// - If services haven't been started yet, start them
+    /// - If services are already running, signal them to restart
     pub async fn process_task_completions(&mut self) {
-        // Collect groups that need daemon action
+        // Collect groups that need service action
         // (group_name, should_start_not_signal, should_cascade_to_dependents)
-        let mut daemon_actions: Vec<(String, bool, bool)> = Vec::new();
+        let mut service_actions: Vec<(String, bool, bool)> = Vec::new();
         // Collect groups that failed (for cascade_skip)
         let mut failed_groups: Vec<String> = Vec::new();
 
         while let Ok(completion) = self.task_completion_rx.try_recv() {
-            // Handle synthetic daemon actions for groups without tasks.
-            if completion.task_id == DAEMON_START_TASK_ID
-                || completion.task_id == DAEMON_RESTART_TASK_ID
+            // Handle synthetic service actions for groups without tasks.
+            if completion.task_id == SERVICE_START_TASK_ID
+                || completion.task_id == SERVICE_RESTART_TASK_ID
             {
                 tracing::debug!(
                     group = %completion.group_name,
-                    should_start = completion.task_id == DAEMON_START_TASK_ID,
-                    "processing daemon action request for group without tasks"
+                    should_start = completion.task_id == SERVICE_START_TASK_ID,
+                    "processing service action request for group without tasks"
                 );
-                daemon_actions.push((
+                service_actions.push((
                     completion.group_name.clone(),
-                    completion.task_id == DAEMON_START_TASK_ID,
+                    completion.task_id == SERVICE_START_TASK_ID,
                     true,
                 ));
                 continue;
@@ -1099,18 +1099,18 @@ impl Engine {
                             crate::notify::NotifyEvent::group_complete(&completion.group_name),
                         );
 
-                        // Queue daemon action: start if not yet started, signal if already running
-                        if !group.daemons.is_empty() {
-                            let should_start = !group.daemons_started;
-                            daemon_actions.push((
+                        // Queue service action: start if not yet started, signal if already running
+                        if !group.services.is_empty() {
+                            let should_start = !group.services_started;
+                            service_actions.push((
                                 completion.group_name.clone(),
                                 should_start,
                                 should_cascade,
                             ));
                         } else {
-                            // No daemons - group is ready, daemon_actions will trigger dependents
-                            // We still need to add to daemon_actions for trigger_dependents call
-                            daemon_actions.push((
+                            // No services - group is ready, service_actions will trigger dependents
+                            // We still need to add to service_actions for trigger_dependents call
+                            service_actions.push((
                                 completion.group_name.clone(),
                                 true,
                                 should_cascade,
@@ -1178,18 +1178,18 @@ impl Engine {
             self.cascade_skip(&group_name);
         }
 
-        // Process daemon actions after releasing borrows from the loop
-        for (group_name, should_start, should_cascade) in daemon_actions {
-            // Check if this group has daemons to start/signal
-            let has_daemons = self
+        // Process service actions after releasing borrows from the loop
+        for (group_name, should_start, should_cascade) in service_actions {
+            // Check if this group has services to start/signal
+            let has_services = self
                 .groups
                 .get(&group_name)
-                .map(|g| !g.daemons.is_empty())
+                .map(|g| !g.services.is_empty())
                 .unwrap_or(false);
 
-            if has_daemons {
-                if let Err(e) = self.handle_daemon_action(&group_name, should_start).await {
-                    tracing::error!(group = %group_name, error = %e, "failed to handle daemon action");
+            if has_services {
+                if let Err(e) = self.handle_service_action(&group_name, should_start).await {
+                    tracing::error!(group = %group_name, error = %e, "failed to handle service action");
                 }
             }
 
@@ -1219,36 +1219,36 @@ impl Engine {
         self.update_state();
     }
 
-    /// Handle daemon startup or signal for a group after successful task completion.
+    /// Handle service startup or signal for a group after successful task completion.
     ///
-    /// - If `should_start` is true, starts daemons (first time)
-    /// - If `should_start` is false, signals daemons to restart (subsequent times)
-    async fn handle_daemon_action(
+    /// - If `should_start` is true, starts services (first time)
+    /// - If `should_start` is false, signals services to restart (subsequent times)
+    async fn handle_service_action(
         &mut self,
         group_name: &str,
         should_start: bool,
     ) -> Result<(), DaemonError> {
-        // Collect daemon names for logging
-        let daemon_names: Vec<String> = self
+        // Collect service names for logging
+        let service_names: Vec<String> = self
             .groups
             .get(group_name)
-            .map(|g| g.daemons.iter().map(|d| d.name().to_string()).collect())
+            .map(|g| g.services.iter().map(|d| d.name().to_string()).collect())
             .unwrap_or_default();
 
         // Log what we're about to do
-        for daemon_name in &daemon_names {
+        for service_name in &service_names {
             if should_start {
                 self.push_log(
-                    LogLine::daemon(daemon_name, "starting").with_group(group_name.to_string()),
+                    LogLine::daemon(service_name, "starting").with_group(group_name.to_string()),
                 )?;
             } else {
                 self.push_log(
-                    LogLine::daemon(daemon_name, "restarting").with_group(group_name.to_string()),
+                    LogLine::daemon(service_name, "restarting").with_group(group_name.to_string()),
                 )?;
             }
         }
 
-        // Collect PTY readers for newly started daemons
+        // Collect PTY readers for newly started services
         let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
             Vec::new();
 
@@ -1265,66 +1265,66 @@ impl Engine {
         let expander = zaz_vars::Expander::new(&var_context);
 
         if let Some(group) = self.groups.get_mut(group_name) {
-            for (idx, daemon) in group.daemons.iter_mut().enumerate() {
-                // Check if daemon is actually running before deciding what to do
-                let is_running = daemon.is_running();
+            for (idx, service) in group.services.iter_mut().enumerate() {
+                // Check if service is actually running before deciding what to do
+                let is_running = service.is_running();
 
                 if should_start || !is_running {
-                    // Start daemon if:
+                    // Start service if:
                     // - This is the first time (should_start=true), OR
-                    // - The daemon is not running (crashed before file change)
+                    // - The service is not running (crashed before file change)
                     if !should_start && !is_running {
                         tracing::info!(
-                            daemon = %daemon.name(),
-                            "daemon not running, starting instead of signaling"
+                            service = %service.name(),
+                            "service not running, starting instead of signaling"
                         );
                     }
 
                     // Apply startup delay if configured
-                    if let Some(delay) = daemon.startup_delay() {
+                    if let Some(delay) = service.startup_delay() {
                         tracing::info!(
-                            daemon = %daemon.name(),
+                            service = %service.name(),
                             delay_ms = delay.as_millis(),
-                            "waiting before starting daemon"
+                            "waiting before starting service"
                         );
                         tokio::time::sleep(delay).await;
                     }
 
-                    let command = match expander.expand(daemon.command_template()) {
+                    let command = match expander.expand(service.command_template()) {
                         Ok(cmd) => cmd,
                         Err(e) => {
                             tracing::error!(
-                                daemon = %daemon.name(),
+                                service = %service.name(),
                                 error = %e,
-                                "variable expansion failed; skipping daemon start"
+                                "variable expansion failed; skipping service start"
                             );
                             continue;
                         }
                     };
 
-                    // Start daemon
-                    tracing::info!(daemon = %daemon.name(), "starting daemon");
-                    daemon.start(&command).map_err(DaemonError::Process)?;
+                    // Start service
+                    tracing::info!(service = %service.name(), "starting service");
+                    service.start(&command).map_err(DaemonError::Process)?;
 
                     // Get PTY reader for streaming output
-                    if let Some(reader) = daemon.try_clone_reader() {
+                    if let Some(reader) = service.try_clone_reader() {
                         pty_readers.push((
-                            daemon.name().to_string(),
+                            service.name().to_string(),
                             Some(group_name.to_string()),
                             reader,
                         ));
                     }
                 } else {
-                    // Signal existing daemon to restart
-                    tracing::info!(daemon = %daemon.name(), "signaling daemon restart");
-                    daemon.signal_restart().map_err(DaemonError::Process)?;
+                    // Signal existing service to restart
+                    tracing::info!(service = %service.name(), "signaling service restart");
+                    service.signal_restart().map_err(DaemonError::Process)?;
                 }
 
-                group.state.daemons[idx].status = ProcessStatus::Running;
-                group.state.daemons[idx].pid = daemon.pid();
+                group.state.services[idx].status = ProcessStatus::Running;
+                group.state.services[idx].pid = service.pid();
             }
 
-            group.daemons_started = true;
+            group.services_started = true;
             group.state.status = GroupStatus::Ready;
         }
 
@@ -1378,12 +1378,12 @@ impl Engine {
         }
     }
 
-    /// Check daemon processes and handle restarts.
+    /// Check service processes and handle restarts.
     ///
-    /// This function is non-blocking: when a daemon exits, it schedules a restart
+    /// This function is non-blocking: when a service exits, it schedules a restart
     /// for later rather than sleeping. This allows the main loop to remain responsive
     /// to API commands while waiting for restart delays.
-    pub async fn check_daemons(&mut self) -> Result<(), DaemonError> {
+    pub async fn check_services(&mut self) -> Result<(), DaemonError> {
         let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
             Vec::new();
 
@@ -1401,56 +1401,56 @@ impl Engine {
 
         let now = Instant::now();
         for (group_name, group) in self.groups.iter_mut() {
-            for (idx, daemon) in group.daemons.iter_mut().enumerate() {
+            for (idx, service) in group.services.iter_mut().enumerate() {
                 // First, check if there's a pending restart that's ready
                 if let Some(restart_at) = group.pending_restarts[idx] {
                     if now >= restart_at {
-                        let command = match expander.expand(daemon.command_template()) {
+                        let command = match expander.expand(service.command_template()) {
                             Ok(cmd) => cmd,
                             Err(e) => {
                                 tracing::error!(
-                                    daemon = %daemon.name(),
+                                    service = %service.name(),
                                     error = %e,
-                                    "variable expansion failed; skipping daemon restart"
+                                    "variable expansion failed; skipping service restart"
                                 );
                                 group.pending_restarts[idx] = None;
                                 continue;
                             }
                         };
-                        tracing::info!(daemon = %daemon.name(), "restarting daemon");
-                        daemon.start(&command).map_err(DaemonError::Process)?;
+                        tracing::info!(service = %service.name(), "restarting service");
+                        service.start(&command).map_err(DaemonError::Process)?;
 
-                        if let Some(reader) = daemon.try_clone_reader() {
+                        if let Some(reader) = service.try_clone_reader() {
                             pty_readers.push((
-                                daemon.name().to_string(),
+                                service.name().to_string(),
                                 Some(group_name.clone()),
                                 reader,
                             ));
                         }
 
-                        group.state.daemons[idx].status = ProcessStatus::Running;
-                        group.state.daemons[idx].pid = daemon.pid();
+                        group.state.services[idx].status = ProcessStatus::Running;
+                        group.state.services[idx].pid = service.pid();
                         group.pending_restarts[idx] = None;
                     }
 
-                    // Skip any daemons whose time hasn't come
+                    // Skip any services whose time hasn't come
                     continue;
                 }
 
-                // If daemon exited, update the state and schedule restart
-                let exit_info = daemon.check().await.map_err(DaemonError::Process)?;
+                // If service exited, update the state and schedule restart
+                let exit_info = service.check().await.map_err(DaemonError::Process)?;
                 if let Some(exit_info) = exit_info {
-                    group.state.daemons[idx].status = ProcessStatus::Backoff;
-                    group.state.daemons[idx].pid = None;
+                    group.state.services[idx].status = ProcessStatus::Backoff;
+                    group.state.services[idx].pid = None;
 
-                    let delay = daemon.restart_delay();
+                    let delay = service.restart_delay();
                     tracing::info!(
-                        daemon = %daemon.name(),
+                        service = %service.name(),
                         delay_ms = delay.as_millis(),
-                        "daemon exited, scheduling restart"
+                        "service exited, scheduling restart"
                     );
 
-                    // Log the daemon exit with duration and exit code
+                    // Log the service exit with duration and exit code
                     let exit_code_str = exit_info
                         .exit_code
                         .map(|c| c.to_string())
@@ -1464,7 +1464,7 @@ impl Engine {
                         .log_store
                         .sender()
                         .send(
-                            LogLine::daemon(daemon.name(), log_msg).with_group(group_name.clone()),
+                            LogLine::daemon(service.name(), log_msg).with_group(group_name.clone()),
                         )
                         .await;
 
@@ -1483,7 +1483,7 @@ impl Engine {
 
     /// Shutdown all processes gracefully.
     ///
-    /// Sends SIGTERM to all daemons, waits up to grace_period for them to exit,
+    /// Sends SIGTERM to all services, waits up to grace_period for them to exit,
     /// then sends SIGKILL to any that are still running.
     pub async fn shutdown(&mut self) -> Result<(), DaemonError> {
         const GRACE_PERIOD: Duration = Duration::from_secs(10);
@@ -1492,36 +1492,36 @@ impl Engine {
         tracing::info!("shutting down");
         self.state.status = DaemonStatus::Stopping;
 
-        // Send SIGTERM to all daemons
+        // Send SIGTERM to all services
         for group in self.groups.values_mut() {
-            for daemon in &mut group.daemons {
-                daemon.stop().map_err(DaemonError::Process)?;
+            for service in &mut group.services {
+                service.stop().map_err(DaemonError::Process)?;
             }
         }
 
-        // Wait for daemons to exit, up to grace period
+        // Wait for services to exit, up to grace period
         let deadline = std::time::Instant::now() + GRACE_PERIOD;
         loop {
             let mut any_running = false;
             for group in self.groups.values_mut() {
-                for daemon in &mut group.daemons {
-                    if daemon.is_running() {
+                for service in &mut group.services {
+                    if service.is_running() {
                         any_running = true;
                     }
                 }
             }
 
             if !any_running {
-                tracing::info!("all daemons exited");
+                tracing::info!("all services exited");
                 break;
             }
 
             if std::time::Instant::now() >= deadline {
-                tracing::warn!("grace period expired, force killing remaining daemons");
+                tracing::warn!("grace period expired, force killing remaining services");
                 for group in self.groups.values_mut() {
-                    for daemon in &mut group.daemons {
-                        if daemon.is_running() {
-                            daemon.kill().map_err(DaemonError::Process)?;
+                    for service in &mut group.services {
+                        if service.is_running() {
+                            service.kill().map_err(DaemonError::Process)?;
                         }
                     }
                 }
@@ -1585,9 +1585,9 @@ impl Engine {
     ///
     /// This:
     /// 1. Parses and validates the new config
-    /// 2. Stops daemons in removed/modified groups
+    /// 2. Stops services in removed/modified groups
     /// 3. Updates group configurations
-    /// 4. Starts daemons in new/modified groups
+    /// 4. Starts services in new/modified groups
     /// 5. Broadcasts reload status
     pub async fn reload_config(&mut self) -> ReloadResult {
         tracing::info!(path = %self.config_path.display(), "reloading configuration");
@@ -1604,32 +1604,32 @@ impl Engine {
         // 2. Compute changes
         let diff = self.get_config_diff(&new_config);
 
-        // 3. Stop daemons in removed groups
+        // 3. Stop services in removed groups
         for group_name in &diff.removed {
             if let Some(group) = self.groups.get_mut(group_name) {
-                for daemon in &mut group.daemons {
-                    if let Err(e) = daemon.stop() {
+                for service in &mut group.services {
+                    if let Err(e) = service.stop() {
                         tracing::warn!(
-                            daemon = %daemon.name(),
+                            service = %service.name(),
                             group = %group_name,
                             error = %e,
-                            "failed to stop daemon during reload"
+                            "failed to stop service during reload"
                         );
                     }
                 }
             }
         }
 
-        // 4. Stop daemons in modified groups (they'll be restarted)
+        // 4. Stop services in modified groups (they'll be restarted)
         for group_name in &diff.modified {
             if let Some(group) = self.groups.get_mut(group_name) {
-                for daemon in &mut group.daemons {
-                    if let Err(e) = daemon.stop() {
+                for service in &mut group.services {
+                    if let Err(e) = service.stop() {
                         tracing::warn!(
-                            daemon = %daemon.name(),
+                            service = %service.name(),
                             group = %group_name,
                             error = %e,
-                            "failed to stop daemon during reload"
+                            "failed to stop service during reload"
                         );
                     }
                 }
@@ -1742,7 +1742,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Restart a specific process (task or daemon) within a group.
+    /// Restart a specific process (task or service) within a group.
     pub async fn restart_process(
         &mut self,
         group_name: &str,
@@ -1803,20 +1803,20 @@ impl Engine {
             return Ok(());
         }
 
-        // Check if it's a daemon
+        // Check if it's a service
         let group = self.groups.get(group_name).unwrap();
-        if let Some((daemon_idx, _)) = group
-            .daemons
+        if let Some((service_idx, _)) = group
+            .services
             .iter()
             .enumerate()
             .find(|(_, d)| d.name() == process_name)
         {
             tracing::info!(
                 group = group_name,
-                daemon = process_name,
+                service = process_name,
                 trigger_source = ?trigger_ctx.source,
                 should_cascade = trigger_ctx.should_cascade,
-                "restarting daemon"
+                "restarting service"
             );
 
             self.push_log(
@@ -1824,18 +1824,18 @@ impl Engine {
             )?;
 
             if let Some(group) = self.groups.get_mut(group_name) {
-                group.daemons[daemon_idx]
+                group.services[service_idx]
                     .signal_restart()
                     .map_err(DaemonError::Process)?;
             }
 
             // Cascade restart to dependent groups if enabled
             if trigger_ctx.should_cascade {
-                if let Err(e) = self.cascade_daemon_restart(group_name).await {
+                if let Err(e) = self.cascade_service_restart(group_name).await {
                     tracing::error!(
                         group = %group_name,
                         error = %e,
-                        "failed to cascade daemon restart"
+                        "failed to cascade service restart"
                     );
                 }
             }
@@ -2103,11 +2103,11 @@ impl Engine {
         }
     }
 
-    /// Create a trigger context for daemon restart cascades.
-    fn daemon_restart_context(&self, source_group: &str) -> TriggerContext {
+    /// Create a trigger context for service restart cascades.
+    fn service_restart_context(&self, source_group: &str) -> TriggerContext {
         let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
         TriggerContext {
-            source: TriggerSource::DaemonRestart {
+            source: TriggerSource::ServiceRestart {
                 group: source_group.to_string(),
             },
             vars: Context::new()
@@ -2136,8 +2136,8 @@ impl Engine {
     /// Determine the lifecycle phase for a group.
     ///
     /// A group is in Runtime phase if it has already completed initial startup:
-    /// - For groups with daemons: when daemons have been started at least once
-    /// - For groups without daemons: when no dependents are waiting for it
+    /// - For groups with services: when services have been started at least once
+    /// - For groups without services: when no dependents are waiting for it
     ///
     /// The key insight is that during startup, dependent groups are in "Waiting"
     /// state tracked by the DependencyResolver. During runtime, dependents are
@@ -2150,13 +2150,13 @@ impl Engine {
                     return LifecyclePhase::Startup;
                 }
 
-                // Check if group has daemons
-                let has_daemons = !g.daemons.is_empty();
+                // Check if group has services
+                let has_services = !g.services.is_empty();
 
-                if has_daemons {
-                    // Groups with daemons: runtime after first start, unless a
+                if has_services {
+                    // Groups with services: runtime after first start, unless a
                     // dependency-ordered rerun wave still has blocked dependents.
-                    if g.daemons_started {
+                    if g.services_started {
                         LifecyclePhase::Runtime
                     } else {
                         LifecyclePhase::Startup
@@ -2214,18 +2214,18 @@ impl Engine {
             self.set_group_status(group_name, GroupStatus::Ready);
             self.trigger_dependents(group_name);
         } else {
-            // No tasks - mark as ready immediately or start daemons
-            let has_daemons = self.group_has_daemons(group_name);
+            // No tasks - mark as ready immediately or start services
+            let has_services = self.group_has_services(group_name);
 
-            if has_daemons {
+            if has_services {
                 let should_start = self
                     .groups
                     .get(group_name)
-                    .map(|group| !group.daemons_started)
+                    .map(|group| !group.services_started)
                     .unwrap_or(true);
-                self.queue_daemon_action(group_name, should_start);
+                self.queue_service_action(group_name, should_start);
             } else {
-                // No tasks and no daemons - mark as Ready and trigger dependents
+                // No tasks and no services - mark as Ready and trigger dependents
                 self.set_group_status(group_name, GroupStatus::Ready);
                 self.trigger_dependents(group_name);
             }
@@ -2262,7 +2262,7 @@ impl Engine {
     ///   `trigger_dependents` to start groups that were waiting for dependencies.
     ///
     /// - **Runtime phase**: Groups are already Ready and being re-triggered (e.g.,
-    ///   due to file changes or daemon restarts). Uses `cascade_daemon_restart`
+    ///   due to file changes or service restarts). Uses `cascade_service_restart`
     ///   to propagate restarts to dependent groups.
     async fn propagate_to_dependents(
         &mut self,
@@ -2274,7 +2274,7 @@ impl Engine {
                 self.trigger_dependents(completed_group);
                 Ok(())
             }
-            LifecyclePhase::Runtime => self.cascade_daemon_restart(completed_group).await,
+            LifecyclePhase::Runtime => self.cascade_service_restart(completed_group).await,
         }
     }
 
@@ -2283,31 +2283,31 @@ impl Engine {
     /// When a group is restarted, this propagates the restart to all dependent
     /// groups (transitively). For each dependent:
     /// - If it has startup tasks: spawn those tasks (cascade continues when they complete)
-    /// - If it has no tasks but has daemons: signal daemons directly and continue cascade
-    async fn cascade_daemon_restart(&mut self, source_group: &str) -> Result<(), DaemonError> {
+    /// - If it has no tasks but has services: signal services directly and continue cascade
+    async fn cascade_service_restart(&mut self, source_group: &str) -> Result<(), DaemonError> {
         let dependents = self.dependency_resolver.get_dependents(source_group);
         if dependents.is_empty() {
             return Ok(());
         }
 
-        let trigger_ctx = self.daemon_restart_context(source_group);
+        let trigger_ctx = self.service_restart_context(source_group);
 
         for dependent in dependents {
             // Get dependent group info
-            let (is_ready, has_startup_tasks, has_running_daemons) = self
+            let (is_ready, has_startup_tasks, has_running_services) = self
                 .groups
                 .get(&dependent)
                 .map(|g| {
                     let is_ready = g.state.status == GroupStatus::Ready;
                     let has_startup_tasks = g.config.tasks.iter().any(|t| !t.on_change_only);
-                    let has_running_daemons = g.daemons_started && !g.daemons.is_empty();
-                    (is_ready, has_startup_tasks, has_running_daemons)
+                    let has_running_services = g.services_started && !g.services.is_empty();
+                    (is_ready, has_startup_tasks, has_running_services)
                 })
                 .unwrap_or((false, false, false));
 
             // Only cascade if the dependent is Ready (completed initial startup)
-            // and has something to trigger (tasks to run or daemons to restart)
-            let should_cascade = is_ready && (has_startup_tasks || has_running_daemons);
+            // and has something to trigger (tasks to run or services to restart)
+            let should_cascade = is_ready && (has_startup_tasks || has_running_services);
 
             if should_cascade {
                 if has_startup_tasks {
@@ -2317,27 +2317,27 @@ impl Engine {
                         "cascading restart: spawning tasks for dependent group"
                     );
 
-                    // Spawn tasks - when they complete, daemons will be signaled
+                    // Spawn tasks - when they complete, services will be signaled
                     // and cascade will continue through process_task_completions
                     self.spawn_group_tasks(&dependent, &trigger_ctx);
                 } else {
                     tracing::info!(
                         from = %source_group,
                         to = %dependent,
-                        "cascading restart: signaling daemons directly (no tasks)"
+                        "cascading restart: signaling services directly (no tasks)"
                     );
 
-                    // No tasks - signal daemons directly (without cascade, we handle it below)
-                    if let Err(e) = self.signal_group_daemons_no_cascade(&dependent) {
+                    // No tasks - signal services directly (without cascade, we handle it below)
+                    if let Err(e) = self.signal_group_services_no_cascade(&dependent) {
                         tracing::error!(
                             group = %dependent,
                             error = %e,
-                            "failed to cascade daemon restart"
+                            "failed to cascade service restart"
                         );
                     }
 
                     // Recursively cascade to further dependents
-                    Box::pin(self.cascade_daemon_restart(&dependent)).await?;
+                    Box::pin(self.cascade_service_restart(&dependent)).await?;
                 }
             }
         }
@@ -2345,13 +2345,13 @@ impl Engine {
         Ok(())
     }
 
-    fn queue_daemon_action(&self, group_name: &str, should_start: bool) {
+    fn queue_service_action(&self, group_name: &str, should_start: bool) {
         let group_name = group_name.to_string();
         let task_completion_tx = self.task_completion_tx.clone();
         let task_id = if should_start {
-            DAEMON_START_TASK_ID
+            SERVICE_START_TASK_ID
         } else {
-            DAEMON_RESTART_TASK_ID
+            SERVICE_RESTART_TASK_ID
         };
 
         tokio::spawn(async move {
@@ -2369,15 +2369,15 @@ impl Engine {
         });
     }
 
-    /// Signal all daemons in a group to restart (without cascading).
+    /// Signal all services in a group to restart (without cascading).
     ///
-    /// This is a low-level method used internally by cascade_daemon_restart.
-    /// For most cases, use `restart_group_daemons` which also triggers the cascade.
-    fn signal_group_daemons_no_cascade(&mut self, group_name: &str) -> Result<(), DaemonError> {
+    /// This is a low-level method used internally by cascade_service_restart.
+    /// For most cases, use `restart_group_services` which also triggers the cascade.
+    fn signal_group_services_no_cascade(&mut self, group_name: &str) -> Result<(), DaemonError> {
         if let Some(group) = self.groups.get_mut(group_name) {
-            for daemon in &mut group.daemons {
-                if daemon.is_running() {
-                    daemon.signal_restart().map_err(DaemonError::Process)?;
+            for service in &mut group.services {
+                if service.is_running() {
+                    service.signal_restart().map_err(DaemonError::Process)?;
                 }
             }
         }
@@ -2412,8 +2412,8 @@ fn build_group_state(group: &Group) -> GroupState {
                 ..Default::default()
             })
             .collect(),
-        daemons: group
-            .daemons
+        services: group
+            .services
             .iter()
             .map(|d| ProcessState {
                 name: d.name().to_string(),
@@ -2437,30 +2437,30 @@ fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) 
         executor = executor.with_env(group.env.clone());
     }
 
-    // Create daemons with per-daemon working_dir and env overrides
-    let daemons: Vec<Daemon> = group
-        .daemons
+    // Create services with per-service working_dir and env overrides
+    let services: Vec<Service> = group
+        .services
         .iter()
         .map(|d| {
-            let mut daemon_executor = executor.clone();
+            let mut service_executor = executor.clone();
             if let Some(ref dir) = d.working_dir {
-                daemon_executor = daemon_executor.with_working_dir(dir.clone());
+                service_executor = service_executor.with_working_dir(dir.clone());
             }
             if !d.env.is_empty() {
-                daemon_executor = daemon_executor.extend_env(d.env.clone());
+                service_executor = service_executor.extend_env(d.env.clone());
             }
-            Daemon::new(d.clone(), daemon_executor)
+            Service::new(d.clone(), service_executor)
         })
         .collect();
 
-    let daemon_count = daemons.len();
+    let service_count = services.len();
     ManagedGroup {
         config: group.clone(),
         executor,
-        daemons,
+        services,
         state: build_group_state(group),
-        daemons_started: false,
-        pending_restarts: vec![None; daemon_count],
+        services_started: false,
+        pending_restarts: vec![None; service_count],
     }
 }
 
@@ -2603,7 +2603,7 @@ fn topological_sort(groups: &[Group]) -> Result<Vec<String>, DaemonError> {
 mod tests {
     use super::*;
     use crate::ApiRequest;
-    use zaz_config::{DaemonCommand, Group, Silence, TaskCommand};
+    use zaz_config::{Group, ServiceCommand, Silence, TaskCommand};
 
     // =========================================================================
     // Test helpers
@@ -2704,11 +2704,11 @@ mod tests {
         group
     }
 
-    fn test_daemon_group(name: &str, command: &str) -> Group {
+    fn test_service_group(name: &str, command: &str) -> Group {
         Group {
             name: name.to_string(),
             patterns: vec!["*.test".to_string()],
-            daemons: vec![DaemonCommand::new("daemon", command)],
+            services: vec![ServiceCommand::new("service", command)],
             ..Default::default()
         }
     }
@@ -3102,14 +3102,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_completion_daemon_start_signal() {
-        // Special __daemon_start__ task ID for groups without tasks
+    async fn test_process_completion_service_start_signal() {
+        // Special __service_start__ task ID for groups without tasks
         let groups = vec![test_group("mygroup", &[])]; // No tasks
         let mut engine = create_test_engine(groups);
 
-        // Send daemon start signal
+        // Send service start signal
         let completion = TaskCompletion {
-            task_id: DAEMON_START_TASK_ID.to_string(),
+            task_id: SERVICE_START_TASK_ID.to_string(),
             group_name: "mygroup".to_string(),
             task_index: 0,
             success: true,
@@ -3119,20 +3119,20 @@ mod tests {
         };
         engine.task_completion_tx.send(completion).await.unwrap();
 
-        // Process - this should queue daemon action
+        // Process - this should queue service action
         engine.process_task_completions().await;
 
-        // The daemon action is processed and queues to handle_daemon_action.
-        // For groups without daemons, handle_daemon_action sets status to Ready
+        // The service action is processed and queues to handle_service_action.
+        // For groups without services, handle_service_action sets status to Ready
         // and triggers dependents. Check that the signal was processed
-        // (running_tasks unchanged since __daemon_start__ isn't added to running_tasks).
-        // The actual status depends on whether handle_daemon_action ran.
+        // (running_tasks unchanged since __service_start__ isn't added to running_tasks).
+        // The actual status depends on whether handle_service_action ran.
         let group = engine.groups.get("mygroup").unwrap();
-        // Group either stays Pending (daemon action queued but not fully processed)
-        // or becomes Ready (if handle_daemon_action completed)
+        // Group either stays Pending (service action queued but not fully processed)
+        // or becomes Ready (if handle_service_action completed)
         assert!(
             group.state.status == GroupStatus::Pending || group.state.status == GroupStatus::Ready,
-            "Expected Pending or Ready for daemon start signal, got {:?}",
+            "Expected Pending or Ready for service start signal, got {:?}",
             group.state.status
         );
     }
@@ -3889,8 +3889,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_startup_group_no_tasks_no_daemons_ready() {
-        // Group with no tasks and no daemons should be Ready immediately
+    async fn test_startup_group_no_tasks_no_services_ready() {
+        // Group with no tasks and no services should be Ready immediately
         let groups = vec![Group {
             name: "empty".to_string(),
             tasks: vec![],
@@ -4015,12 +4015,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_startup_only_on_change_only_tasks_skips_to_daemon() {
-        // Group with no startup tasks (only on_change_only or none) should skip to daemon handling
+    async fn test_startup_only_on_change_only_tasks_skips_to_service() {
+        // Group with no startup tasks (only on_change_only or none) should skip to service handling
         // Since TaskCommand doesn't expose on_change_only directly, we test with an empty task list
         let groups = vec![Group {
             name: "mygroup".to_string(),
-            tasks: vec![], // No tasks means it goes straight to daemon handling
+            tasks: vec![], // No tasks means it goes straight to service handling
             patterns: vec!["*.test".to_string()],
             ..Default::default()
         }];
@@ -4028,7 +4028,7 @@ mod tests {
 
         engine.startup().await.unwrap();
 
-        // Group should be Ready (no tasks, no daemons)
+        // Group should be Ready (no tasks, no services)
         let group = engine.groups.get("mygroup").unwrap();
         assert_eq!(group.state.status, GroupStatus::Ready);
         // No tasks should be running
@@ -4036,11 +4036,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_only_startup_skips_daemon_only_group() {
+    async fn test_task_only_startup_skips_service_only_group() {
         let groups = vec![Group {
-            name: "daemon-only".to_string(),
+            name: "service-only".to_string(),
             tasks: vec![],
-            daemons: vec![DaemonCommand::new("server", "sleep 1")],
+            services: vec![ServiceCommand::new("server", "sleep 1")],
             patterns: vec!["*.test".to_string()],
             ..Default::default()
         }];
@@ -4048,23 +4048,23 @@ mod tests {
 
         engine.startup().await.unwrap();
 
-        let group = engine.groups.get("daemon-only").unwrap();
+        let group = engine.groups.get("service-only").unwrap();
         assert_eq!(group.state.status, GroupStatus::Ready);
         assert!(engine.running_tasks.is_empty());
-        assert!(!group.daemons_started);
+        assert!(!group.services_started);
     }
 
     #[tokio::test]
-    async fn test_task_only_dependency_on_daemon_only_group_triggers_dependents() {
-        let daemon_only = Group {
+    async fn test_task_only_dependency_on_service_only_group_triggers_dependents() {
+        let service_only = Group {
             name: "a".to_string(),
             tasks: vec![],
-            daemons: vec![DaemonCommand::new("server", "sleep 1")],
+            services: vec![ServiceCommand::new("server", "sleep 1")],
             patterns: vec!["*.test".to_string()],
             ..Default::default()
         };
         let dependent = test_group_with_deps("b", &["task1"], &["a"]);
-        let mut engine = create_test_task_only_engine(vec![daemon_only, dependent]);
+        let mut engine = create_test_task_only_engine(vec![service_only, dependent]);
 
         engine.startup().await.unwrap();
 
@@ -4081,10 +4081,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_startup_daemon_only_group_triggers_dependents() {
-        let daemon_only = test_daemon_group("a", "sleep 1");
+    async fn test_startup_service_only_group_triggers_dependents() {
+        let service_only = test_service_group("a", "sleep 1");
         let dependent = test_group_with_deps("b", &["task1"], &["a"]);
-        let mut engine = create_test_engine(vec![daemon_only, dependent]);
+        let mut engine = create_test_engine(vec![service_only, dependent]);
 
         engine.startup().await.unwrap();
 
@@ -4092,7 +4092,7 @@ mod tests {
             engine.groups.get("a").unwrap().state.status,
             GroupStatus::Ready
         );
-        assert!(engine.groups.get("a").unwrap().daemons_started);
+        assert!(engine.groups.get("a").unwrap().services_started);
         assert_eq!(
             engine.groups.get("b").unwrap().state.status,
             GroupStatus::Running
@@ -4129,7 +4129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_startup_sets_daemon_status_running() {
+    async fn test_startup_sets_service_status_running() {
         let groups = vec![test_group("mygroup", &["task1"])];
         let mut engine = create_test_engine(groups);
 
@@ -4339,31 +4339,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restart_group_daemon_only_uses_shared_execution_and_cascades() {
+    async fn test_restart_group_service_only_uses_shared_execution_and_cascades() {
         let groups = vec![
-            test_daemon_group("a", "sleep 1"),
+            test_service_group("a", "sleep 1"),
             test_group_with_deps_and_command("b", &["task1"], &["a"], "sleep 0.05"),
         ];
         let mut engine = create_test_engine(groups);
 
-        engine.groups.get_mut("a").unwrap().daemons_started = true;
+        engine.groups.get_mut("a").unwrap().services_started = true;
         engine.groups.get_mut("a").unwrap().state.status = GroupStatus::Ready;
         engine.groups.get_mut("b").unwrap().state.status = GroupStatus::Ready;
 
         engine.restart_group("a").await.unwrap();
 
-        assert!(engine.groups.get("a").unwrap().daemons_started);
+        assert!(engine.groups.get("a").unwrap().services_started);
         assert_eq!(
             engine.groups.get("a").unwrap().state.status,
             GroupStatus::Ready
         );
         assert_eq!(
-            engine.groups.get("a").unwrap().state.daemons[0].status,
+            engine.groups.get("a").unwrap().state.services[0].status,
             ProcessStatus::Running
         );
         assert!(engine.running_tasks.contains("b:task1"));
 
-        // Avoid leaking the started daemon process from the test.
+        // Avoid leaking the started service process from the test.
         engine.shutdown().await.unwrap();
     }
 
@@ -4547,16 +4547,16 @@ mod tests {
 
     #[test]
     fn test_rebuild_groups_preserves_unchanged_runtime_state() {
-        let unchanged = test_daemon_group("keep", "sleep 30");
+        let unchanged = test_service_group("keep", "sleep 30");
         let modified = test_group("change", &["task1"]);
         let mut engine = create_test_engine(vec![unchanged.clone(), modified.clone()]);
 
         {
             let keep = engine.groups.get_mut("keep").unwrap();
-            keep.daemons_started = true;
+            keep.services_started = true;
             keep.state.status = GroupStatus::Ready;
-            keep.state.daemons[0].status = ProcessStatus::Running;
-            keep.state.daemons[0].pid = Some(4242);
+            keep.state.services[0].status = ProcessStatus::Running;
+            keep.state.services[0].pid = Some(4242);
             keep.pending_restarts[0] = Some(Instant::now() + Duration::from_secs(5));
         }
 
@@ -4569,14 +4569,14 @@ mod tests {
         engine.rebuild_groups(diff).unwrap();
 
         let keep = engine.groups.get("keep").unwrap();
-        assert!(keep.daemons_started);
+        assert!(keep.services_started);
         assert_eq!(keep.state.status, GroupStatus::Ready);
-        assert_eq!(keep.state.daemons[0].status, ProcessStatus::Running);
-        assert_eq!(keep.state.daemons[0].pid, Some(4242));
+        assert_eq!(keep.state.services[0].status, ProcessStatus::Running);
+        assert_eq!(keep.state.services[0].pid, Some(4242));
         assert!(keep.pending_restarts[0].is_some());
 
         let change = engine.groups.get("change").unwrap();
-        assert!(!change.daemons_started);
+        assert!(!change.services_started);
         assert_eq!(change.state.status, GroupStatus::Pending);
         assert!(change.pending_restarts.is_empty());
     }
@@ -4597,7 +4597,7 @@ mod tests {
 name = "server"
 patterns = ["server.txt"]
 
-[[group.daemon]]
+[[group.service]]
 name = "server"
 command = "sleep 30"
 
@@ -4627,7 +4627,7 @@ command = "printf dependent >> '{dependent_log}'"
         engine.startup().await.unwrap();
         assert!(engine.wait_for_tasks().await);
 
-        let original_pid = engine.groups["server"].state.daemons[0].pid.unwrap();
+        let original_pid = engine.groups["server"].state.services[0].pid.unwrap();
         assert_eq!(std::fs::read_to_string(&source_log).unwrap(), "source");
         assert_eq!(
             std::fs::read_to_string(&dependent_log).unwrap(),
@@ -4640,7 +4640,7 @@ command = "printf dependent >> '{dependent_log}'"
 name = "server"
 patterns = ["server.txt"]
 
-[[group.daemon]]
+[[group.service]]
 name = "server"
 command = "sleep 30"
 
@@ -4675,11 +4675,11 @@ command = "printf watch >> '{changed_log}'"
 on_change_only = true
 
 [[group]]
-name = "new-daemon"
-patterns = ["new-daemon.txt"]
+name = "new-service"
+patterns = ["new-service.txt"]
 
-[[group.daemon]]
-name = "new-daemon"
+[[group.service]]
+name = "new-service"
 command = "sleep 30"
 "#,
             source_log = source_log.display(),
@@ -4697,7 +4697,7 @@ command = "sleep 30"
             } => {
                 assert_eq!(added.len(), 2);
                 assert!(added.contains(&"changed".to_string()));
-                assert!(added.contains(&"new-daemon".to_string()));
+                assert!(added.contains(&"new-service".to_string()));
                 assert!(removed.is_empty());
                 assert_eq!(modified, vec!["source"]);
             }
@@ -4706,7 +4706,7 @@ command = "sleep 30"
 
         assert!(engine.wait_for_tasks().await);
 
-        let reloaded_pid = engine.groups["server"].state.daemons[0].pid.unwrap();
+        let reloaded_pid = engine.groups["server"].state.services[0].pid.unwrap();
         assert_eq!(reloaded_pid, original_pid);
         assert_eq!(
             std::fs::read_to_string(&source_log).unwrap(),
@@ -4717,13 +4717,13 @@ command = "sleep 30"
             "dependent"
         );
         assert_eq!(std::fs::read_to_string(&changed_log).unwrap(), "startup");
-        assert!(engine.groups["new-daemon"].state.daemons[0].pid.is_some());
+        assert!(engine.groups["new-service"].state.services[0].pid.is_some());
 
         engine.shutdown().await.unwrap();
     }
 
     // =========================================================================
-    // cascade_daemon_restart tests
+    // cascade_service_restart tests
     // =========================================================================
 
     #[tokio::test]
@@ -4765,14 +4765,14 @@ command = "sleep 30"
     }
 
     #[tokio::test]
-    async fn test_daemon_command_expands_user_variables() {
+    async fn test_service_command_expands_user_variables() {
         use tempfile::TempDir;
 
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("zaz.toml");
-        let output_path = temp_dir.path().join("daemon-out");
+        let output_path = temp_dir.path().join("service-out");
 
-        // The daemon writes the expanded value of `${sentinel}` to a file.
+        // The service writes the expanded value of `${sentinel}` to a file.
         // If expansion is broken, the shell sees an unset variable and the file
         // is empty. `no_pty` is required for environments where openpty is
         // disallowed.
@@ -4785,7 +4785,7 @@ sentinel = "expansion-worked"
 name = "writer"
 patterns = ["*.never-matches"]
 
-[[group.daemon]]
+[[group.service]]
 name = "writer"
 command = "printf '${{sentinel}}' > '{output}'; sleep 30"
 no_pty = true
@@ -4814,7 +4814,7 @@ no_pty = true
 
         assert_eq!(
             contents, "expansion-worked",
-            "daemon command was not expanded; file contained {:?}",
+            "service command was not expanded; file contained {:?}",
             contents
         );
     }
@@ -4822,7 +4822,7 @@ no_pty = true
     #[tokio::test]
     async fn test_trigger_dependents_on_restart_does_nothing_for_ready_groups() {
         // This test documents the current behavior: trigger_dependents only affects
-        // groups that are in waiting state. For restart cascading, use cascade_daemon_restart.
+        // groups that are in waiting state. For restart cascading, use cascade_service_restart.
         let groups = vec![
             test_group("a", &["task1"]),
             test_group_with_deps("b", &["task1"], &["a"]),
@@ -4843,7 +4843,7 @@ no_pty = true
         engine.trigger_dependents("a");
 
         // b should still be Ready (not Running) because it wasn't waiting
-        // The cascade for restarts should go through cascade_daemon_restart instead
+        // The cascade for restarts should go through cascade_service_restart instead
         assert_eq!(
             engine.groups.get("b").unwrap().state.status,
             GroupStatus::Ready

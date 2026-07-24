@@ -1,22 +1,7 @@
-use std::path::Path;
-use std::process::{Command, Output};
+mod support;
+
+use support::{run_zaz, stderr_string};
 use tempfile::TempDir;
-
-fn zaz_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_zaz")
-}
-
-fn run_zaz(current_dir: &Path, args: &[&str]) -> Output {
-    Command::new(zaz_bin())
-        .args(args)
-        .current_dir(current_dir)
-        .output()
-        .expect("failed to run zaz binary")
-}
-
-fn stderr_string(output: &Output) -> String {
-    String::from_utf8(output.stderr.clone()).expect("stderr should be valid utf-8")
-}
 
 #[test]
 fn restart_discovers_project_socket_from_nested_directory() {

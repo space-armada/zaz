@@ -17,13 +17,13 @@ ignore = ["**/__pycache__/**", ".venv/**"]
   name = "migrate"
   command = "python -m app.migrate"
 
-  [[group.daemon]]
+  [[group.service]]
   name = "worker"
   command = "python -m app.worker"
   signal = "SIGINT"
   no_pty = true
   delay = "500ms"
 
-    [group.daemon.env]
+    [group.service.env]
     PYTHONUNBUFFERED = "1"
     APP_ENV = "production"
