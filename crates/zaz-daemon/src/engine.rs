@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group, LogStorageBackend};
 use zaz_process::{
-    CommandOutput, Executor, HookRun, KillAction, OutputLine, ProcessError, Service,
+    CommandOutput, Executor, HookRun, KillAction, OutputLine, ProcessError, ReadyPoll, Service,
     StopEscalation, TaskRunner,
 };
 use zaz_vars::Context;
@@ -223,6 +223,7 @@ async fn execute_task(ctx: TaskExecutionContext, log_tx: mpsc::Sender<LogLine>) 
 #[derive(Debug, Clone, Copy)]
 enum HookKind {
     Cleanup,
+    Ready,
     Stop,
     Kill,
 }
@@ -231,6 +232,7 @@ impl HookKind {
     fn label(self) -> &'static str {
         match self {
             HookKind::Cleanup => "cleanup",
+            HookKind::Ready => "ready check",
             HookKind::Stop => "stop",
             HookKind::Kill => "kill",
         }
@@ -499,6 +501,134 @@ fn spawn_hook_driver(
 
         drive_hook(kind, run, output_rx, &name, &group_name, silence, &log_tx).await;
     });
+}
+
+/// Advance a service's readiness window by one tick.
+///
+/// Returns the status the service has settled on, or None while it is still starting or has
+/// no `ready_check` at all. A service that never reports ready is left running: tearing it
+/// down here would feed it straight back into the restart path, which would spawn it, arm a
+/// fresh window, time out, and tear it down again.
+///
+/// Probe output is deliberately not streamed. A thirty-second window at the default interval
+/// runs three hundred checks, and three hundred hook headers would bury the service's own
+/// output. What the last failing check printed is carried by the timeout line instead, which
+/// is where an operator actually needs it.
+async fn tick_readiness(
+    service: &mut Service,
+    group_name: &str,
+    now: Instant,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) -> Option<ProcessStatus> {
+    match service.poll_readiness(now) {
+        ReadyPoll::Idle | ReadyPoll::Waiting => None,
+
+        ReadyPoll::Due { first } => {
+            start_ready_probe(service, group_name, first, expander, log_tx).await
+        }
+
+        ReadyPoll::Passed { waited } => {
+            tracing::info!(
+                service = %service.name(),
+                waited_ms = waited.as_millis(),
+                "service reported ready"
+            );
+
+            let log_msg = format!("ready after {:.2}s", waited.as_secs_f64());
+            let _ = log_tx
+                .send(LogLine::daemon(service.name(), log_msg).with_group(group_name.to_string()))
+                .await;
+
+            Some(ProcessStatus::Running)
+        }
+
+        ReadyPoll::TimedOut {
+            waited,
+            last_failure,
+        } => {
+            tracing::warn!(
+                service = %service.name(),
+                waited_ms = waited.as_millis(),
+                "ready timeout expired; treating the service as failed to start"
+            );
+
+            let log_msg = match last_failure {
+                Some(failure) => format!(
+                    "gave up waiting for readiness after {:.2}s: {}",
+                    waited.as_secs_f64(),
+                    failure
+                ),
+                None => format!(
+                    "gave up waiting for readiness after {:.2}s",
+                    waited.as_secs_f64()
+                ),
+            };
+            let _ = log_tx
+                .send(LogLine::daemon(service.name(), log_msg).with_group(group_name.to_string()))
+                .await;
+
+            Some(ProcessStatus::Failed)
+        }
+    }
+}
+
+/// Spawn one readiness probe, detached, and report the status when the check cannot run.
+///
+/// A check whose variables do not expand, or whose shell will not spawn, fails the service
+/// outright rather than polling on to the timeout. Neither gets better inside the window, so
+/// waiting would only repeat the same failure every interval before reaching the same verdict.
+async fn start_ready_probe(
+    service: &mut Service,
+    group_name: &str,
+    first: bool,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) -> Option<ProcessStatus> {
+    let name = service.name().to_string();
+    let template = service.ready_check_template()?.to_string();
+
+    let command = match expander.expand(&template) {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "ready_check expansion failed; the service cannot report ready"
+            );
+            log_hook_skipped(HookKind::Ready, &name, group_name, &e.to_string(), log_tx).await;
+            service.abandon_readiness();
+
+            return Some(ProcessStatus::Failed);
+        }
+    };
+
+    if first {
+        log_hook_header(HookKind::Ready, &name, group_name, &command, log_tx).await;
+    }
+
+    match service.begin_ready_probe(&command) {
+        Ok(probe) => {
+            tokio::spawn(probe.run());
+            None
+        }
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "ready_check could not spawn; the service cannot report ready"
+            );
+            let _ = log_tx
+                .send(
+                    LogLine::daemon(&name, format!("ready check failed: {}", e))
+                        .with_group(group_name.to_string()),
+                )
+                .await;
+            service.abandon_readiness();
+
+            Some(ProcessStatus::Failed)
+        }
+    }
 }
 
 /// Pump a hook's output into the log store until the run ends, then log its footer.
@@ -1738,6 +1868,7 @@ impl Engine {
                     // Start service
                     tracing::info!(service = %service.name(), "starting service");
                     service.start(&command).map_err(DaemonError::Process)?;
+                    service.arm_readiness();
 
                     // Get PTY reader for streaming output
                     if let Some(reader) = service.try_clone_reader() {
@@ -1761,7 +1892,14 @@ impl Engine {
                     .map_err(DaemonError::Process)?;
                 }
 
-                group.state.services[idx].status = ProcessStatus::Running;
+                // A service with a `ready_check` is spawned, not ready. Only the readiness
+                // tick moves it on from here. The signal branch above armed nothing, so a
+                // service being asked to restart stays where it was until it respawns.
+                group.state.services[idx].status = if service.awaiting_readiness() {
+                    ProcessStatus::Starting
+                } else {
+                    ProcessStatus::Running
+                };
                 group.state.services[idx].pid = service.pid();
             }
 
@@ -1870,6 +2008,7 @@ impl Engine {
 
                         tracing::info!(service = %service.name(), "restarting service");
                         service.start(&command).map_err(DaemonError::Process)?;
+                        service.arm_readiness();
 
                         if let Some(reader) = service.try_clone_reader() {
                             pty_readers.push((
@@ -1879,7 +2018,11 @@ impl Engine {
                             ));
                         }
 
-                        group.state.services[idx].status = ProcessStatus::Running;
+                        group.state.services[idx].status = if service.awaiting_readiness() {
+                            ProcessStatus::Starting
+                        } else {
+                            ProcessStatus::Running
+                        };
                         group.state.services[idx].pid = service.pid();
                         group.pending_restarts[idx] = None;
                     }
@@ -1920,8 +2063,17 @@ impl Engine {
                         .await;
 
                     group.pending_restarts[idx] = Some(now + delay);
-                } else if let Some(escalation) = service.enforce_stop_deadline(now) {
-                    handle_escalation(service, group_name, escalation, &expander, &log_tx).await;
+                } else {
+                    if let Some(escalation) = service.enforce_stop_deadline(now) {
+                        handle_escalation(service, group_name, escalation, &expander, &log_tx)
+                            .await;
+                    }
+
+                    if let Some(status) =
+                        tick_readiness(service, group_name, now, &expander, &log_tx).await
+                    {
+                        group.state.services[idx].status = status;
+                    }
                 }
             }
         }
@@ -6209,6 +6361,256 @@ stop_timeout = "{timeout}"
         assert_eq!(
             engine.groups.get("b").unwrap().state.status,
             GroupStatus::Ready
+        );
+    }
+
+    /// Write a config whose lone service waits on a readiness check the test controls.
+    ///
+    /// `no_pty` is required for environments where openpty is disallowed, and the pattern never
+    /// matches so the only trigger under test is the one the test drives.
+    fn write_ready_check_config(config_path: &Path, extra_service_fields: &str) {
+        let config = format!(
+            r#"
+[[group]]
+name = "hooked"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "hooked"
+command = "sleep 30"
+no_pty = true
+{extra}
+"#,
+            extra = extra_service_fields,
+        );
+        std::fs::write(config_path, config).unwrap();
+    }
+
+    fn ready_status(engine: &Engine) -> ProcessStatus {
+        engine.groups.get("hooked").unwrap().state.services[0].status
+    }
+
+    /// Drive `check_services` until the service reports `expected`, or give up after five
+    /// seconds. Readiness settles a tick or more after the probe that decided it, since the
+    /// probe runs detached and only a later tick reads its verdict.
+    async fn pump_until_status(engine: &mut Engine, expected: ProcessStatus) -> ProcessStatus {
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            if ready_status(engine) == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        ready_status(engine)
+    }
+
+    #[tokio::test]
+    async fn test_a_service_without_a_ready_check_is_running_the_moment_it_spawns() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+
+        write_ready_check_config(&config_path, "");
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        let status = ready_status(&engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            status,
+            ProcessStatus::Running,
+            "a service that configures no readiness check must behave exactly as it always has"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_service_stays_starting_until_its_ready_check_passes() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let marker = temp_dir.path().join("listening");
+
+        write_ready_check_config(
+            &config_path,
+            &format!(
+                "ready_check = \"test -f '{marker}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                marker = marker.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        assert_eq!(
+            ready_status(&engine),
+            ProcessStatus::Starting,
+            "a spawned service with a readiness check has not reported ready yet"
+        );
+
+        for _ in 0..5 {
+            engine.check_services().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            ready_status(&engine),
+            ProcessStatus::Starting,
+            "a check that keeps failing must not move the service on"
+        );
+
+        std::fs::write(&marker, "").unwrap();
+
+        let status = pump_until_status(&mut engine, ProcessStatus::Running).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(status, ProcessStatus::Running);
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("ready check: test -f")),
+            "the first probe must name the check being polled: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|line| line.starts_with("ready after")),
+            "the pass must be reported: {:?}",
+            logs
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.starts_with("ready check: "))
+                .count(),
+            1,
+            "only the first probe of a window names the check; the rest would flood: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_ready_check_that_never_passes_fails_the_service_but_leaves_it_running() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+
+        write_ready_check_config(
+            &config_path,
+            "ready_check = \"echo not listening yet >&2; exit 7\"\n\
+             ready_poll_interval = \"20ms\"\n\
+             ready_timeout = \"200ms\"",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        let status = pump_until_status(&mut engine, ProcessStatus::Failed).await;
+        let still_running = engine.groups.get_mut("hooked").unwrap().services[0].is_running();
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(status, ProcessStatus::Failed);
+        assert!(
+            still_running,
+            "tearing the service down would feed it back into the restart path and time out again"
+        );
+
+        let gave_up = logs
+            .iter()
+            .find(|line| line.starts_with("gave up waiting for readiness after"))
+            .unwrap_or_else(|| panic!("the timeout must be reported: {:?}", logs));
+        assert!(
+            gave_up.contains("exit code 7") && gave_up.contains("not listening yet"),
+            "the timeout must carry what the last check printed, got {:?}",
+            gave_up
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_restart_opens_a_fresh_readiness_window() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let marker = temp_dir.path().join("listening");
+        std::fs::write(&marker, "").unwrap();
+
+        write_ready_check_config(
+            &config_path,
+            &format!(
+                "ready_check = \"test -f '{marker}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                marker = marker.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        assert_eq!(
+            pump_until_status(&mut engine, ProcessStatus::Running).await,
+            ProcessStatus::Running
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        assert_eq!(
+            pump_until_status(&mut engine, ProcessStatus::Starting).await,
+            ProcessStatus::Starting,
+            "a respawned service owes its readiness check all over again"
+        );
+
+        std::fs::write(&marker, "").unwrap();
+
+        let status = pump_until_status(&mut engine, ProcessStatus::Running).await;
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(status, ProcessStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_an_unexpandable_ready_check_fails_the_service() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+
+        write_ready_check_config(
+            &config_path,
+            "ready_check = \"test -f ${no_such_variable}\"\n\
+             ready_poll_interval = \"20ms\"\n\
+             ready_timeout = \"10s\"",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        let status = pump_until_status(&mut engine, ProcessStatus::Failed).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            status,
+            ProcessStatus::Failed,
+            "a check that cannot be built is a check that can never pass, so waiting out the \
+             ten-second window would only reach the same verdict"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("ready check skipped:")),
+            "the failed expansion must be reported: {:?}",
+            logs
         );
     }
 }

@@ -14,6 +14,9 @@ pub use error::ProcessError;
 pub use executor::{CommandOutput, Executor, OutputLine, StreamingRun};
 pub use launcher::{DaemonLauncher, LaunchHandle};
 pub use pty::ManagedChild;
-pub use service::{HookRun, KillAction, Service, ServiceExitInfo, ServiceState, StopEscalation};
+pub use service::{
+    HookRun, KillAction, ReadyPoll, ReadyProbeRun, Service, ServiceExitInfo, ServiceState,
+    StopEscalation,
+};
 pub use signal::SignalHandler;
 pub use task::TaskRunner;

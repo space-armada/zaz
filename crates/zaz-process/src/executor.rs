@@ -4,9 +4,14 @@ use crate::pty::ManagedChild;
 use crate::ProcessError;
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+
+/// How long a finished command's output readers get to reach EOF before the run gives up on
+/// them and returns what it has.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// Output from a command execution.
 #[derive(Debug, Clone)]
@@ -206,6 +211,14 @@ impl StreamingRun {
         .await
     }
 
+    /// Drive the command to completion, discarding output as it arrives.
+    ///
+    /// The output still comes back collected in `CommandOutput`, so a caller that only wants
+    /// it after the fact does not have to wire up a channel it will never read.
+    pub async fn collect(self) -> Result<CommandOutput, ProcessError> {
+        self.drive(|_| {}).await
+    }
+
     /// Drive the command to completion, streaming output to a callback.
     async fn drive<F>(self, on_output: F) -> Result<CommandOutput, ProcessError>
     where
@@ -273,17 +286,27 @@ impl StreamingRun {
                     tracing::debug!("streaming run: child.wait() returned");
                     let status = status.map_err(ProcessError::Spawn)?;
 
-                    // Drain remaining output
-                    stdout_rx.close();
-                    stderr_rx.close();
+                    // The child is gone, but its readers may still be working through what it
+                    // left in the pipes. Each closes its sender at EOF, which is what ends this
+                    // drain, so a command that exits the instant it prints still reports what
+                    // it printed.
+                    //
+                    // The wait is bounded because a grandchild that inherited the pipe holds it
+                    // open past the child's own exit. A command that backgrounds something must
+                    // not hang the run that started it.
+                    let drain = async {
+                        while let Some(line) = stdout_rx.recv().await {
+                            on_output(OutputLine::Stdout(line.clone()));
+                            stdout_lines.push(line);
+                        }
+                        while let Some(line) = stderr_rx.recv().await {
+                            on_output(OutputLine::Stderr(line.clone()));
+                            stderr_lines.push(line);
+                        }
+                    };
 
-                    while let Some(line) = stdout_rx.recv().await {
-                        on_output(OutputLine::Stdout(line.clone()));
-                        stdout_lines.push(line);
-                    }
-                    while let Some(line) = stderr_rx.recv().await {
-                        on_output(OutputLine::Stderr(line.clone()));
-                        stderr_lines.push(line);
+                    if tokio::time::timeout(OUTPUT_DRAIN_GRACE, drain).await.is_err() {
+                        tracing::debug!("streaming run: output drain timed out, pipe still held");
                     }
 
                     tracing::debug!(exit_code = ?status.code(), "streaming run: returning");

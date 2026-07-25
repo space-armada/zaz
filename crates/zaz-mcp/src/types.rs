@@ -83,6 +83,7 @@ pub enum ProcessKind {
 #[serde(rename_all = "lowercase")]
 pub enum ProcessStatusReport {
     Pending,
+    Starting,
     Running,
     Success,
     Failed,
@@ -378,6 +379,7 @@ impl From<ProcessStatus> for ProcessStatusReport {
     fn from(value: ProcessStatus) -> Self {
         match value {
             ProcessStatus::Pending => Self::Pending,
+            ProcessStatus::Starting => Self::Starting,
             ProcessStatus::Running => Self::Running,
             ProcessStatus::Success => Self::Success,
             ProcessStatus::Failed => Self::Failed,

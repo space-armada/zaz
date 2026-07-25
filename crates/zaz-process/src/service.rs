@@ -5,7 +5,7 @@ use crate::pty::ManagedChild;
 use crate::{Executor, ProcessError, SignalHandler};
 use nix::sys::signal::Signal;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use zaz_config::{ServiceCommand, Silence};
@@ -21,6 +21,19 @@ const BACKOFF_MULTIPLIER: u32 = 2;
 
 /// Grace period before escalating to SIGKILL when a service sets no `stop_timeout`.
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Gap between `ready_check` runs when a service sets no `ready_poll_interval`.
+const DEFAULT_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a `ready_check` may keep failing when a service sets no `ready_timeout`.
+///
+/// Longer than the stop timeout because legitimate startup times vary far more widely than
+/// shutdowns do. A JVM warming up or a container running an entrypoint script would trip a
+/// ten-second window that a graceful shutdown never gets near.
+const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many characters of a failed probe's output the readiness timeout message carries.
+const READY_FAILURE_OUTPUT_LIMIT: usize = 400;
 
 /// Information about a service that has exited.
 #[derive(Debug)]
@@ -92,6 +105,159 @@ impl Drop for FinishedOnDrop {
     }
 }
 
+/// A readiness probe the daemon started for this service.
+///
+/// The run is driven by a detached task, so only what a later tick needs stays here: the
+/// process group to kill if the window closes on a probe still running, the flags that task
+/// raises, and whatever the probe printed if it reported not-ready.
+struct TrackedProbe {
+    pgid: Option<u32>,
+    finished: Arc<AtomicBool>,
+    passed: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl TrackedProbe {
+    /// Take what this probe printed when it failed, leaving the slot empty.
+    fn take_failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+/// The window a service spends spawned but not yet reporting ready.
+///
+/// Modelled on `stop_deadline`: the window lives on the service and `poll_readiness` decides
+/// against a caller-supplied `now`, so readiness needs no clock of its own and stays testable
+/// without one.
+struct ReadyState {
+    started_at: Instant,
+    deadline: Instant,
+    next_attempt: Instant,
+    probe: Option<TrackedProbe>,
+    attempts: u32,
+
+    /// What the most recent failing probe printed, kept across probes for the message a
+    /// readiness timeout logs.
+    last_failure: Option<String>,
+}
+
+/// What a readiness tick calls for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadyPoll {
+    /// The service has no `ready_check`, or its readiness is already settled.
+    Idle,
+
+    /// Still inside the window, with no probe due this tick.
+    Waiting,
+
+    /// A probe is due. The caller expands `ready_check` and hands the run back through
+    /// `begin_ready_probe`.
+    Due {
+        /// True for the first probe of this window, which is where the check is worth naming
+        /// in the log. Naming it on all three hundred would drown out the service's own
+        /// output.
+        first: bool,
+    },
+
+    /// A probe exited zero. The service is ready.
+    Passed {
+        /// How long the service spent waiting to report ready.
+        waited: Duration,
+    },
+
+    /// The window closed with no probe reporting ready.
+    TimedOut {
+        /// How long the service was given before it was given up on.
+        waited: Duration,
+
+        /// What the last failing probe printed, absent when no probe ever finished.
+        last_failure: Option<String>,
+    },
+}
+
+/// A readiness probe handed to the caller to drive to completion.
+///
+/// The poll branch that starts a probe is cancelled whenever an API command arrives, and an
+/// attached TUI asks for status twice a second. A probe awaited there would be dropped
+/// mid-run on every one of those, so any check slower than that cadence would never finish.
+/// Driving it from a detached task is what makes a slow check workable at all.
+///
+/// The outcome lands in the flags the service kept rather than being returned, since the
+/// tick that reads it is a later one than the tick that started the run.
+pub struct ReadyProbeRun {
+    run: StreamingRun,
+    passed: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
+
+    // Same placement as `HookRun`: on the handle, so a driver dropped before it was ever
+    // polled still clears the flag and lets the next tick start a fresh probe.
+    _guard: FinishedOnDrop,
+}
+
+impl ReadyProbeRun {
+    /// Drive the probe to completion and record whether the service reported ready.
+    ///
+    /// A zero exit means ready. Every other ending means not yet, and what the check printed
+    /// is kept for the message a readiness timeout logs.
+    pub async fn run(self) {
+        let Self {
+            run,
+            passed,
+            failure,
+            _guard,
+        } = self;
+
+        let message = match run.collect().await {
+            Ok(output) if output.exit_code == Some(0) => {
+                passed.store(true, Ordering::Release);
+                return;
+            }
+            Ok(output) => describe_failed_probe(&output),
+            Err(e) => format!("could not run: {}", e),
+        };
+
+        *failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message);
+    }
+}
+
+/// Render a probe that reported not-ready: how it ended, then what it printed.
+///
+/// An operator reading a readiness timeout wants the check's own words. A bare exit code
+/// says the check failed without saying what it saw.
+fn describe_failed_probe(output: &CommandOutput) -> String {
+    let ending = match output.exit_code {
+        Some(code) => format!("exit code {}", code),
+        None => "killed by a signal".to_string(),
+    };
+
+    let printed: Vec<&str> = output
+        .stdout
+        .iter()
+        .chain(output.stderr.iter())
+        .map(String::as_str)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    if printed.is_empty() {
+        return ending;
+    }
+
+    let joined = printed.join("; ");
+    let truncated: String = joined.chars().take(READY_FAILURE_OUTPUT_LIMIT).collect();
+    let ellipsis = if truncated.len() < joined.len() {
+        "..."
+    } else {
+        ""
+    };
+
+    format!("{}: {}{}", ending, truncated, ellipsis)
+}
+
 /// The kill step an expired stop timeout reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillAction {
@@ -124,6 +290,7 @@ pub struct Service {
     last_start: Option<Instant>,
     stop_deadline: Option<Instant>,
     hook: Option<TrackedHook>,
+    ready: Option<ReadyState>,
 }
 
 impl Service {
@@ -138,6 +305,7 @@ impl Service {
             last_start: None,
             stop_deadline: None,
             hook: None,
+            ready: None,
         }
     }
 
@@ -170,6 +338,29 @@ impl Service {
     /// Returns None when the service is force killed by a signal to its process group.
     pub fn kill_command_template(&self) -> Option<&str> {
         self.config.kill_command.as_deref()
+    }
+
+    /// Get the configured readiness check template, before variable expansion.
+    ///
+    /// Returns None when the service counts as ready the moment it spawns.
+    pub fn ready_check_template(&self) -> Option<&str> {
+        self.config.ready_check.as_deref()
+    }
+
+    /// How long the service waits between `ready_check` runs.
+    pub fn ready_poll_interval(&self) -> Duration {
+        self.config
+            .ready_poll_interval
+            .map(|t| t.as_duration())
+            .unwrap_or(DEFAULT_READY_POLL_INTERVAL)
+    }
+
+    /// How long the service's `ready_check` may keep failing before it is given up on.
+    pub fn ready_timeout(&self) -> Duration {
+        self.config
+            .ready_timeout
+            .map(|t| t.as_duration())
+            .unwrap_or(DEFAULT_READY_TIMEOUT)
     }
 
     /// Get the log suppression level configured for this service.
@@ -243,7 +434,175 @@ impl Service {
             return;
         }
 
+        self.ready = None;
         self.stop_deadline = Some(Instant::now() + self.stop_timeout());
+    }
+
+    /// Open a readiness window for a service that just spawned. Does nothing for a service
+    /// with no `ready_check`, which counts as ready the moment it starts.
+    ///
+    /// The first probe is due immediately. A service that is already accepting work should
+    /// not have to sit through a poll interval before it can say so.
+    pub fn arm_readiness(&mut self) {
+        if self.config.ready_check.is_none() {
+            return;
+        }
+
+        let now = Instant::now();
+
+        self.ready = Some(ReadyState {
+            started_at: now,
+            deadline: now + self.ready_timeout(),
+            next_attempt: now,
+            probe: None,
+            attempts: 0,
+            last_failure: None,
+        });
+    }
+
+    /// Returns true while the service is spawned but has not yet reported ready.
+    pub fn awaiting_readiness(&self) -> bool {
+        self.ready.is_some()
+    }
+
+    /// Close the readiness window for a check that cannot be run at all, such as one whose
+    /// variables do not expand or whose shell will not spawn.
+    ///
+    /// Neither gets better inside the window, so polling on to the timeout would only repeat
+    /// the same failure every interval. The caller decides what the service's status becomes.
+    pub fn abandon_readiness(&mut self) {
+        self.kill_running_probe();
+        self.ready = None;
+    }
+
+    /// Decide what an open readiness window owes this tick, against a caller-supplied `now`.
+    ///
+    /// Pure and non-awaiting, the same shape as `enforce_stop_deadline`. The probe itself
+    /// runs detached, so all this does is read the flags its driver raised and hand back the
+    /// next step.
+    ///
+    /// Both `Passed` and `TimedOut` close the window, so readiness settles once per spawn and
+    /// a service given up on is not polled forever. A restart opens a fresh window.
+    ///
+    /// A probe that passed wins over a deadline reached in the same tick. The check did
+    /// report ready, and the window is there to bound waiting, not to overrule an answer that
+    /// is already in.
+    pub fn poll_readiness(&mut self, now: Instant) -> ReadyPoll {
+        let Some(ready) = self.ready.as_mut() else {
+            return ReadyPoll::Idle;
+        };
+
+        let waited = now.saturating_duration_since(ready.started_at);
+        let expired = now >= ready.deadline;
+
+        let mut probe_running = false;
+        if let Some(probe) = ready.probe.take() {
+            if !probe.finished.load(Ordering::Acquire) {
+                probe_running = true;
+                ready.probe = Some(probe);
+            } else if probe.passed.load(Ordering::Acquire) {
+                self.ready = None;
+                return ReadyPoll::Passed { waited };
+            } else if let Some(failure) = probe.take_failure() {
+                ready.last_failure = Some(failure);
+            }
+        }
+
+        if !expired {
+            if probe_running || now < ready.next_attempt {
+                return ReadyPoll::Waiting;
+            }
+
+            return ReadyPoll::Due {
+                first: ready.attempts == 0,
+            };
+        }
+
+        let last_failure = ready.last_failure.take();
+
+        // A probe outliving the window it belongs to is orphaned the moment the window
+        // closes, so its process group goes with it. Leaving it would leak a shell per
+        // service that never came up.
+        self.kill_running_probe();
+        self.ready = None;
+
+        ReadyPoll::TimedOut {
+            waited,
+            last_failure,
+        }
+    }
+
+    /// Spawn a readiness probe with the given fully expanded command, recording its process
+    /// group so a probe still running when the window closes can be killed.
+    ///
+    /// The returned handle is driven by the caller rather than here, since a probe outlives
+    /// the poll tick that started it.
+    ///
+    /// The next attempt is scheduled from the start of this probe rather than from its end,
+    /// which makes the interval a floor on the gap between starts. A probe slower than its
+    /// interval simply runs back to back. Probes never overlap either way, since a window
+    /// holding one reports `Waiting` until it finishes.
+    pub fn begin_ready_probe(&mut self, command: &str) -> Result<ReadyProbeRun, ProcessError> {
+        let next_attempt = Instant::now() + self.ready_poll_interval();
+        if let Some(ready) = self.ready.as_mut() {
+            ready.next_attempt = next_attempt;
+            ready.attempts += 1;
+        }
+
+        let run = self.executor.spawn_streaming(command)?;
+        let finished = Arc::new(AtomicBool::new(false));
+        let passed = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(Mutex::new(None));
+
+        if let Some(ready) = self.ready.as_mut() {
+            ready.probe = Some(TrackedProbe {
+                pgid: run.pgid(),
+                finished: Arc::clone(&finished),
+                passed: Arc::clone(&passed),
+                failure: Arc::clone(&failure),
+            });
+        }
+
+        Ok(ReadyProbeRun {
+            run,
+            passed,
+            failure,
+            _guard: FinishedOnDrop(finished),
+        })
+    }
+
+    /// Kill the process group of a readiness probe that is still running. Returns true if
+    /// one was.
+    fn kill_running_probe(&self) -> bool {
+        let Some(probe) = self.ready.as_ref().and_then(|ready| ready.probe.as_ref()) else {
+            return false;
+        };
+
+        if probe.finished.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let Some(pgid) = probe.pgid else {
+            return false;
+        };
+
+        tracing::warn!(
+            name = %self.config.name(),
+            pgid = pgid,
+            "ready timeout expired with a check still running, killing it"
+        );
+
+        if let Err(e) = SignalHandler::send_to_group(pgid as i32, Signal::SIGKILL) {
+            tracing::warn!(
+                name = %self.config.name(),
+                pgid = pgid,
+                error = %e,
+                "could not kill readiness check; it has most likely already exited"
+            );
+            return false;
+        }
+
+        true
     }
 
     /// Start the service with the given fully expanded command.
@@ -262,6 +621,7 @@ impl Service {
         self.state = ServiceState::Running;
         self.last_start = Some(Instant::now());
         self.stop_deadline = None;
+        self.ready = None;
 
         Ok(())
     }
@@ -291,6 +651,7 @@ impl Service {
                     "sending restart signal"
                 );
                 SignalHandler::send_to_group(pid as i32, signal)?;
+                self.ready = None;
                 self.stop_deadline = Some(Instant::now() + self.stop_timeout());
             }
         }
@@ -305,6 +666,7 @@ impl Service {
             if let Some(pid) = child.id() {
                 tracing::info!(name = %self.config.name(), pid = pid, "stopping service");
                 SignalHandler::send_to_group(pid as i32, Signal::SIGTERM)?;
+                self.ready = None;
                 self.stop_deadline = Some(Instant::now() + self.stop_timeout());
             }
         }
@@ -473,6 +835,7 @@ impl Service {
                 self.child = None;
                 self.state = ServiceState::Stopped;
                 self.stop_deadline = None;
+                self.ready = None;
                 Ok(Some(ServiceExitInfo {
                     duration,
                     exit_code: status.code(),
@@ -878,5 +1241,202 @@ mod tests {
             .expect("an expired deadline must still report itself");
         assert_eq!(escalation.action, None);
         assert!(!escalation.killed_hook);
+    }
+
+    /// Build a service whose readiness window is under the test's control.
+    fn ready_service(check: Option<&str>, interval: Option<u64>, timeout: Option<u64>) -> Service {
+        let mut config = ServiceCommand::new("svc", "sleep 30");
+        config.no_pty = true;
+        config.ready_check = check.map(str::to_string);
+        config.ready_poll_interval = interval.map(zaz_config::HumanDuration::from_millis);
+        config.ready_timeout = timeout.map(zaz_config::HumanDuration::from_millis);
+
+        Service::new(config, Executor::new(Some("/bin/sh".to_string())))
+    }
+
+    /// Start a probe and drive it to completion, the way the daemon's detached task does.
+    async fn probe(service: &mut Service, command: &str) {
+        service.begin_ready_probe(command).unwrap().run().await;
+    }
+
+    #[test]
+    fn test_a_service_without_a_ready_check_never_opens_a_window() {
+        let mut service = ready_service(None, None, None);
+        service.arm_readiness();
+
+        assert!(!service.awaiting_readiness());
+        assert_eq!(service.poll_readiness(Instant::now()), ReadyPoll::Idle);
+    }
+
+    #[test]
+    fn test_unset_ready_tuning_falls_back_to_the_defaults() {
+        let service = ready_service(Some("true"), None, None);
+
+        assert_eq!(service.ready_poll_interval(), Duration::from_millis(100));
+        assert_eq!(service.ready_timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_configured_ready_tuning_overrides_the_defaults() {
+        let service = ready_service(Some("true"), Some(250), Some(5_000));
+
+        assert_eq!(service.ready_poll_interval(), Duration::from_millis(250));
+        assert_eq!(service.ready_timeout(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_arming_readiness_makes_the_first_probe_due_immediately() {
+        let mut service = ready_service(Some("true"), None, None);
+        service.arm_readiness();
+
+        assert!(service.awaiting_readiness());
+        assert_eq!(
+            service.poll_readiness(Instant::now()),
+            ReadyPoll::Due { first: true },
+            "a service that is already up must not wait out an interval to say so"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_passing_probe_settles_readiness() {
+        let mut service = ready_service(Some("true"), None, None);
+        service.arm_readiness();
+
+        probe(&mut service, "true").await;
+
+        assert!(matches!(
+            service.poll_readiness(Instant::now()),
+            ReadyPoll::Passed { .. }
+        ));
+        assert!(
+            !service.awaiting_readiness(),
+            "readiness settles once per spawn, so the window must close behind a pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_failing_probe_waits_out_the_interval_before_the_next_one() {
+        let mut service = ready_service(Some("false"), Some(500), None);
+        service.arm_readiness();
+
+        probe(&mut service, "false").await;
+
+        let now = Instant::now();
+        assert_eq!(service.poll_readiness(now), ReadyPoll::Waiting);
+        assert_eq!(
+            service.poll_readiness(now + Duration::from_millis(500)),
+            ReadyPoll::Due { first: false },
+            "only the first probe of a window names the check in the log"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_probe_still_running_holds_off_a_second_one() {
+        let mut service = ready_service(Some("sleep 30"), Some(1), None);
+        service.arm_readiness();
+
+        let _running = service.begin_ready_probe("sleep 30").unwrap();
+
+        assert_eq!(
+            service.poll_readiness(Instant::now() + Duration::from_secs(1)),
+            ReadyPoll::Waiting,
+            "probes must never overlap, however short the interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_closed_window_reports_what_the_last_failing_check_printed() {
+        let mut service = ready_service(Some("unused"), None, Some(50));
+        service.arm_readiness();
+
+        probe(&mut service, "echo not listening yet >&2; exit 7").await;
+
+        let ReadyPoll::TimedOut { last_failure, .. } =
+            service.poll_readiness(Instant::now() + Duration::from_secs(60))
+        else {
+            panic!("a window past its deadline must time out");
+        };
+
+        let failure = last_failure.expect("the last failing probe's output must survive");
+        assert!(
+            failure.contains("exit code 7") && failure.contains("not listening yet"),
+            "an operator needs the check's own words, got {:?}",
+            failure
+        );
+        assert!(!service.awaiting_readiness());
+    }
+
+    #[tokio::test]
+    async fn test_a_probe_outliving_its_window_is_killed() {
+        let mut service = ready_service(Some("sleep 30"), None, Some(50));
+        service.arm_readiness();
+
+        let running = service.begin_ready_probe("sleep 30").unwrap();
+
+        assert!(matches!(
+            service.poll_readiness(Instant::now() + Duration::from_secs(60)),
+            ReadyPoll::TimedOut { .. }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), running.run())
+            .await
+            .expect("the closed window left its probe running, leaking a shell");
+    }
+
+    #[tokio::test]
+    async fn test_a_pass_wins_a_deadline_reached_in_the_same_tick() {
+        let mut service = ready_service(Some("true"), None, Some(50));
+        service.arm_readiness();
+
+        probe(&mut service, "true").await;
+
+        assert!(
+            matches!(
+                service.poll_readiness(Instant::now() + Duration::from_secs(60)),
+                ReadyPoll::Passed { .. }
+            ),
+            "the window bounds waiting; it must not overrule an answer already in"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_reaped_exit_closes_the_readiness_window() {
+        let mut service = ready_service(Some("true"), None, None);
+        service.start("exit 0").unwrap();
+        service.arm_readiness();
+
+        wait_for_exit(&mut service)
+            .await
+            .expect("the service never reported its exit");
+
+        assert!(
+            !service.awaiting_readiness(),
+            "a service that exited is not going to report ready; its restart opens a new window"
+        );
+    }
+
+    #[test]
+    fn test_abandoning_readiness_closes_the_window() {
+        let mut service = ready_service(Some("true"), None, None);
+        service.arm_readiness();
+
+        service.abandon_readiness();
+
+        assert!(!service.awaiting_readiness());
+        assert_eq!(service.poll_readiness(Instant::now()), ReadyPoll::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_a_stop_closes_the_readiness_window() {
+        let mut service = ready_service(Some("true"), None, None);
+        service.start("sleep 30").unwrap();
+        service.arm_readiness();
+
+        service.stop().unwrap();
+
+        assert!(
+            !service.awaiting_readiness(),
+            "a service on its way down owes no readiness"
+        );
     }
 }

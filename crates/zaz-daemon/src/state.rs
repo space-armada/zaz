@@ -105,6 +105,10 @@ pub enum ProcessStatus {
     #[default]
     Pending,
 
+    /// Spawned, but its `ready_check` has not passed yet. Only a service configuring a
+    /// readiness check ever reaches this state.
+    Starting,
+
     /// Currently running.
     Running,
 
