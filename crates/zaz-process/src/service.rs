@@ -1,9 +1,11 @@
 //! Service process management.
 
-use crate::executor::{CommandOutput, OutputLine};
+use crate::executor::{CommandOutput, OutputLine, StreamingRun};
 use crate::pty::ManagedChild;
 use crate::{Executor, ProcessError, SignalHandler};
 use nix::sys::signal::Signal;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use zaz_config::{ServiceCommand, Silence};
@@ -45,6 +47,73 @@ pub enum ServiceState {
     Stopping,
 }
 
+/// A lifecycle hook process the daemon started for this service.
+///
+/// The run itself is driven by a detached task, so a cancelled poll can never drop the
+/// child. The service keeps only what the stop deadline needs: the process group to
+/// signal, and the flag that task raises once the run is over.
+struct TrackedHook {
+    pgid: u32,
+    finished: Arc<AtomicBool>,
+}
+
+/// A lifecycle hook handed to the caller to drive to completion.
+///
+/// Driving it elsewhere is what keeps a cancelled poll from dropping the hook's child. The
+/// service that issued this handle already recorded the process group, so it can still kill
+/// a hook that outlives the stop timeout.
+pub struct HookRun {
+    run: StreamingRun,
+
+    // The guard lives on the handle rather than inside `stream`, so a driver dropped before
+    // it was ever polled still clears the flag. Reporting a hook nobody is driving as
+    // running would stall every later poll of the service.
+    _guard: FinishedOnDrop,
+}
+
+impl HookRun {
+    /// Drive the hook to completion, streaming its output through the channel.
+    pub async fn stream(
+        self,
+        output_tx: mpsc::UnboundedSender<OutputLine>,
+    ) -> Result<CommandOutput, ProcessError> {
+        let _guard = self._guard;
+
+        self.run.stream(output_tx).await
+    }
+}
+
+/// Raises a hook's finished flag however its run ends, including a dropped driver.
+struct FinishedOnDrop(Arc<AtomicBool>);
+
+impl Drop for FinishedOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// The kill step an expired stop timeout reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillAction {
+    /// SIGKILL went to the service's own process group.
+    SentSignal,
+
+    /// The service configures `kill_command`. The caller runs it as a hook.
+    RunKillCommand,
+}
+
+/// What a service's expired stop timeout called for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopEscalation {
+    /// A hook was still running when the timeout expired, so its process group was killed
+    /// before the service's own kill step.
+    pub killed_hook: bool,
+
+    /// The kill step taken against the service, absent when the service was already gone or
+    /// the signal could not be delivered.
+    pub action: Option<KillAction>,
+}
+
 /// Manages a long-running service process.
 pub struct Service {
     config: ServiceCommand,
@@ -54,6 +123,7 @@ pub struct Service {
     restart_delay: Duration,
     last_start: Option<Instant>,
     stop_deadline: Option<Instant>,
+    hook: Option<TrackedHook>,
 }
 
 impl Service {
@@ -67,6 +137,7 @@ impl Service {
             restart_delay: MIN_RESTART_DELAY,
             last_start: None,
             stop_deadline: None,
+            hook: None,
         }
     }
 
@@ -85,6 +156,20 @@ impl Service {
     /// Returns None when the service has no cleanup hook.
     pub fn cleanup_command_template(&self) -> Option<&str> {
         self.config.cleanup_command.as_deref()
+    }
+
+    /// Get the configured stop command template, before variable expansion.
+    ///
+    /// Returns None when the service is stopped by a signal to its process group.
+    pub fn stop_command_template(&self) -> Option<&str> {
+        self.config.stop_command.as_deref()
+    }
+
+    /// Get the configured kill command template, before variable expansion.
+    ///
+    /// Returns None when the service is force killed by a signal to its process group.
+    pub fn kill_command_template(&self) -> Option<&str> {
+        self.config.kill_command.as_deref()
     }
 
     /// Get the log suppression level configured for this service.
@@ -116,6 +201,49 @@ impl Service {
         output_tx: mpsc::UnboundedSender<OutputLine>,
     ) -> Result<CommandOutput, ProcessError> {
         self.executor.run_streaming(command, output_tx).await
+    }
+
+    /// Spawn a stop or kill hook with the given fully expanded command, recording its
+    /// process group so a hook that outlives the stop timeout can be killed.
+    ///
+    /// The returned handle is driven by the caller rather than here, since a hook outlives
+    /// the poll tick that started it. The cleanup hook does not go through this: it is
+    /// awaited before a spawn, when no stop timeout is running.
+    pub fn begin_hook(&mut self, command: &str) -> Result<HookRun, ProcessError> {
+        let run = self.executor.spawn_streaming(command)?;
+        let finished = Arc::new(AtomicBool::new(false));
+
+        if let Some(pgid) = run.pgid() {
+            self.hook = Some(TrackedHook {
+                pgid,
+                finished: Arc::clone(&finished),
+            });
+        }
+
+        Ok(HookRun {
+            run,
+            _guard: FinishedOnDrop(finished),
+        })
+    }
+
+    /// Returns true while a stop or kill hook this service started is still running.
+    pub fn has_running_hook(&self) -> bool {
+        self.hook
+            .as_ref()
+            .is_some_and(|hook| !hook.finished.load(Ordering::Acquire))
+    }
+
+    /// Start the stop timeout without sending a signal, for a service whose `stop_command`
+    /// replaced the signal.
+    ///
+    /// Mirrors the guard in `stop`: a service with no live child owes no exit, so arming a
+    /// deadline against it would escalate at nothing.
+    pub fn arm_stop_deadline(&mut self) {
+        if self.child.as_ref().and_then(|child| child.id()).is_none() {
+            return;
+        }
+
+        self.stop_deadline = Some(Instant::now() + self.stop_timeout());
     }
 
     /// Start the service with the given fully expanded command.
@@ -184,41 +312,80 @@ impl Service {
         Ok(())
     }
 
-    /// Force kill the service if its stop timeout has elapsed. Returns true if SIGKILL was
-    /// delivered.
+    /// Force kill the service if its stop timeout has elapsed. Returns what the expired
+    /// deadline called for, or None while the service is still inside its window.
     ///
-    /// The deadline is armed by whichever of `signal_restart` or `stop` sent the signal,
-    /// and is one-shot. It clears whether or not the signal lands, so a caller polling this
-    /// cannot spin forever on a process it is unable to kill.
+    /// The deadline is armed by whichever of `signal_restart`, `stop`, or `arm_stop_deadline`
+    /// began the stop, and is one-shot. It clears whether or not the kill lands, so a caller
+    /// polling this cannot spin forever on a process it is unable to kill.
+    ///
+    /// A hook still running at this point outlived the window the whole stop is bounded by,
+    /// so its process group is killed first. Leaving it would reproduce, one level removed,
+    /// the orphan it exists to prevent.
     ///
     /// A signal that fails is logged rather than returned. The group can exit between the
     /// caller's liveness check and this signal, and a stop must not be blocked by a service
     /// that is already gone.
     ///
-    /// Unlike `kill`, this keeps the child so the ordinary `check` path reaps the exit and
-    /// schedules the restart. Dropping it here would strand a restarting service with no
-    /// exit for anyone to observe.
-    pub fn enforce_stop_deadline(&mut self, now: Instant) -> bool {
-        let Some(deadline) = self.stop_deadline else {
-            return false;
-        };
+    /// The child stays so the ordinary `check` path reaps the exit and schedules the
+    /// restart. Dropping it here would strand a restarting service with no exit for anyone
+    /// to observe.
+    pub fn enforce_stop_deadline(&mut self, now: Instant) -> Option<StopEscalation> {
+        let deadline = self.stop_deadline?;
 
         if now < deadline {
-            return false;
+            return None;
         }
 
         self.stop_deadline = None;
 
+        let killed_hook = self.kill_running_hook();
+
+        // A service that already exited needs no kill step. Running `kill_command` against
+        // it would report a force kill of something that stopped on its own.
+        if !self.is_running() {
+            return Some(StopEscalation {
+                killed_hook,
+                action: None,
+            });
+        }
+
+        tracing::warn!(
+            name = %self.config.name(),
+            timeout_ms = self.stop_timeout().as_millis(),
+            "stop timeout expired, force killing service"
+        );
+
+        if self.config.kill_command.is_some() {
+            return Some(StopEscalation {
+                killed_hook,
+                action: Some(KillAction::RunKillCommand),
+            });
+        }
+
+        let action = self.force_kill().then_some(KillAction::SentSignal);
+
+        Some(StopEscalation {
+            killed_hook,
+            action,
+        })
+    }
+
+    /// Send SIGKILL to the service's process group. Returns true if it was delivered.
+    ///
+    /// A signal that fails is logged rather than returned. The group can exit between a
+    /// caller's liveness check and this signal, and a stop must not be blocked by a service
+    /// that is already gone.
+    ///
+    /// The child stays so the ordinary `check` path reaps the exit and schedules the
+    /// restart. Dropping it here would strand a restarting service with no exit for anyone
+    /// to observe.
+    pub fn force_kill(&self) -> bool {
         let Some(pid) = self.child.as_ref().and_then(|child| child.id()) else {
             return false;
         };
 
-        tracing::warn!(
-            name = %self.config.name(),
-            pid = pid,
-            timeout_ms = self.stop_timeout().as_millis(),
-            "stop timeout expired, force killing service"
-        );
+        tracing::warn!(name = %self.config.name(), pid = pid, "force killing service");
 
         if let Err(e) = SignalHandler::send_to_group(pid as i32, Signal::SIGKILL) {
             tracing::warn!(
@@ -233,18 +400,33 @@ impl Service {
         true
     }
 
-    /// Force kill the service (SIGKILL).
-    pub fn kill(&mut self) -> Result<(), ProcessError> {
-        if let Some(child) = &self.child {
-            if let Some(pid) = child.id() {
-                tracing::warn!(name = %self.config.name(), pid = pid, "force killing service");
-                SignalHandler::send_to_group(pid as i32, Signal::SIGKILL)?;
-            }
+    /// Kill the process group of a hook that is still running. Returns true if one was.
+    fn kill_running_hook(&mut self) -> bool {
+        let Some(hook) = self.hook.as_ref() else {
+            return false;
+        };
+
+        if hook.finished.load(Ordering::Acquire) {
+            return false;
         }
-        self.child = None;
-        self.state = ServiceState::Stopped;
-        self.stop_deadline = None;
-        Ok(())
+
+        tracing::warn!(
+            name = %self.config.name(),
+            pgid = hook.pgid,
+            "stop timeout expired with a lifecycle hook still running, killing it"
+        );
+
+        if let Err(e) = SignalHandler::send_to_group(hook.pgid as i32, Signal::SIGKILL) {
+            tracing::warn!(
+                name = %self.config.name(),
+                pgid = hook.pgid,
+                error = %e,
+                "could not kill lifecycle hook; it has most likely already exited"
+            );
+            return false;
+        }
+
+        true
     }
 
     /// Check if the service is still running.
@@ -371,15 +553,15 @@ mod tests {
     }
 
     /// Poll `enforce_stop_deadline` until it escalates, or give up after a second.
-    async fn wait_for_escalation(service: &mut Service) -> bool {
+    async fn wait_for_escalation(service: &mut Service) -> Option<StopEscalation> {
         for _ in 0..100 {
-            if service.enforce_stop_deadline(Instant::now()) {
-                return true;
+            if let Some(escalation) = service.enforce_stop_deadline(Instant::now()) {
+                return Some(escalation);
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        false
+        None
     }
 
     /// Poll `check` until the service reports its exit, or give up after a second.
@@ -493,7 +675,7 @@ mod tests {
         let mut service = stubborn_service(Some(Duration::from_millis(50)));
 
         assert!(!service.has_stop_deadline());
-        assert!(!service.enforce_stop_deadline(Instant::now()));
+        assert!(service.enforce_stop_deadline(Instant::now()).is_none());
     }
 
     #[tokio::test]
@@ -508,10 +690,10 @@ mod tests {
         service.signal_restart().unwrap();
         assert!(service.has_stop_deadline());
 
-        assert!(
-            wait_for_escalation(&mut service).await,
-            "stop timeout never escalated to SIGKILL"
-        );
+        let escalation = wait_for_escalation(&mut service)
+            .await
+            .expect("stop timeout never escalated to SIGKILL");
+        assert_eq!(escalation.action, Some(KillAction::SentSignal));
         assert!(
             !service.has_stop_deadline(),
             "the deadline must clear so the escalation stays one-shot"
@@ -541,7 +723,7 @@ mod tests {
             !service.has_stop_deadline(),
             "an observed exit must disarm the deadline"
         );
-        assert!(!service.enforce_stop_deadline(Instant::now()));
+        assert!(service.enforce_stop_deadline(Instant::now()).is_none());
     }
 
     #[tokio::test]
@@ -556,14 +738,145 @@ mod tests {
         service.stop().unwrap();
         assert!(service.has_stop_deadline());
 
-        assert!(
-            wait_for_escalation(&mut service).await,
-            "shutdown-path stop never escalated to SIGKILL"
-        );
+        let escalation = wait_for_escalation(&mut service)
+            .await
+            .expect("shutdown-path stop never escalated to SIGKILL");
+        assert_eq!(escalation.action, Some(KillAction::SentSignal));
 
         let exit = wait_for_exit(&mut service)
             .await
             .expect("SIGKILLed service never reported its exit");
         assert_eq!(exit.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn test_arm_stop_deadline_escalates_without_a_signal() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let ready = temp_dir.path().join("trapping");
+
+        let mut service = stubborn_service(Some(Duration::from_millis(100)));
+        service.start(&stubborn_command(&ready)).unwrap();
+        wait_until_trapping(&ready).await;
+
+        service.arm_stop_deadline();
+        assert!(service.has_stop_deadline());
+
+        let escalation = wait_for_escalation(&mut service)
+            .await
+            .expect("a hook-armed deadline never escalated");
+        assert_eq!(escalation.action, Some(KillAction::SentSignal));
+        assert!(!escalation.killed_hook);
+    }
+
+    #[test]
+    fn test_arm_stop_deadline_ignores_a_service_with_no_child() {
+        let mut service = stubborn_service(Some(Duration::from_millis(50)));
+
+        service.arm_stop_deadline();
+
+        assert!(!service.has_stop_deadline());
+    }
+
+    #[tokio::test]
+    async fn test_a_hook_reports_itself_finished_once_its_run_ends() {
+        let mut service = stubborn_service(None);
+
+        let hook = service.begin_hook("exit 0").unwrap();
+        assert!(service.has_running_hook());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let output = hook.stream(tx).await.unwrap();
+
+        assert_eq!(output.exit_code, Some(0));
+        assert!(!service.has_running_hook());
+    }
+
+    #[tokio::test]
+    async fn test_a_dropped_hook_driver_stops_reporting_the_hook_as_running() {
+        let mut service = stubborn_service(None);
+
+        let hook = service.begin_hook("sleep 30").unwrap();
+        assert!(service.has_running_hook());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        drop(hook.stream(tx));
+
+        assert!(!service.has_running_hook());
+    }
+
+    #[tokio::test]
+    async fn test_a_hook_outliving_the_stop_timeout_is_killed_first() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let ready = temp_dir.path().join("trapping");
+
+        let mut service = stubborn_service(Some(Duration::from_millis(100)));
+        service.start(&stubborn_command(&ready)).unwrap();
+        wait_until_trapping(&ready).await;
+
+        let hook = service.begin_hook("sleep 30").unwrap();
+        service.arm_stop_deadline();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let driver = tokio::spawn(hook.stream(tx));
+
+        let escalation = wait_for_escalation(&mut service)
+            .await
+            .expect("a service held up by its own stop hook never escalated");
+        assert!(escalation.killed_hook);
+        assert_eq!(escalation.action, Some(KillAction::SentSignal));
+
+        let output = driver
+            .await
+            .expect("the hook driver panicked")
+            .expect("the killed hook reported no exit");
+        assert_eq!(
+            output.exit_code, None,
+            "a signalled exit carries no exit code, so SIGKILL is what ended the hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_kill_command_replaces_the_escalation_signal() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let ready = temp_dir.path().join("trapping");
+
+        let mut config = ServiceCommand::new("svc", "unused");
+        config.no_pty = true;
+        config.stop_timeout = Some(zaz_config::HumanDuration::new(Duration::from_millis(100)));
+        config.kill_command = Some("true".to_string());
+        let mut service = Service::new(config, Executor::new(Some("/bin/sh".to_string())));
+
+        service.start(&stubborn_command(&ready)).unwrap();
+        wait_until_trapping(&ready).await;
+        service.arm_stop_deadline();
+
+        let escalation = wait_for_escalation(&mut service)
+            .await
+            .expect("a service with a kill command never escalated");
+        assert_eq!(escalation.action, Some(KillAction::RunKillCommand));
+        assert!(
+            service.is_running(),
+            "the escalation must leave the kill to the hook rather than signal the group"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_deadline_reached_after_the_service_exited_takes_no_kill_step() {
+        let mut service = stubborn_service(Some(Duration::from_millis(50)));
+        service.start("exit 0").unwrap();
+        service.arm_stop_deadline();
+
+        for _ in 0..100 {
+            if !service.is_running() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let escalation = wait_for_escalation(&mut service)
+            .await
+            .expect("an expired deadline must still report itself");
+        assert_eq!(escalation.action, None);
+        assert!(!escalation.killed_hook);
     }
 }

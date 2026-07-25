@@ -140,12 +140,7 @@ impl Executor {
         output_tx: mpsc::UnboundedSender<OutputLine>,
     ) -> Result<CommandOutput, ProcessError> {
         tracing::debug!(command = %command, "run_streaming: starting");
-        let result = self
-            .run_with_callback(command, move |line| {
-                // Unbounded send never blocks and only fails if receiver dropped
-                let _ = output_tx.send(line);
-            })
-            .await;
+        let result = self.spawn_streaming(command)?.stream(output_tx).await;
         tracing::debug!(command = %command, success = %result.is_ok(), "run_streaming: completed");
         result
     }
@@ -162,12 +157,61 @@ impl Executor {
     where
         F: Fn(OutputLine) + Send + 'static,
     {
+        self.spawn_streaming(command)?.drive(on_output).await
+    }
+
+    /// Spawn a run-to-completion command without driving it.
+    ///
+    /// The spawn and the output pump are separated so a caller that needs the process group
+    /// has it before the run starts. Signalling a run that has already been handed to
+    /// another task is otherwise impossible.
+    pub fn spawn_streaming(&self, command: &str) -> Result<StreamingRun, ProcessError> {
         // For run-to-completion commands, we use regular spawn to capture output
         let child = self.spawn_regular(command)?;
 
-        let ManagedChild::Regular(mut child) = child else {
+        let ManagedChild::Regular(child) = child else {
             unreachable!("spawn_regular always returns Regular variant");
         };
+
+        let pgid = child.id();
+
+        Ok(StreamingRun { child, pgid })
+    }
+}
+
+/// A spawned run-to-completion command that has not been driven yet.
+///
+/// `spawn_regular` puts every command in its own process group, so `pgid` is the group to
+/// signal to reach the command and everything it started.
+pub struct StreamingRun {
+    child: tokio::process::Child,
+    pgid: Option<u32>,
+}
+
+impl StreamingRun {
+    /// Process group of the spawned command, absent once it has been reaped.
+    pub fn pgid(&self) -> Option<u32> {
+        self.pgid
+    }
+
+    /// Drive the command to completion, streaming output through an unbounded channel.
+    pub async fn stream(
+        self,
+        output_tx: mpsc::UnboundedSender<OutputLine>,
+    ) -> Result<CommandOutput, ProcessError> {
+        self.drive(move |line| {
+            // Unbounded send never blocks and only fails if receiver dropped
+            let _ = output_tx.send(line);
+        })
+        .await
+    }
+
+    /// Drive the command to completion, streaming output to a callback.
+    async fn drive<F>(self, on_output: F) -> Result<CommandOutput, ProcessError>
+    where
+        F: Fn(OutputLine) + Send + 'static,
+    {
+        let mut child = self.child;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -212,7 +256,7 @@ impl Executor {
         let mut stderr_lines = Vec::new();
 
         // Process output as it arrives
-        tracing::debug!("run_with_callback: entering select loop");
+        tracing::debug!("streaming run: entering select loop");
         loop {
             tokio::select! {
                 biased;  // Prefer earlier branches to ensure we drain output before checking wait
@@ -226,7 +270,7 @@ impl Executor {
                     stderr_lines.push(line);
                 }
                 status = child.wait() => {
-                    tracing::debug!("run_with_callback: child.wait() returned");
+                    tracing::debug!("streaming run: child.wait() returned");
                     let status = status.map_err(ProcessError::Spawn)?;
 
                     // Drain remaining output
@@ -242,7 +286,7 @@ impl Executor {
                         stderr_lines.push(line);
                     }
 
-                    tracing::debug!(exit_code = ?status.code(), "run_with_callback: returning");
+                    tracing::debug!(exit_code = ?status.code(), "streaming run: returning");
                     // Always return output, even on non-zero exit.
                     // Caller can check exit_code to determine success/failure.
                     return Ok(CommandOutput {

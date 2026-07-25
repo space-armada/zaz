@@ -178,10 +178,10 @@ deprecated aliases for backwards compatibility. New configs should use
 | `name` | string | derived | Same derivation rule as task `name`. |
 | `command` | string | required | Shell command to run; non-empty. |
 | `cleanup_command` | string | unset | Runs before every spawn, including the first. Clears state a prior run left behind. |
-| `stop_command` | string | unset | Stops the service instead of signalling its process group. Conflicts with `signal`. |
-| `kill_command` | string | unset | Force kills the service instead of sending SIGKILL. |
+| `stop_command` | string | unset | Stops the service instead of signalling its process group, on restart and on shutdown alike. Conflicts with `signal`. |
+| `kill_command` | string | unset | Force kills the service instead of sending SIGKILL once `stop_timeout` elapses. |
 | `signal` | enum | `SIGTERM` | Signal sent on restart. See [`Signal`](#signal). |
-| `stop_timeout` | duration | `10s` | How long to wait for an exit after the stop signal before force killing. |
+| `stop_timeout` | duration | `10s` | How long to wait for an exit after the stop before force killing. Also bounds `stop_command` itself. |
 | `no_pty` | bool | `false` | Disable PTY allocation. PTY is on by default so tools like `tailwind --watch` work. |
 | `silence` | enum | `none` | TUI suppression level. See [`Silence`](#silence). |
 | `delay` | duration | unset | Wait this long after preceding tasks before starting. Alias: `delay_ms`. |

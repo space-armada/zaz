@@ -12,11 +12,15 @@ use crate::{ApiResponse, DaemonError};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group, LogStorageBackend};
-use zaz_process::{Executor, OutputLine, Service, TaskRunner};
+use zaz_process::{
+    CommandOutput, Executor, HookRun, KillAction, OutputLine, ProcessError, Service,
+    StopEscalation, TaskRunner,
+};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
 
@@ -214,12 +218,34 @@ async fn execute_task(ctx: TaskExecutionContext, log_tx: mpsc::Sender<LogLine>) 
     }
 }
 
+/// Which lifecycle hook a run belongs to. The label prefixes every line the run logs, so an
+/// operator reading a service's log can tell a cleanup from a stop from a kill.
+#[derive(Debug, Clone, Copy)]
+enum HookKind {
+    Cleanup,
+    Stop,
+    Kill,
+}
+
+impl HookKind {
+    fn label(self) -> &'static str {
+        match self {
+            HookKind::Cleanup => "cleanup",
+            HookKind::Stop => "stop",
+            HookKind::Kill => "kill",
+        }
+    }
+}
+
 /// Run a service's pre-spawn cleanup hook to completion, streaming its output to the log
 /// store. Does nothing when the service has no hook configured.
 ///
 /// The hook is best-effort. A failed expansion, a spawn failure, or a nonzero exit is logged
 /// and the caller goes on to spawn the service anyway. A hook that failed to clear stale
 /// state usually makes the spawn itself fail loudly on its own.
+///
+/// This one is awaited inline rather than detached, since the spawn it precedes must not
+/// happen until it is done.
 async fn run_cleanup_hook(
     service: &Service,
     group_name: &str,
@@ -240,84 +266,313 @@ async fn run_cleanup_hook(
                 error = %e,
                 "cleanup_command expansion failed; starting service anyway"
             );
-            let _ = log_tx
-                .send(
-                    LogLine::daemon(name, format!("cleanup skipped: {}", e))
-                        .with_group(group_name.to_string()),
-                )
-                .await;
+            log_hook_skipped(HookKind::Cleanup, name, group_name, &e.to_string(), log_tx).await;
             return;
         }
     };
 
     tracing::info!(service = %name, command = %command, "running service cleanup hook");
 
-    let _ = log_tx
-        .send(
-            LogLine::daemon(name, format!("cleanup: {}", command))
-                .with_group(group_name.to_string()),
-        )
-        .await;
+    log_hook_header(HookKind::Cleanup, name, group_name, &command, log_tx).await;
 
-    let start = std::time::Instant::now();
+    let (output_tx, output_rx) = mpsc::unbounded_channel::<OutputLine>();
+    let run = service.run_cleanup(&command, output_tx);
+
+    drive_hook(
+        HookKind::Cleanup,
+        run,
+        output_rx,
+        name,
+        group_name,
+        service.silence(),
+        log_tx,
+    )
+    .await;
+}
+
+/// The signal a service falls back to when no `stop_command` runs.
+#[derive(Debug, Clone, Copy)]
+enum StopFallback {
+    /// SIGTERM, as the shutdown and reload paths send.
+    Terminate,
+
+    /// The service's configured restart signal.
+    Restart,
+}
+
+/// Stop a service, through its `stop_command` when it sets one.
+///
+/// A hook replaces the signal outright, which is why configuring both is a load-time error.
+/// A hook that cannot be expanded or spawned falls back to the signal: a hook that never ran
+/// is not replacing anything, and a service still has to be asked to go down.
+///
+/// The stop timeout is armed either way, so the escalation bounds the stop whichever path
+/// ran. The hook itself is driven detached, since the poll branch that starts it is
+/// cancelled whenever an API command arrives.
+async fn stop_service(
+    service: &mut Service,
+    group_name: &str,
+    fallback: StopFallback,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) -> Result<(), ProcessError> {
+    let Some(template) = service.stop_command_template().map(str::to_string) else {
+        return signal_service(service, fallback);
+    };
+
+    let name = service.name().to_string();
     let silence = service.silence();
 
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
+    let command = match expander.expand(&template) {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "stop_command expansion failed; signalling the service instead"
+            );
+            log_hook_skipped(HookKind::Stop, &name, group_name, &e.to_string(), log_tx).await;
+            return signal_service(service, fallback);
+        }
+    };
 
-    let cleanup_future = service.run_cleanup(&command, output_tx);
-    tokio::pin!(cleanup_future);
+    tracing::info!(service = %name, command = %command, "running service stop hook");
+
+    log_hook_header(HookKind::Stop, &name, group_name, &command, log_tx).await;
+
+    let hook = match service.begin_hook(&command) {
+        Ok(hook) => hook,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "stop_command could not spawn; signalling the service instead"
+            );
+            let _ = log_tx
+                .send(
+                    LogLine::daemon(&name, format!("stop failed: {}", e))
+                        .with_group(group_name.to_string()),
+                )
+                .await;
+            return signal_service(service, fallback);
+        }
+    };
+
+    service.arm_stop_deadline();
+    spawn_hook_driver(
+        HookKind::Stop,
+        hook,
+        name,
+        group_name.to_string(),
+        silence,
+        log_tx.clone(),
+    );
+
+    Ok(())
+}
+
+/// Force kill a service whose stop timeout expired, through its `kill_command` when it sets
+/// one. Falls back to SIGKILL on the same terms `stop_service` falls back to its signal.
+async fn kill_service(
+    service: &mut Service,
+    group_name: &str,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let Some(template) = service.kill_command_template().map(str::to_string) else {
+        service.force_kill();
+        return;
+    };
+
+    let name = service.name().to_string();
+    let silence = service.silence();
+
+    let command = match expander.expand(&template) {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "kill_command expansion failed; force killing the service instead"
+            );
+            log_hook_skipped(HookKind::Kill, &name, group_name, &e.to_string(), log_tx).await;
+            service.force_kill();
+            return;
+        }
+    };
+
+    tracing::warn!(service = %name, command = %command, "running service kill hook");
+
+    log_hook_header(HookKind::Kill, &name, group_name, &command, log_tx).await;
+
+    match service.begin_hook(&command) {
+        Ok(hook) => spawn_hook_driver(
+            HookKind::Kill,
+            hook,
+            name,
+            group_name.to_string(),
+            silence,
+            log_tx.clone(),
+        ),
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "kill_command could not spawn; force killing the service instead"
+            );
+            let _ = log_tx
+                .send(
+                    LogLine::daemon(&name, format!("kill failed: {}", e))
+                        .with_group(group_name.to_string()),
+                )
+                .await;
+            service.force_kill();
+        }
+    }
+}
+
+/// Act on an expired stop timeout and report what it did to the service's own log.
+///
+/// An operator reads a service's lifecycle in that log, where its exits and its cleanup runs
+/// already report themselves, so a force kill belongs there beside them.
+async fn handle_escalation(
+    service: &mut Service,
+    group_name: &str,
+    escalation: StopEscalation,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let mut steps = Vec::new();
+
+    if escalation.killed_hook {
+        steps.push("killed the lifecycle hook still running".to_string());
+    }
+
+    match escalation.action {
+        Some(KillAction::SentSignal) => steps.push("sent SIGKILL".to_string()),
+        Some(KillAction::RunKillCommand) => steps.push("running the kill command".to_string()),
+        None => {}
+    }
+
+    if steps.is_empty() {
+        return;
+    }
+
+    let log_msg = format!(
+        "stop timeout expired after {:.2}s; {}",
+        service.stop_timeout().as_secs_f64(),
+        steps.join("; ")
+    );
+    let _ = log_tx
+        .send(LogLine::daemon(service.name(), log_msg).with_group(group_name.to_string()))
+        .await;
+
+    if escalation.action == Some(KillAction::RunKillCommand) {
+        kill_service(service, group_name, expander, log_tx).await;
+    }
+}
+
+/// Send the signal that stands in for an absent or unusable `stop_command`.
+fn signal_service(service: &mut Service, fallback: StopFallback) -> Result<(), ProcessError> {
+    match fallback {
+        StopFallback::Terminate => service.stop(),
+        StopFallback::Restart => service.signal_restart(),
+    }
+}
+
+/// Drive a stop or kill hook to completion in a detached task.
+///
+/// Detaching is what keeps the hook alive across a cancelled poll. The daemon's main loop
+/// selects over the poll branch and the API command channel, so an arriving command would
+/// otherwise drop a hook mid-stop and leave the service neither stopped nor escalated.
+fn spawn_hook_driver(
+    kind: HookKind,
+    hook: HookRun,
+    name: String,
+    group_name: String,
+    silence: zaz_config::Silence,
+    log_tx: mpsc::Sender<LogLine>,
+) {
+    tokio::spawn(async move {
+        let (output_tx, output_rx) = mpsc::unbounded_channel::<OutputLine>();
+        let run = hook.stream(output_tx);
+
+        drive_hook(kind, run, output_rx, &name, &group_name, silence, &log_tx).await;
+    });
+}
+
+/// Pump a hook's output into the log store until the run ends, then log its footer.
+///
+/// The header is logged by the caller, before the hook is spawned, so a hook that fails to
+/// spawn still reports the command it would have run.
+async fn drive_hook(
+    kind: HookKind,
+    run: impl Future<Output = Result<CommandOutput, ProcessError>>,
+    mut output_rx: mpsc::UnboundedReceiver<OutputLine>,
+    name: &str,
+    group_name: &str,
+    silence: zaz_config::Silence,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let start = std::time::Instant::now();
+
+    tokio::pin!(run);
 
     let result = loop {
         tokio::select! {
             biased;
 
-            result = &mut cleanup_future => {
+            result = &mut run => {
                 while let Some(line) = output_rx.recv().await {
-                    forward_cleanup_line(line, name, group_name, silence, log_tx).await;
+                    forward_hook_line(line, name, group_name, silence, log_tx).await;
                 }
                 break result;
             }
 
             Some(line) = output_rx.recv() => {
-                forward_cleanup_line(line, name, group_name, silence, log_tx).await;
+                forward_hook_line(line, name, group_name, silence, log_tx).await;
             }
         }
     };
 
     let duration = start.elapsed();
+    let label = kind.label();
 
     let log_msg = match result {
-        Ok(output) => {
-            let exit_code_str = output
-                .exit_code
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "?".to_string());
-
-            if output.exit_code.map(|c| c == 0).unwrap_or(true) {
-                format!(
-                    "cleanup completed in {:.2}s (exit code: {})",
-                    duration.as_secs_f64(),
-                    exit_code_str
-                )
-            } else {
+        Ok(output) => match output.exit_code {
+            Some(0) => format!(
+                "{} completed in {:.2}s (exit code: 0)",
+                label,
+                duration.as_secs_f64()
+            ),
+            Some(code) => {
                 tracing::warn!(
                     service = %name,
-                    exit_code = ?output.exit_code,
-                    "service cleanup hook exited nonzero; starting service anyway"
+                    hook = %label,
+                    exit_code = code,
+                    "service lifecycle hook exited nonzero; proceeding anyway"
                 );
-                format!(
-                    "cleanup failed: process exited with status {}",
-                    exit_code_str
-                )
+                format!("{} failed: process exited with status {}", label, code)
             }
-        }
+            // A hook the stop timeout killed lands here, so reporting no exit code as
+            // success would contradict the escalation line that killed it.
+            None => {
+                tracing::warn!(
+                    service = %name,
+                    hook = %label,
+                    "service lifecycle hook was killed by a signal; proceeding anyway"
+                );
+                format!("{} failed: process was killed by a signal", label)
+            }
+        },
         Err(e) => {
             tracing::error!(
                 service = %name,
+                hook = %label,
                 error = %e,
-                "service cleanup hook could not run; starting service anyway"
+                "service lifecycle hook could not run; proceeding anyway"
             );
-            format!("cleanup failed: {}", e)
+            format!("{} failed: {}", label, e)
         }
     };
 
@@ -326,8 +581,40 @@ async fn run_cleanup_hook(
         .await;
 }
 
-/// Send one line of cleanup hook output to the log store, honoring the service's silence.
-async fn forward_cleanup_line(
+/// Log the header naming the expanded command a hook is about to run.
+async fn log_hook_header(
+    kind: HookKind,
+    name: &str,
+    group_name: &str,
+    command: &str,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let _ = log_tx
+        .send(
+            LogLine::daemon(name, format!("{}: {}", kind.label(), command))
+                .with_group(group_name.to_string()),
+        )
+        .await;
+}
+
+/// Log a hook that never ran, naming why.
+async fn log_hook_skipped(
+    kind: HookKind,
+    name: &str,
+    group_name: &str,
+    reason: &str,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let _ = log_tx
+        .send(
+            LogLine::daemon(name, format!("{} skipped: {}", kind.label(), reason))
+                .with_group(group_name.to_string()),
+        )
+        .await;
+}
+
+/// Send one line of hook output to the log store, honoring the service's silence.
+async fn forward_hook_line(
     line: OutputLine,
     name: &str,
     group_name: &str,
@@ -1404,8 +1691,8 @@ impl Engine {
             .with_root(config_dir);
         let expander = zaz_vars::Expander::new(&var_context);
 
-        // Cleanup hooks log through a pre-cloned sender: `push_log` takes `&mut self` and is
-        // unusable while the borrow on `self.groups` below is live.
+        // Lifecycle hooks log through a pre-cloned sender: `push_log` takes `&mut self` and
+        // is unusable while the borrow on `self.groups` below is live.
         let log_tx = self.log_store.sender();
 
         if let Some(group) = self.groups.get_mut(group_name) {
@@ -1463,7 +1750,15 @@ impl Engine {
                 } else {
                     // Signal existing service to restart
                     tracing::info!(service = %service.name(), "signaling service restart");
-                    service.signal_restart().map_err(DaemonError::Process)?;
+                    stop_service(
+                        service,
+                        group_name,
+                        StopFallback::Restart,
+                        &expander,
+                        &log_tx,
+                    )
+                    .await
+                    .map_err(DaemonError::Process)?;
                 }
 
                 group.state.services[idx].status = ProcessStatus::Running;
@@ -1545,8 +1840,8 @@ impl Engine {
             .with_root(config_dir);
         let expander = zaz_vars::Expander::new(&var_context);
 
-        // Cleanup hooks log through a pre-cloned sender: `push_log` takes `&mut self` and is
-        // unusable while the borrow on `self.groups` below is live.
+        // Lifecycle hooks log through a pre-cloned sender: `push_log` takes `&mut self` and
+        // is unusable while the borrow on `self.groups` below is live.
         let log_tx = self.log_store.sender();
 
         let now = Instant::now();
@@ -1625,16 +1920,8 @@ impl Engine {
                         .await;
 
                     group.pending_restarts[idx] = Some(now + delay);
-                } else if service.enforce_stop_deadline(now) {
-                    let log_msg = format!(
-                        "stop timeout expired after {:.2}s; sent SIGKILL",
-                        service.stop_timeout().as_secs_f64()
-                    );
-                    let _ = log_tx
-                        .send(
-                            LogLine::daemon(service.name(), log_msg).with_group(group_name.clone()),
-                        )
-                        .await;
+                } else if let Some(escalation) = service.enforce_stop_deadline(now) {
+                    handle_escalation(service, group_name, escalation, &expander, &log_tx).await;
                 }
             }
         }
@@ -1649,35 +1936,60 @@ impl Engine {
 
     /// Shutdown all processes gracefully.
     ///
-    /// Sends SIGTERM to all services, waits up to each service's own `stop_timeout` for it
-    /// to exit, then sends SIGKILL to any that are still running.
+    /// Stops every service, through its `stop_command` where one is configured and by
+    /// SIGTERM otherwise, waits up to each service's own `stop_timeout` for it to exit, then
+    /// force kills whatever is still running.
     pub async fn shutdown(&mut self) -> Result<(), DaemonError> {
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
         tracing::info!("shutting down");
         self.state.status = DaemonStatus::Stopping;
 
-        // Send SIGTERM to all services
-        for group in self.groups.values_mut() {
+        let config_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let var_context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir);
+        let expander = zaz_vars::Expander::new(&var_context);
+
+        // Lifecycle hooks log through a pre-cloned sender: `push_log` takes `&mut self` and
+        // is unusable while the borrow on `self.groups` below is live.
+        let log_tx = self.log_store.sender();
+
+        for (group_name, group) in self.groups.iter_mut() {
             for service in &mut group.services {
-                service.stop().map_err(DaemonError::Process)?;
+                stop_service(
+                    service,
+                    group_name,
+                    StopFallback::Terminate,
+                    &expander,
+                    &log_tx,
+                )
+                .await
+                .map_err(DaemonError::Process)?;
             }
         }
 
-        // Wait for services to exit, each on its own deadline. The loop terminates because
-        // every service either exits, escalates once and clears its deadline, or is still
-        // inside its window.
+        // Wait for services to exit, each on its own deadline. A stop hook that outlives its
+        // service is waited on too, so its output lands before the daemon goes away. The loop
+        // terminates because every service either exits, escalates once and clears its
+        // deadline, or is still inside its window.
         loop {
             let now = std::time::Instant::now();
             let mut waiting = false;
 
-            for group in self.groups.values_mut() {
+            for (group_name, group) in self.groups.iter_mut() {
                 for service in &mut group.services {
-                    if !service.is_running() {
+                    if !service.is_running() && !service.has_running_hook() {
                         continue;
                     }
 
-                    if service.enforce_stop_deadline(now) {
+                    if let Some(escalation) = service.enforce_stop_deadline(now) {
+                        handle_escalation(service, group_name, escalation, &expander, &log_tx)
+                            .await;
                         continue;
                     }
 
@@ -1767,27 +2079,41 @@ impl Engine {
         // 2. Compute changes
         let diff = self.get_config_diff(&new_config);
 
-        // 3. Stop services in removed groups
-        for group_name in &diff.removed {
-            if let Some(group) = self.groups.get_mut(group_name) {
-                for service in &mut group.services {
-                    if let Err(e) = service.stop() {
-                        tracing::warn!(
-                            service = %service.name(),
-                            group = %group_name,
-                            error = %e,
-                            "failed to stop service during reload"
-                        );
-                    }
-                }
-            }
-        }
+        // Stop hooks expand against the config being replaced, since they belong to the
+        // services that config started.
+        let config_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let var_context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir);
+        let expander = zaz_vars::Expander::new(&var_context);
+        let log_tx = self.log_store.sender();
 
-        // 4. Stop services in modified groups (they'll be restarted)
-        for group_name in &diff.modified {
+        // 3. Stop services in removed groups, then 4. in modified groups (they'll be
+        // restarted). A stop hook outlives the group it belongs to: it runs detached, so
+        // rebuilding the group below drops the service without cutting the hook short.
+        let stopping: Vec<String> = diff
+            .removed
+            .iter()
+            .chain(diff.modified.iter())
+            .cloned()
+            .collect();
+
+        for group_name in &stopping {
             if let Some(group) = self.groups.get_mut(group_name) {
                 for service in &mut group.services {
-                    if let Err(e) = service.stop() {
+                    if let Err(e) = stop_service(
+                        service,
+                        group_name,
+                        StopFallback::Terminate,
+                        &expander,
+                        &log_tx,
+                    )
+                    .await
+                    {
                         tracing::warn!(
                             service = %service.name(),
                             group = %group_name,
@@ -1986,10 +2312,27 @@ impl Engine {
                 LogLine::daemon(process_name, "restarting").with_group(group_name.to_string()),
             )?;
 
+            let config_dir = self
+                .config_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            let var_context = Context::new()
+                .with_variables(self.config.variables.clone())
+                .with_root(config_dir);
+            let expander = zaz_vars::Expander::new(&var_context);
+            let log_tx = self.log_store.sender();
+
             if let Some(group) = self.groups.get_mut(group_name) {
-                group.services[service_idx]
-                    .signal_restart()
-                    .map_err(DaemonError::Process)?;
+                stop_service(
+                    &mut group.services[service_idx],
+                    group_name,
+                    StopFallback::Restart,
+                    &expander,
+                    &log_tx,
+                )
+                .await
+                .map_err(DaemonError::Process)?;
             }
 
             // Cascade restart to dependent groups if enabled
@@ -2491,7 +2834,7 @@ impl Engine {
                     );
 
                     // No tasks - signal services directly (without cascade, we handle it below)
-                    if let Err(e) = self.signal_group_services_no_cascade(&dependent) {
+                    if let Err(e) = self.signal_group_services_no_cascade(&dependent).await {
                         tracing::error!(
                             group = %dependent,
                             error = %e,
@@ -2536,11 +2879,33 @@ impl Engine {
     ///
     /// This is a low-level method used internally by cascade_service_restart.
     /// For most cases, use `restart_group_services` which also triggers the cascade.
-    fn signal_group_services_no_cascade(&mut self, group_name: &str) -> Result<(), DaemonError> {
+    async fn signal_group_services_no_cascade(
+        &mut self,
+        group_name: &str,
+    ) -> Result<(), DaemonError> {
+        let config_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let var_context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir);
+        let expander = zaz_vars::Expander::new(&var_context);
+        let log_tx = self.log_store.sender();
+
         if let Some(group) = self.groups.get_mut(group_name) {
             for service in &mut group.services {
                 if service.is_running() {
-                    service.signal_restart().map_err(DaemonError::Process)?;
+                    stop_service(
+                        service,
+                        group_name,
+                        StopFallback::Restart,
+                        &expander,
+                        &log_tx,
+                    )
+                    .await
+                    .map_err(DaemonError::Process)?;
                 }
             }
         }
@@ -5390,6 +5755,428 @@ stop_timeout = "{timeout}"
             elapsed < Duration::from_secs(5),
             "shutdown fell back to the fixed grace period instead of the service's own \
              stop_timeout, taking {:?}",
+            elapsed
+        );
+    }
+
+    /// Files a hook-driven service test writes through.
+    struct HookPaths {
+        config: PathBuf,
+        trace: PathBuf,
+        ready: PathBuf,
+        pid: PathBuf,
+    }
+
+    fn hook_paths(dir: &Path) -> HookPaths {
+        HookPaths {
+            config: dir.join("zaz.toml"),
+            trace: dir.join("trace"),
+            ready: dir.join("trapping"),
+            pid: dir.join("pid"),
+        }
+    }
+
+    /// Write a config for a service whose stop runs through hooks.
+    ///
+    /// The service records its own process group so a hook can reach it, and traces every
+    /// spawn. Trapping SIGTERM is what makes a hook-driven stop observably different from a
+    /// signal-driven one: nothing else would tell them apart in the trace.
+    fn write_stop_hook_config(
+        paths: &HookPaths,
+        stop_timeout: &str,
+        trap_term: bool,
+        extra_service_fields: &str,
+    ) {
+        let trap = if trap_term { "trap '' TERM; " } else { "" };
+        let config = format!(
+            r#"
+[[group]]
+name = "hooked"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "hooked"
+command = "{trap}echo $$ > '{pid}'; echo start >> '{trace}'; : > '{ready}'; while true; do sleep 1; done"
+no_pty = true
+stop_timeout = "{timeout}"
+{extra}
+"#,
+            trap = trap,
+            pid = paths.pid.display(),
+            trace = paths.trace.display(),
+            ready = paths.ready.display(),
+            timeout = stop_timeout,
+            extra = extra_service_fields,
+        );
+        std::fs::write(&paths.config, config).unwrap();
+    }
+
+    /// A hook command that traces itself and then force kills the service it belongs to.
+    fn tracing_killer(paths: &HookPaths, marker: &str) -> String {
+        format!(
+            "echo {marker} >> '{trace}'; kill -KILL $(cat '{pid}')",
+            marker = marker,
+            trace = paths.trace.display(),
+            pid = paths.pid.display(),
+        )
+    }
+
+    /// Drive `check_services` until the trace holds `expected` markers.
+    async fn pump_until_trace(engine: &mut Engine, path: &Path, expected: usize) -> Vec<String> {
+        let mut trace = Vec::new();
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            trace = read_trace(path);
+            if trace.len() >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        trace
+    }
+
+    fn service_logs(engine: &mut Engine) -> Vec<String> {
+        engine.process_incoming_logs().unwrap();
+        engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_stop_command_replaces_the_restart_signal() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        write_stop_hook_config(
+            &paths,
+            "5s",
+            true,
+            &format!(
+                r#"stop_command = "{}""#,
+                tracing_killer(&paths, "stop").replace('"', "\\\"")
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        let trace = pump_until_trace(&mut engine, &paths.trace, 3).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace[..3],
+            ["start", "stop", "start"],
+            "the stop hook did not replace the restart signal; trace was {:?}",
+            trace
+        );
+        assert!(
+            logs.iter().any(|line| line.starts_with("stop: echo stop")),
+            "stop hook header missing from logs: {:?}",
+            logs
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.starts_with("stop timeout expired")),
+            "the hook stopped the service, so nothing should have escalated: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_command_runs_on_shutdown() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        write_stop_hook_config(
+            &paths,
+            "5s",
+            true,
+            &format!(
+                r#"stop_command = "{}""#,
+                tracing_killer(&paths, "stop").replace('"', "\\\"")
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        let started = Instant::now();
+        engine.shutdown().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            read_trace(&paths.trace),
+            vec!["start".to_string(), "stop".to_string()],
+            "shutdown did not run the stop hook"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown waited out the stop timeout instead of the hook's own exit, taking {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kill_command_runs_when_the_stop_timeout_expires() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        // The stop hook only reports itself, so the service outlives its window and the
+        // kill hook is what actually ends it.
+        write_stop_hook_config(
+            &paths,
+            "200ms",
+            true,
+            &format!(
+                "stop_command = \"echo stop >> '{trace}'\"\nkill_command = \"{kill}\"",
+                trace = paths.trace.display(),
+                kill = tracing_killer(&paths, "kill").replace('"', "\\\""),
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        let trace = pump_until_trace(&mut engine, &paths.trace, 4).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace[..4],
+            ["start", "stop", "kill", "start"],
+            "the kill hook did not replace the escalation SIGKILL; trace was {:?}",
+            trace
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("stop timeout expired") && line.contains("kill command")),
+            "the escalation did not report running the kill command: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_stop_hook_outliving_its_window_is_killed_before_the_kill_command() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        write_stop_hook_config(
+            &paths,
+            "200ms",
+            true,
+            &format!(
+                "stop_command = \"echo stop >> '{trace}'; sleep 30\"\nkill_command = \"{kill}\"",
+                trace = paths.trace.display(),
+                kill = tracing_killer(&paths, "kill").replace('"', "\\\""),
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        let trace = pump_until_trace(&mut engine, &paths.trace, 4).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace[..4],
+            ["start", "stop", "kill", "start"],
+            "a hung stop hook blocked the kill hook; trace was {:?}",
+            trace
+        );
+
+        let escalation = logs
+            .iter()
+            .find(|line| line.starts_with("stop timeout expired"))
+            .unwrap_or_else(|| panic!("nothing reported the escalation: {:?}", logs));
+        let hook_kill = escalation
+            .find("killed the lifecycle hook")
+            .unwrap_or_else(|| panic!("the hung hook was not killed: {}", escalation));
+        let service_kill = escalation
+            .find("kill command")
+            .unwrap_or_else(|| panic!("the kill command did not run: {}", escalation));
+        assert!(
+            hook_kill < service_kill,
+            "the hung hook must be killed before the kill command runs: {}",
+            escalation
+        );
+
+        assert!(
+            logs.iter()
+                .any(|line| line == "stop failed: process was killed by a signal"),
+            "a killed hook must not report itself as completed: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unexpandable_stop_command_falls_back_to_the_signal() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        // `${missing}` is undefined, and config load does not reject undefined variables, so
+        // the hook can only fail at stop time. The service does not trap SIGTERM, so the
+        // fallback signal is enough to stop it.
+        write_stop_hook_config(
+            &paths,
+            "5s",
+            false,
+            &format!(
+                r#"stop_command = "echo stop-${{missing}} >> '{}'""#,
+                paths.trace.display()
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        let trace = pump_until_trace(&mut engine, &paths.trace, 2).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace[..2],
+            ["start", "start"],
+            "a hook that could not expand must not run; trace was {:?}",
+            trace
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line == "stop skipped: undefined variable: ${missing}"),
+            "expansion failure was not reported: {:?}",
+            logs
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.starts_with("stop timeout expired")),
+            "the fallback signal should have stopped the service without escalating: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silence_suppresses_stop_hook_output_but_not_lifecycle_lines() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        write_stop_hook_config(
+            &paths,
+            "5s",
+            true,
+            &format!(
+                "stop_command = \"echo swept; echo griped >&2; {kill}\"\nsilence = \"all\"",
+                kill = tracing_killer(&paths, "stop").replace('"', "\\\""),
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        pump_until_trace(&mut engine, &paths.trace, 3).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert!(
+            !logs.iter().any(|line| line == "swept" || line == "griped"),
+            "silence did not suppress stop hook output: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|line| line.starts_with("stop: echo swept")),
+            "silence must not suppress the hook's own header: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("stop completed in")),
+            "silence must not suppress the hook's own footer: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_waits_for_a_stop_hook_that_outlives_its_service() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        // The hook kills the service straight away and keeps working afterwards, which is
+        // what `docker stop` does once the container it waited on is gone.
+        write_stop_hook_config(
+            &paths,
+            "10s",
+            true,
+            &format!(
+                "stop_command = \"kill -KILL $(cat '{pid}'); sleep 1; echo late >> '{trace}'\"",
+                pid = paths.pid.display(),
+                trace = paths.trace.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        let started = Instant::now();
+        engine.shutdown().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            read_trace(&paths.trace),
+            vec!["start".to_string(), "late".to_string()],
+            "shutdown left before the stop hook finished"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "shutdown did not wait for the hook, taking {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "shutdown waited out the stop timeout instead of the hook's own exit, taking {:?}",
             elapsed
         );
     }
