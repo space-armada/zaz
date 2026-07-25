@@ -1,0 +1,33 @@
+# Docker container gated on its own HEALTHCHECK.
+#
+# `docker run` returns as soon as the container starts, which says nothing
+# about the process inside it. The image declares a HEALTHCHECK; the check
+# below reads the verdict Docker records for it. The lifecycle hooks are
+# here for the same reason they are in the docker-service example: the
+# container belongs to the Docker daemon, not to the process group zaz
+# tracks.
+
+[variables]
+image = "myapp/api:dev"
+container = "myapp-api"
+
+[[group]]
+name = "api"
+patterns = ["src/**/*.go", "go.mod", "go.sum", "Dockerfile"]
+ignore = ["**/*_test.go"]
+
+  [[group.task]]
+  name = "image"
+  command = "docker build -t ${image} ."
+
+  [[group.service]]
+  name = "api"
+  command = "docker run --rm --name ${container} -p 8080:8080 ${image}"
+  cleanup_command = "docker rm --force ${container} 2>/dev/null || true"
+  ready_check = "docker inspect -f '{{.State.Health.Status}}' ${container} | grep -qx healthy"
+  ready_poll_interval = "1s"
+  ready_timeout = "90s"
+  stop_command = "docker stop ${container}"
+  kill_command = "docker kill ${container}"
+  stop_timeout = "45s"
+  no_pty = true

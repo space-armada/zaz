@@ -257,6 +257,62 @@ Worked configurations for both cases:
 [docker-service](examples/docker-service/README.md) and
 [local-service-cleanup](examples/local-service-cleanup/README.md).
 
+### Readiness checks
+
+A service reads `Running` the instant it spawns. Spawned is not the same as
+listening on a port, or done replaying a write-ahead log, or past a JVM
+warmup. `ready_check` closes that gap. zaz runs it after the spawn and
+treats the service as ready only once it exits zero. A service that sets no
+check counts as ready the moment it starts, exactly as before.
+
+A check expands what `command` expands: the `[variables]` table and the
+`${zaz:*}` built-ins. The file-context built-ins (`${zaz:files}`,
+`${zaz:dirs}`, `${zaz:prefix}`) are rejected, the same as in `command` and
+in the lifecycle hooks. Expansion happens per probe rather than once per
+window.
+
+The first probe runs immediately. A service that is already up should not
+have to sit through an interval before it can say so. After that,
+`ready_poll_interval` is measured from the start of each probe rather than
+from its end, which makes it a floor on the gap between starts. Probes never
+overlap. A check slower than its own interval simply runs back to back.
+
+`ready_timeout` bounds the whole window. A window always runs its check at
+least once, so a timeout too short to contain a poll tick, zero included,
+means run the check and give up rather than give up without running it.
+
+A service reads `Starting` while its window is open. A zero exit promotes it
+to `Running`. A window that closes without one marks it `Failed` and leaves
+the process alone. Stopping it would feed it straight back into the restart
+path, which would spawn it, arm a fresh window, and reach the same timeout
+again. A slow-booting service is also usually still worth inspecting.
+
+A check whose variables do not expand, or whose shell will not spawn, fails
+the service immediately rather than polling to the timeout. Neither gets
+better inside the window.
+
+A group holds at `Running` until every service in it that declares a
+`ready_check` has answered. Only then does it become `Ready`. Groups listing
+it in `depends_on` wait on that, which is the point of the feature: a
+dependent starts once the thing it depends on can actually take work. A
+check that runs out its window makes its group `Failed` and every group
+waiting behind it `Skipped`.
+
+Only a group's first transition to `Ready` is gated. A group that has
+already reached it keeps it while a crashed service respawns and checks
+again, the same way it stays `Ready` through a restart backoff.
+
+The service's own log names the check once per window, then carries either
+the pass or the give-up. The give-up line quotes the last failing probe's
+exit code and output. Individual probes stream nothing. A thirty-second
+window at the default interval runs three hundred of them, and streaming
+each one would bury the service's own output. `silence` has nothing to
+suppress here.
+
+Worked configurations for both cases:
+[http-service-readiness](examples/http-service-readiness/README.md) and
+[docker-service-readiness](examples/docker-service-readiness/README.md).
+
 ## Enums
 
 ### `Silence`

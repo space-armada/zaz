@@ -1,0 +1,37 @@
+# HTTP API gated on its own health endpoint, with a frontend behind it.
+#
+# The `web` group depends on `api`, so nothing in it starts until the API
+# answers on /healthz. Without the check, `depends_on` waits only for the
+# process to spawn, and the seed request below races the server's boot.
+
+[variables]
+api_port = "8080"
+
+[[group]]
+name = "api"
+patterns = ["api/**/*.go", "go.mod", "go.sum"]
+ignore = ["**/*_test.go"]
+
+  [[group.task]]
+  name = "build"
+  command = "go build -o bin/api ./api"
+
+  [[group.service]]
+  name = "api"
+  command = "./bin/api --port ${api_port}"
+  ready_check = "curl -sf http://localhost:${api_port}/healthz"
+  ready_timeout = "20s"
+
+[[group]]
+name = "web"
+depends_on = ["api"]
+patterns = ["web/**/*.ts", "web/**/*.tsx"]
+ignore = ["web/dist/**", "**/node_modules/**"]
+
+  [[group.task]]
+  name = "seed"
+  command = "curl -sf -X POST http://localhost:${api_port}/dev/seed"
+
+  [[group.service]]
+  name = "vite"
+  command = "npx vite"

@@ -53,6 +53,8 @@ zaz restart api               # exercises stop_command then cleanup_command
 
 - [../local-service-cleanup/](../local-service-cleanup/README.md) — the
   same hooks against a plain local service.
+- [../docker-service-readiness/](../docker-service-readiness/README.md) —
+  these hooks plus a check that waits for the container to report healthy.
 - [../../configuration.md](../../configuration.md) — full project config
   reference, including the lifecycle hook ordering rules.
 - [../../cli.md](../../cli.md) — every subcommand and flag.

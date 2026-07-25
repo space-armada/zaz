@@ -487,6 +487,9 @@ impl Service {
     /// A probe that passed wins over a deadline reached in the same tick. The check did
     /// report ready, and the window is there to bound waiting, not to overrule an answer that
     /// is already in.
+    ///
+    /// A window that has never dispatched a probe cannot time out. A `ready_timeout` too
+    /// short to contain one poll tick still gets its one check.
     pub fn poll_readiness(&mut self, now: Instant) -> ReadyPoll {
         let Some(ready) = self.ready.as_mut() else {
             return ReadyPoll::Idle;
@@ -508,7 +511,11 @@ impl Service {
             }
         }
 
-        if !expired {
+        // A window owes one probe before it can close. A `ready_timeout` shorter than a poll
+        // tick, zero included, means run the check and give up, not give up without running
+        // it. Once the probe is dispatched the deadline applies as usual, so a check that
+        // hangs is still killed rather than holding the window open.
+        if !expired || ready.attempts == 0 {
             if probe_running || now < ready.next_attempt {
                 return ReadyPoll::Waiting;
             }
@@ -1396,6 +1403,52 @@ mod tests {
                 ReadyPoll::Passed { .. }
             ),
             "the window bounds waiting; it must not overrule an answer already in"
+        );
+    }
+
+    #[test]
+    fn test_a_zero_ready_timeout_still_runs_its_one_check() {
+        let mut service = ready_service(Some("true"), None, Some(0));
+        service.arm_readiness();
+
+        assert_eq!(
+            service.poll_readiness(Instant::now() + Duration::from_secs(60)),
+            ReadyPoll::Due { first: true },
+            "a zero timeout means one check then give up, not give up without checking"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_zero_ready_timeout_honors_a_check_that_passes() {
+        let mut service = ready_service(Some("true"), None, Some(0));
+        service.arm_readiness();
+
+        probe(&mut service, "true").await;
+
+        assert!(matches!(
+            service.poll_readiness(Instant::now() + Duration::from_secs(60)),
+            ReadyPoll::Passed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_a_zero_ready_timeout_gives_up_after_its_one_check() {
+        let mut service = ready_service(Some("unused"), None, Some(0));
+        service.arm_readiness();
+
+        probe(&mut service, "exit 7").await;
+
+        let ReadyPoll::TimedOut { last_failure, .. } =
+            service.poll_readiness(Instant::now() + Duration::from_secs(60))
+        else {
+            panic!("the one check failed, so the window must close");
+        };
+
+        let failure = last_failure.expect("the check did run, so its verdict must survive");
+        assert!(
+            failure.contains("exit code 7"),
+            "an operator needs the check's own words, got {:?}",
+            failure
         );
     }
 
