@@ -155,7 +155,7 @@ impl Service {
     pub fn signal_restart(&mut self) -> Result<(), ProcessError> {
         if let Some(child) = &self.child {
             if let Some(pid) = child.id() {
-                let signal = SignalHandler::to_nix_signal(self.config.signal);
+                let signal = SignalHandler::to_nix_signal(self.config.signal());
                 tracing::info!(
                     name = %self.config.name(),
                     pid = pid,

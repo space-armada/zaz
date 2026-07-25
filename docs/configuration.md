@@ -177,7 +177,11 @@ deprecated aliases for backwards compatibility. New configs should use
 |-------|------|---------|-------|
 | `name` | string | derived | Same derivation rule as task `name`. |
 | `command` | string | required | Shell command to run; non-empty. |
+| `cleanup_command` | string | unset | Runs before every spawn, including the first. Clears state a prior run left behind. |
+| `stop_command` | string | unset | Stops the service instead of signalling its process group. Conflicts with `signal`. |
+| `kill_command` | string | unset | Force kills the service instead of sending SIGKILL. |
 | `signal` | enum | `SIGTERM` | Signal sent on restart. See [`Signal`](#signal). |
+| `stop_timeout` | duration | `10s` | How long to wait for an exit after the stop signal before force killing. |
 | `no_pty` | bool | `false` | Disable PTY allocation. PTY is on by default so tools like `tailwind --watch` work. |
 | `silence` | enum | `none` | TUI suppression level. See [`Silence`](#silence). |
 | `delay` | duration | unset | Wait this long after preceding tasks before starting. Alias: `delay_ms`. |
@@ -232,7 +236,8 @@ is `SIGTERM`.
 
 ## Duration parsing
 
-Duration-typed fields (`debounce`, `delay`) accept three input forms:
+Duration-typed fields (`debounce`, `delay`, `stop_timeout`) accept three input
+forms:
 
 - A human-readable string parsed by [`humantime`](https://docs.rs/humantime):
   `"500ms"`, `"2s"`, `"1m30s"`, `"1s 500ms"`.
@@ -269,9 +274,13 @@ human message.
 | Empty service command field | `group '{g}': service '{n}' has empty {field}` |
 | Duplicate service name | `group '{g}': duplicate service name '{n}'` |
 | File-context built-in in a service command field | `group '{g}': service '{n}' {field} references ${b}, ...` |
+| Conflicting stop mechanism | `group '{g}': service '{n}' sets both signal and stop_command` |
 
 Service errors report `{field}` as the name of the offending field, so a
 service carrying more than one command string points at the right one.
+
+`stop_command` replaces the restart signal outright, so a service setting both
+it and `signal` is rejected rather than having its signal silently ignored.
 
 Unknown-dependency errors include a "did you mean '{x}'?" hint when a
 group name within Levenshtein distance 2 exists, otherwise an

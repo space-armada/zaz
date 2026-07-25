@@ -270,7 +270,7 @@ command = "./srv"
 signal = "SIGHUP"
 "#;
         let config = parse_toml(toml).unwrap();
-        assert_eq!(config.groups[0].services[0].signal, Signal::Sighup);
+        assert_eq!(config.groups[0].services[0].signal(), Signal::Sighup);
     }
 
     #[test]
@@ -462,6 +462,96 @@ cleanup_command = "docker rm -f api"
     }
 
     #[test]
+    fn test_stop_and_kill_command_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "docker run --rm --name api img"
+stop_command = "docker stop api"
+kill_command = "docker kill api"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].stop_command,
+            Some("docker stop api".to_string())
+        );
+        assert_eq!(
+            config.groups[0].services[0].kill_command,
+            Some("docker kill api".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stop_and_kill_command_parsing_json() {
+        let json = r#"{
+            "groups": [{
+                "name": "test",
+                "patterns": ["*.txt"],
+                "services": [{
+                    "name": "server",
+                    "command": "docker run --rm --name api img",
+                    "stop_command": "docker stop api",
+                    "kill_command": "docker kill api"
+                }]
+            }]
+        }"#;
+        let config = parse_json(json).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].stop_command,
+            Some("docker stop api".to_string())
+        );
+        assert_eq!(
+            config.groups[0].services[0].kill_command,
+            Some("docker kill api".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stop_and_kill_command_unset_leaves_service_unchanged() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+"#;
+        let config = parse_toml(toml).unwrap();
+        let service = &config.groups[0].services[0];
+
+        assert_eq!(*service, ServiceCommand::new("server", "./server"));
+        assert!(service.stop_command.is_none());
+        assert!(service.kill_command.is_none());
+    }
+
+    #[test]
+    fn test_omitted_signal_stays_omitted_through_a_round_trip() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert!(!config.groups[0].services[0].has_explicit_signal());
+        assert_eq!(config.groups[0].services[0].signal(), Signal::Sigterm);
+
+        let reparsed = parse_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(
+            !reparsed.groups[0].services[0].has_explicit_signal(),
+            "a service that never set a signal must not gain one by round-tripping"
+        );
+    }
+
+    #[test]
     fn test_cleanup_command_unset_leaves_service_unchanged() {
         let toml = r#"
 [[group]]
@@ -548,6 +638,8 @@ command = "make"
 name = "server"
 command = "./server"
 cleanup_command = "rm -f ./server.pid"
+stop_command = "./server-ctl drain"
+kill_command = "./server-ctl abort"
 delay = "500ms"
 stop_timeout = "30s"
 "#;

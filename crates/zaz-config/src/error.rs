@@ -242,6 +242,13 @@ pub enum ValidationErrorKind {
         /// The offending built-in name, e.g. `zaz:files`.
         builtin: String,
     },
+    /// Service specifies its stop mechanism twice, as both a signal and a command.
+    ConflictingStopMechanism {
+        /// Name of the group.
+        group: String,
+        /// Name of the service.
+        service: String,
+    },
 }
 
 impl ValidationErrorKind {
@@ -261,6 +268,7 @@ impl ValidationErrorKind {
             Self::EmptyServiceCommand { .. } => "empty_service_command",
             Self::DuplicateServiceName { .. } => "duplicate_service_name",
             Self::ServiceCommandFileBuiltin { .. } => "service_command_file_builtin",
+            Self::ConflictingStopMechanism { .. } => "conflicting_stop_mechanism",
         }
     }
 }
@@ -351,6 +359,13 @@ impl fmt::Display for ValidationErrorKind {
                     "group '{}': service '{}' {} references ${{{}}}, which is only \
                      populated for file-change triggers and is unavailable to services",
                     group, service, field, builtin
+                )
+            }
+            Self::ConflictingStopMechanism { group, service } => {
+                write!(
+                    f,
+                    "group '{}': service '{}' sets both signal and stop_command",
+                    group, service
                 )
             }
         }

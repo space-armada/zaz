@@ -2,7 +2,7 @@
 
 use crate::error::{ValidationError, ValidationErrorKind, ValidationErrors};
 use crate::toml_spanned::SpanInfo;
-use crate::Config;
+use crate::{Config, ServiceCommand};
 use std::collections::{HashMap, HashSet};
 use strsim::levenshtein;
 
@@ -309,6 +309,14 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
                     errors,
                 );
             }
+            if let Some(stop) = &service.stop_command {
+                validate_service_command_field(&group.name, name, "stop_command", stop, errors);
+            }
+            if let Some(kill) = &service.kill_command {
+                validate_service_command_field(&group.name, name, "kill_command", kill, errors);
+            }
+
+            validate_service_stop_mechanism(&group.name, service, errors);
 
             if service_names.contains(name) {
                 let mut error = ValidationError::new(ValidationErrorKind::DuplicateServiceName {
@@ -363,10 +371,30 @@ fn validate_service_command_field(
     }
 }
 
+/// Reject a service whose stop mechanism is specified twice.
+///
+/// `stop_command` replaces the signal outright, so a `signal` set alongside it is silently
+/// ignored at runtime. Rejecting the pair at load time keeps that from reading as working.
+fn validate_service_stop_mechanism(
+    group: &str,
+    service: &ServiceCommand,
+    errors: &mut ValidationErrors,
+) {
+    if service.has_explicit_signal() && service.stop_command.is_some() {
+        errors.push(
+            ValidationError::new(ValidationErrorKind::ConflictingStopMechanism {
+                group: group.to_string(),
+                service: service.name().to_string(),
+            })
+            .with_hint("stop_command replaces the restart signal; remove one"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Group, ServiceCommand, TaskCommand};
+    use crate::{Group, ServiceCommand, Signal, TaskCommand};
 
     fn make_group(name: &str) -> Group {
         Group {
@@ -775,6 +803,137 @@ mod tests {
             ..Default::default()
         };
         validate(&config).expect("an unset cleanup_command must not affect validation");
+    }
+
+    #[test]
+    fn test_stop_and_kill_commands_reject_file_context_builtins() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.stop_command = Some("./ctl drain ${zaz:files}".to_string());
+        service.kill_command = Some("./ctl abort ${zaz:dirs}".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' stop_command references ${zaz:files}"),
+            "expected stop_command named in error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("service 'watcher' kill_command references ${zaz:dirs}"),
+            "expected kill_command named in error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_empty_stop_and_kill_commands_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.stop_command = Some(String::new());
+        service.kill_command = Some(String::new());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' has empty stop_command"),
+            "expected empty stop_command error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("service 'watcher' has empty kill_command"),
+            "expected empty kill_command error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_unset_stop_and_kill_commands_validate() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "./bin/handler")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("unset stop_command and kill_command must not affect validation");
+    }
+
+    #[test]
+    fn test_stop_command_without_a_signal_validates() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.stop_command = Some("./ctl drain".to_string());
+        service.kill_command = Some("./ctl abort".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("stop_command alone must validate");
+    }
+
+    #[test]
+    fn test_signal_alongside_stop_command_rejected() {
+        let mut group = make_group("server");
+        let mut service =
+            ServiceCommand::new("watcher", "./bin/handler").with_signal(Signal::Sigint);
+        service.stop_command = Some("./ctl drain".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' sets both signal and stop_command"),
+            "expected conflicting stop mechanism error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("hint:"),
+            "expected hint pointing at the redundant field, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_explicit_default_signal_alongside_stop_command_rejected() {
+        let mut group = make_group("server");
+        let mut service =
+            ServiceCommand::new("watcher", "./bin/handler").with_signal(Signal::Sigterm);
+        service.stop_command = Some("./ctl drain".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.kind.code() == "conflicting_stop_mechanism"),
+            "an explicit SIGTERM is still a signal the stop_command would silence"
+        );
+    }
+
+    #[test]
+    fn test_signal_without_a_stop_command_validates() {
+        let mut group = make_group("server");
+        group.services =
+            vec![ServiceCommand::new("watcher", "./bin/handler").with_signal(Signal::Sigint)];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("a signal without a stop_command must validate");
     }
 
     #[test]

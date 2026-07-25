@@ -328,9 +328,25 @@ pub struct ServiceCommand {
     #[serde(default)]
     pub cleanup_command: Option<String>,
 
-    /// Signal to send when restarting.
+    /// Command that stops this service, replacing the signal sent to its process group.
+    ///
+    /// Lets a service that wraps an external system stop what it wraps rather than only its
+    /// local process. A failure is logged and the stop proceeds.
     #[serde(default)]
-    pub signal: Signal,
+    pub stop_command: Option<String>,
+
+    /// Command that force kills this service, replacing the SIGKILL sent to its process
+    /// group once `stop_timeout` elapses.
+    #[serde(default)]
+    pub kill_command: Option<String>,
+
+    /// Signal to send when restarting.
+    ///
+    /// Unset falls back to SIGTERM. The distinction between unset and an explicit SIGTERM
+    /// matters: setting a signal alongside `stop_command`, which replaces the signal
+    /// outright, is a validation error.
+    #[serde(default)]
+    signal: Option<Signal>,
 
     /// Disable PTY allocation for this process.
     /// By default, PTY is enabled (no_pty = false).
@@ -371,7 +387,9 @@ impl ServiceCommand {
             name: Some(name.into()),
             command: command.into(),
             cleanup_command: None,
-            signal: Signal::default(),
+            stop_command: None,
+            kill_command: None,
+            signal: None,
             no_pty: false,
             silence: Silence::None,
             working_dir: None,
@@ -387,7 +405,9 @@ impl ServiceCommand {
             name: None,
             command: command.into(),
             cleanup_command: None,
-            signal: Signal::default(),
+            stop_command: None,
+            kill_command: None,
+            signal: None,
             no_pty: false,
             silence: Silence::None,
             working_dir: None,
@@ -407,6 +427,22 @@ impl ServiceCommand {
     /// Returns true if this service has an explicitly set name.
     pub fn has_explicit_name(&self) -> bool {
         self.name.is_some()
+    }
+
+    /// Set the restart signal explicitly.
+    pub fn with_signal(mut self, signal: Signal) -> Self {
+        self.signal = Some(signal);
+        self
+    }
+
+    /// Get the restart signal, falling back to SIGTERM when unset.
+    pub fn signal(&self) -> Signal {
+        self.signal.unwrap_or_default()
+    }
+
+    /// Returns true if this service has an explicitly set restart signal.
+    pub fn has_explicit_signal(&self) -> bool {
+        self.signal.is_some()
     }
 
     /// Get delay in milliseconds (for backwards compatibility).
