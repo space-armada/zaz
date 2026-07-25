@@ -1,10 +1,12 @@
 //! Service process management.
 
+use crate::executor::{CommandOutput, OutputLine};
 use crate::pty::ManagedChild;
 use crate::{Executor, ProcessError, SignalHandler};
 use nix::sys::signal::Signal;
 use std::time::{Duration, Instant};
-use zaz_config::ServiceCommand;
+use tokio::sync::mpsc;
+use zaz_config::{ServiceCommand, Silence};
 
 /// Minimum restart delay.
 const MIN_RESTART_DELAY: Duration = Duration::from_millis(500);
@@ -73,6 +75,18 @@ impl Service {
         &self.config.command
     }
 
+    /// Get the configured cleanup command template, before variable expansion.
+    ///
+    /// Returns None when the service has no cleanup hook.
+    pub fn cleanup_command_template(&self) -> Option<&str> {
+        self.config.cleanup_command.as_deref()
+    }
+
+    /// Get the log suppression level configured for this service.
+    pub fn silence(&self) -> Silence {
+        self.config.silence
+    }
+
     /// Get the current state.
     pub fn state(&self) -> ServiceState {
         self.state
@@ -81,6 +95,22 @@ impl Service {
     /// Get the process ID if running.
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(|c| c.id())
+    }
+
+    /// Run the pre-spawn cleanup hook to completion with the given fully expanded command.
+    ///
+    /// Output lines stream through `output_tx` as they arrive. The hook runs under the
+    /// service's own working directory and environment, which the group-level executor
+    /// does not carry.
+    ///
+    /// The hook always runs without a PTY, so its stdout and stderr stay separable. It also
+    /// gets its own process group, which makes it killable by pgid if it hangs.
+    pub async fn run_cleanup(
+        &self,
+        command: &str,
+        output_tx: mpsc::UnboundedSender<OutputLine>,
+    ) -> Result<CommandOutput, ProcessError> {
+        self.executor.run_streaming(command, output_tx).await
     }
 
     /// Start the service with the given fully expanded command.
@@ -222,5 +252,96 @@ impl Service {
     /// Check if this service uses a PTY.
     pub fn is_pty(&self) -> bool {
         self.child.as_ref().map(|c| c.is_pty()).unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service_with_cleanup(command: &str, cleanup: Option<&str>) -> ServiceCommand {
+        let mut config = ServiceCommand::new("svc", command);
+        config.cleanup_command = cleanup.map(str::to_string);
+        config
+    }
+
+    fn drain(mut rx: mpsc::UnboundedReceiver<OutputLine>) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            lines.push(match line {
+                OutputLine::Stdout(s) => format!("out: {}", s),
+                OutputLine::Stderr(s) => format!("err: {}", s),
+            });
+        }
+        lines
+    }
+
+    #[test]
+    fn test_cleanup_command_template_unset_is_none() {
+        let service = Service::new(
+            service_with_cleanup("sleep 30", None),
+            Executor::new(Some("/bin/sh".to_string())),
+        );
+
+        assert_eq!(service.cleanup_command_template(), None);
+    }
+
+    #[tokio::test]
+    async fn test_run_cleanup_streams_both_output_streams() {
+        let service = Service::new(
+            service_with_cleanup("sleep 30", Some("echo clean; echo noisy >&2")),
+            Executor::new(Some("/bin/sh".to_string())),
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let command = service.cleanup_command_template().unwrap().to_string();
+        let output = service.run_cleanup(&command, tx).await.unwrap();
+
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, vec!["clean".to_string()]);
+        assert_eq!(output.stderr, vec!["noisy".to_string()]);
+        assert_eq!(
+            drain(rx),
+            vec!["out: clean".to_string(), "err: noisy".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_cleanup_reports_nonzero_exit() {
+        let service = Service::new(
+            service_with_cleanup("sleep 30", Some("exit 3")),
+            Executor::new(Some("/bin/sh".to_string())),
+        );
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let output = service.run_cleanup("exit 3", tx).await.unwrap();
+
+        assert_eq!(output.exit_code, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_run_cleanup_uses_service_working_dir_and_env() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let canonical = temp_dir.path().canonicalize().unwrap();
+
+        let executor = Executor::new(Some("/bin/sh".to_string()))
+            .with_working_dir(canonical.display().to_string())
+            .with_env(
+                [("ZAZ_CLEANUP_MARKER".to_string(), "marked".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+        let service = Service::new(service_with_cleanup("sleep 30", None), executor);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let output = service
+            .run_cleanup("pwd; printf '%s\\n' \"$ZAZ_CLEANUP_MARKER\"", tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output.stdout,
+            vec![canonical.display().to_string(), "marked".to_string()]
+        );
     }
 }

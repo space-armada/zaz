@@ -214,6 +214,146 @@ async fn execute_task(ctx: TaskExecutionContext, log_tx: mpsc::Sender<LogLine>) 
     }
 }
 
+/// Run a service's pre-spawn cleanup hook to completion, streaming its output to the log
+/// store. Does nothing when the service has no hook configured.
+///
+/// The hook is best-effort. A failed expansion, a spawn failure, or a nonzero exit is logged
+/// and the caller goes on to spawn the service anyway. A hook that failed to clear stale
+/// state usually makes the spawn itself fail loudly on its own.
+async fn run_cleanup_hook(
+    service: &Service,
+    group_name: &str,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let name = service.name();
+
+    let Some(template) = service.cleanup_command_template() else {
+        return;
+    };
+
+    let command = match expander.expand(template) {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "cleanup_command expansion failed; starting service anyway"
+            );
+            let _ = log_tx
+                .send(
+                    LogLine::daemon(name, format!("cleanup skipped: {}", e))
+                        .with_group(group_name.to_string()),
+                )
+                .await;
+            return;
+        }
+    };
+
+    tracing::info!(service = %name, command = %command, "running service cleanup hook");
+
+    let _ = log_tx
+        .send(
+            LogLine::daemon(name, format!("cleanup: {}", command))
+                .with_group(group_name.to_string()),
+        )
+        .await;
+
+    let start = std::time::Instant::now();
+    let silence = service.silence();
+
+    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
+
+    let cleanup_future = service.run_cleanup(&command, output_tx);
+    tokio::pin!(cleanup_future);
+
+    let result = loop {
+        tokio::select! {
+            biased;
+
+            result = &mut cleanup_future => {
+                while let Some(line) = output_rx.recv().await {
+                    forward_cleanup_line(line, name, group_name, silence, log_tx).await;
+                }
+                break result;
+            }
+
+            Some(line) = output_rx.recv() => {
+                forward_cleanup_line(line, name, group_name, silence, log_tx).await;
+            }
+        }
+    };
+
+    let duration = start.elapsed();
+
+    let log_msg = match result {
+        Ok(output) => {
+            let exit_code_str = output
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".to_string());
+
+            if output.exit_code.map(|c| c == 0).unwrap_or(true) {
+                format!(
+                    "cleanup completed in {:.2}s (exit code: {})",
+                    duration.as_secs_f64(),
+                    exit_code_str
+                )
+            } else {
+                tracing::warn!(
+                    service = %name,
+                    exit_code = ?output.exit_code,
+                    "service cleanup hook exited nonzero; starting service anyway"
+                );
+                format!(
+                    "cleanup failed: process exited with status {}",
+                    exit_code_str
+                )
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "service cleanup hook could not run; starting service anyway"
+            );
+            format!("cleanup failed: {}", e)
+        }
+    };
+
+    let _ = log_tx
+        .send(LogLine::daemon(name, log_msg).with_group(group_name.to_string()))
+        .await;
+}
+
+/// Send one line of cleanup hook output to the log store, honoring the service's silence.
+async fn forward_cleanup_line(
+    line: OutputLine,
+    name: &str,
+    group_name: &str,
+    silence: zaz_config::Silence,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let (content, is_stderr) = match line {
+        OutputLine::Stdout(s) => (s, false),
+        OutputLine::Stderr(s) => (s, true),
+    };
+
+    if should_suppress(silence, is_stderr) {
+        return;
+    }
+
+    let log_line = if is_stderr {
+        LogLine::stderr(name, content)
+    } else {
+        LogLine::stdout(name, content)
+    };
+
+    let _ = log_tx
+        .send(log_line.with_group(group_name.to_string()))
+        .await;
+}
+
 // =============================================================================
 // Trigger Types
 // =============================================================================
@@ -1264,6 +1404,10 @@ impl Engine {
             .with_root(config_dir);
         let expander = zaz_vars::Expander::new(&var_context);
 
+        // Cleanup hooks log through a pre-cloned sender: `push_log` takes `&mut self` and is
+        // unusable while the borrow on `self.groups` below is live.
+        let log_tx = self.log_store.sender();
+
         if let Some(group) = self.groups.get_mut(group_name) {
             for (idx, service) in group.services.iter_mut().enumerate() {
                 // Check if service is actually running before deciding what to do
@@ -1301,6 +1445,8 @@ impl Engine {
                             continue;
                         }
                     };
+
+                    run_cleanup_hook(service, group_name, &expander, &log_tx).await;
 
                     // Start service
                     tracing::info!(service = %service.name(), "starting service");
@@ -1399,6 +1545,10 @@ impl Engine {
             .with_root(config_dir);
         let expander = zaz_vars::Expander::new(&var_context);
 
+        // Cleanup hooks log through a pre-cloned sender: `push_log` takes `&mut self` and is
+        // unusable while the borrow on `self.groups` below is live.
+        let log_tx = self.log_store.sender();
+
         let now = Instant::now();
         for (group_name, group) in self.groups.iter_mut() {
             for (idx, service) in group.services.iter_mut().enumerate() {
@@ -1417,6 +1567,12 @@ impl Engine {
                                 continue;
                             }
                         };
+                        // The pending restart stays scheduled across this await. A cancelled
+                        // poll re-runs the hook next tick, which an idempotent cleanup
+                        // tolerates; clearing the slot first would strand the service with
+                        // no child and nothing left to reschedule it.
+                        run_cleanup_hook(service, group_name, &expander, &log_tx).await;
+
                         tracing::info!(service = %service.name(), "restarting service");
                         service.start(&command).map_err(DaemonError::Process)?;
 
@@ -2711,6 +2867,29 @@ mod tests {
             services: vec![ServiceCommand::new("service", command)],
             ..Default::default()
         }
+    }
+
+    /// Read a lifecycle-hook trace file, one marker per line.
+    ///
+    /// The hook and the service command both append to the same file, so the line order is
+    /// what proves the hook ran before the spawn rather than merely alongside it.
+    fn read_trace(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .map(|read| read.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// Poll a hook-trace file until it holds at least `expected` markers.
+    async fn wait_for_trace(path: &Path, expected: usize) -> Vec<String> {
+        for _ in 0..200 {
+            let trace = read_trace(path);
+            if trace.len() >= expected {
+                return trace;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        read_trace(path)
     }
 
     /// Create a TaskCompletion for testing.
@@ -4816,6 +4995,266 @@ no_pty = true
             contents, "expansion-worked",
             "service command was not expanded; file contained {:?}",
             contents
+        );
+    }
+
+    /// Write a config whose service traces its own spawn and whose hook traces itself.
+    ///
+    /// `no_pty` is required for environments where openpty is disallowed, and the pattern
+    /// never matches so the only trigger under test is the one the test drives.
+    fn write_hook_trace_config(
+        config_path: &Path,
+        trace_path: &Path,
+        command_tail: &str,
+        cleanup_command: &str,
+        extra_service_fields: &str,
+    ) {
+        let config = format!(
+            r#"
+[[group]]
+name = "hooked"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "hooked"
+command = "echo start >> '{trace}'{tail}"
+cleanup_command = "{cleanup}"
+no_pty = true
+{extra}
+"#,
+            trace = trace_path.display(),
+            tail = command_tail,
+            cleanup = cleanup_command,
+            extra = extra_service_fields,
+        );
+        std::fs::write(config_path, config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_command_runs_before_initial_start() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "; sleep 30",
+            &format!("echo cleanup >> '{}'; echo swept", trace_path.display()),
+            "",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        let trace = wait_for_trace(&trace_path, 2).await;
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace,
+            vec!["cleanup".to_string(), "start".to_string()],
+            "cleanup_command did not run before the initial spawn"
+        );
+
+        assert!(
+            logs.iter().any(|line| line.starts_with("cleanup: echo")),
+            "cleanup header missing from logs: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|line| line == "swept"),
+            "cleanup output missing from logs: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("cleanup completed in")),
+            "cleanup footer missing from logs: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_command_runs_before_every_restart() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        // The service exits as soon as it has traced itself, so the backoff restart path
+        // drives the second spawn.
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "",
+            &format!("echo cleanup >> '{}'", trace_path.display()),
+            "",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let mut trace = Vec::new();
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            trace = read_trace(&trace_path);
+            if trace.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        engine.shutdown().await.unwrap();
+
+        assert!(
+            trace.len() >= 4,
+            "service did not spawn twice; trace was {:?}",
+            trace
+        );
+        assert_eq!(
+            trace[..4],
+            ["cleanup", "start", "cleanup", "start"],
+            "cleanup_command did not run before the restart spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failing_cleanup_command_still_starts_service() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "; sleep 30",
+            &format!("echo cleanup >> '{}'; exit 3", trace_path.display()),
+            "",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let trace = wait_for_trace(&trace_path, 2).await;
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        let status = engine.groups.get("hooked").unwrap().state.services[0].status;
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(trace, vec!["cleanup".to_string(), "start".to_string()]);
+        assert_eq!(status, ProcessStatus::Running);
+        assert!(
+            logs.iter()
+                .any(|line| line == "cleanup failed: process exited with status 3"),
+            "nonzero cleanup exit was not reported: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unexpandable_cleanup_command_still_starts_service() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        // `${missing}` is undefined, and config load does not reject undefined variables, so
+        // the hook can only fail at spawn time.
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "; sleep 30",
+            &format!("echo cleanup-${{missing}} >> '{}'", trace_path.display()),
+            "",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let trace = wait_for_trace(&trace_path, 1).await;
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace,
+            vec!["start".to_string()],
+            "the hook must not run when its own expansion failed"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line == "cleanup skipped: undefined variable: ${missing}"),
+            "expansion failure was not reported: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silence_suppresses_cleanup_output_but_not_lifecycle_lines() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "; sleep 30",
+            &format!(
+                "echo cleanup >> '{}'; echo swept; echo griped >&2",
+                trace_path.display()
+            ),
+            r#"silence = "all""#,
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let trace = wait_for_trace(&trace_path, 2).await;
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(trace, vec!["cleanup".to_string(), "start".to_string()]);
+        assert!(
+            !logs.iter().any(|line| line == "swept" || line == "griped"),
+            "silence did not suppress cleanup output: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("cleanup completed in")),
+            "silence must not suppress the hook's own lifecycle lines: {:?}",
+            logs
         );
     }
 
