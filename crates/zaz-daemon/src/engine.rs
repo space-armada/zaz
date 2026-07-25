@@ -982,6 +982,18 @@ struct ConfigDiff {
     unchanged: Vec<String>,
 }
 
+/// The `Ready` transition a service's readiness check is holding back.
+///
+/// Both fields are decided where the services spawn. The tick that eventually settles
+/// readiness runs far from that decision and cannot rebuild it: the two spawn sites read the
+/// lifecycle phase at different points relative to `services_started`, and a suppressed
+/// cascade is not recoverable at all.
+#[derive(Debug, Clone, Copy)]
+struct PendingReady {
+    phase: LifecyclePhase,
+    cascade: bool,
+}
+
 /// A managed watch group with its processes.
 struct ManagedGroup {
     /// Group configuration.
@@ -1002,6 +1014,13 @@ struct ManagedGroup {
 
     /// Pending restart times for services
     pending_restarts: Vec<Option<Instant>>,
+
+    /// The `Ready` transition this group owes once its services report ready.
+    ///
+    /// Only the group's first `Ready` is gated. A group that already reached it stays there
+    /// while a crashed service respawns and checks again, the same way it stays `Ready` while
+    /// a crashed service sits in backoff.
+    pending_ready: Option<PendingReady>,
 }
 
 impl Engine {
@@ -1421,6 +1440,11 @@ impl Engine {
                     );
                     continue;
                 }
+
+                if self.group_awaits_readiness(group_name) {
+                    self.defer_ready(group_name, phase, trigger_ctx.should_cascade);
+                    continue;
+                }
             } else {
                 // Groups with nothing runnable still become Ready so dependency
                 // markers and task-only service groups can unblock dependents.
@@ -1559,7 +1583,7 @@ impl Engine {
         // Collect groups that need service action
         // (group_name, should_start_not_signal, should_cascade_to_dependents)
         let mut service_actions: Vec<(String, bool, bool)> = Vec::new();
-        // Collect groups that failed (for cascade_skip)
+        // Collect groups that failed (for the failure cascade)
         let mut failed_groups: Vec<String> = Vec::new();
 
         while let Ok(completion) = self.task_completion_rx.try_recv() {
@@ -1648,7 +1672,7 @@ impl Engine {
                             &self.notification_config,
                             crate::notify::NotifyEvent::group_failed(&completion.group_name),
                         );
-                        // Queue cascade_skip for this failed group
+                        // Queue the failure cascade for this group
                         failed_groups.push(completion.group_name.clone());
                     } else {
                         crate::notify::send_notification(
@@ -1730,9 +1754,9 @@ impl Engine {
             self.update_state();
         }
 
-        // Process cascade_skip for failed groups
+        // Skip everything waiting behind a group whose task failed
         for group_name in failed_groups {
-            self.cascade_skip(&group_name);
+            self.cascade_failure(&group_name);
         }
 
         // Process service actions after releasing borrows from the loop
@@ -1762,6 +1786,12 @@ impl Engine {
                 should_cascade,
                 "propagating task completion to dependents"
             );
+
+            if self.group_awaits_readiness(&group_name) {
+                self.defer_ready(&group_name, phase, should_cascade);
+                continue;
+            }
+
             if should_cascade {
                 if let Err(e) = self.propagate_to_dependents(&group_name, phase).await {
                     tracing::error!(
@@ -1904,7 +1934,19 @@ impl Engine {
             }
 
             group.services_started = true;
-            group.state.status = GroupStatus::Ready;
+
+            // This spawn supersedes whatever the last one was still waiting on. The caller
+            // records a fresh transition when this one has checks of its own outstanding.
+            group.pending_ready = None;
+
+            // A group whose services are still proving themselves has not finished starting.
+            // The readiness tick is what moves it on, and the caller holds back the
+            // propagation that goes with it until then.
+            group.state.status = if group.services.iter().any(|s| s.awaiting_readiness()) {
+                GroupStatus::Running
+            } else {
+                GroupStatus::Ready
+            };
         }
 
         // Spawn PTY reader tasks (outside the mutable borrow)
@@ -1965,6 +2007,10 @@ impl Engine {
     pub async fn check_services(&mut self) -> Result<(), DaemonError> {
         let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
             Vec::new();
+
+        // Groups whose readiness settled this tick, applied once the borrow below ends. The
+        // transition they owe reaches for `&mut self` through the dependency cascade.
+        let mut settled: Vec<(String, bool)> = Vec::new();
 
         // Build expansion context up front so the mutable borrow on `self.groups`
         // below does not conflict with reads of `self.config` / `self.config_path`.
@@ -2076,14 +2122,97 @@ impl Engine {
                     }
                 }
             }
+
+            // Checked after the per-service loop, so a group with several services settles
+            // only once the last of them has an answer.
+            if group.pending_ready.is_some()
+                && !group.services.iter().any(|s| s.awaiting_readiness())
+            {
+                let failed = group
+                    .state
+                    .services
+                    .iter()
+                    .any(|s| s.status == ProcessStatus::Failed);
+                settled.push((group_name.clone(), !failed));
+            }
         }
 
         for (process, group, reader) in pty_readers {
             self.spawn_pty_reader(process, group, reader);
         }
 
+        for (group_name, all_ready) in settled {
+            self.settle_group_readiness(&group_name, all_ready).await;
+        }
+
         self.update_state();
         Ok(())
+    }
+
+    /// Finish the `Ready` transition a group's readiness checks were holding back.
+    ///
+    /// A group whose every check passed reaches `Ready` and propagates to its dependents, on
+    /// the phase and cascade decision its spawn recorded. A group where one check timed out
+    /// failed to come up: it is reported failed and everything waiting behind it is skipped,
+    /// the same treatment a group whose task failed gets.
+    ///
+    /// A service that crashes inside its readiness window disarms the window rather than
+    /// failing it, so a crash-looping service settles its group as ready. That matches what a
+    /// group without any readiness check does today.
+    async fn settle_group_readiness(&mut self, group_name: &str, all_ready: bool) {
+        let Some(pending) = self
+            .groups
+            .get_mut(group_name)
+            .and_then(|group| group.pending_ready.take())
+        else {
+            return;
+        };
+
+        // Only the first transition is gated. A group that reached `Ready` between the spawn
+        // that recorded this and the tick that settled it has already told its dependents
+        // everything they were waiting to hear.
+        if self
+            .groups
+            .get(group_name)
+            .is_some_and(|group| group.state.status == GroupStatus::Ready)
+        {
+            return;
+        }
+
+        if !all_ready {
+            tracing::warn!(group = %group_name, "group failed to become ready");
+
+            crate::notify::send_notification(
+                &self.notification_config,
+                crate::notify::NotifyEvent::group_failed(group_name),
+            );
+            self.cascade_failure(group_name);
+
+            return;
+        }
+
+        tracing::info!(group = %group_name, "group ready, every readiness check passed");
+
+        // Only the engine's own copy moves here, matching the spawn site this stands in for.
+        // The resolver learns the group is done through `trigger_dependents` below.
+        if let Some(group) = self.groups.get_mut(group_name) {
+            group.state.status = GroupStatus::Ready;
+        }
+
+        if !pending.cascade {
+            return;
+        }
+
+        if let Err(e) = self
+            .propagate_to_dependents(group_name, pending.phase)
+            .await
+        {
+            tracing::error!(
+                group = %group_name,
+                error = %e,
+                "failed to propagate readiness to dependents"
+            );
+        }
     }
 
     /// Shutdown all processes gracefully.
@@ -2791,6 +2920,23 @@ impl Engine {
         }
     }
 
+    /// Whether any of the group's services is still running its readiness check.
+    fn group_awaits_readiness(&self, group_name: &str) -> bool {
+        self.groups
+            .get(group_name)
+            .is_some_and(|group| group.services.iter().any(|s| s.awaiting_readiness()))
+    }
+
+    /// Record the `Ready` transition a group's readiness checks are holding back, so the tick
+    /// that settles them can finish what this spawn started.
+    ///
+    /// A group that already reached `Ready` keeps it. Only the first transition is gated.
+    fn defer_ready(&mut self, group_name: &str, phase: LifecyclePhase, cascade: bool) {
+        if let Some(group) = self.groups.get_mut(group_name) {
+            group.pending_ready = Some(PendingReady { phase, cascade });
+        }
+    }
+
     /// Determine the lifecycle phase for a group.
     ///
     /// A group is in Runtime phase if it has already completed initial startup:
@@ -2890,12 +3036,11 @@ impl Engine {
         }
     }
 
-    /// Cascade skip status to dependents when a group fails.
+    /// Cascade skip status to dependents when a group is skipped.
     ///
     /// Marks the group as Skipped and recursively skips all dependents
     /// that were waiting for it.
     fn cascade_skip(&mut self, group_name: &str) {
-        // Use the resolver to mark as skipped and get cascading skips
         let result = self.dependency_resolver.mark_skipped(group_name);
 
         // Sync Engine's status for the source group
@@ -2903,8 +3048,27 @@ impl Engine {
             group.state.status = GroupStatus::Skipped;
         }
 
-        // Sync Engine's status for all transitively skipped groups
-        for skipped_group in result.to_skip {
+        self.sync_skipped(result.to_skip);
+    }
+
+    /// Cascade skip status to dependents when a group fails.
+    ///
+    /// The group that broke keeps `Failed` while everything waiting behind it is skipped. An
+    /// operator looking at a run of skipped groups needs to see which one caused them, and
+    /// folding the source into the skip it triggered hides exactly that.
+    fn cascade_failure(&mut self, group_name: &str) {
+        let result = self.dependency_resolver.mark_failed(group_name);
+
+        if let Some(group) = self.groups.get_mut(group_name) {
+            group.state.status = GroupStatus::Failed;
+        }
+
+        self.sync_skipped(result.to_skip);
+    }
+
+    /// Sync the engine's copy of the status for every group the resolver skipped.
+    fn sync_skipped(&mut self, skipped: Vec<String>) {
+        for skipped_group in skipped {
             if let Some(group) = self.groups.get_mut(&skipped_group) {
                 group.state.status = GroupStatus::Skipped;
             }
@@ -3141,6 +3305,7 @@ fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) 
         state: build_group_state(group),
         services_started: false,
         pending_restarts: vec![None; service_count],
+        pending_ready: None,
     }
 }
 
@@ -6611,6 +6776,261 @@ no_pty = true
                 .any(|line| line.starts_with("ready check skipped:")),
             "the failed expansion must be reported: {:?}",
             logs
+        );
+    }
+
+    /// Write a config where `api` depends on `web`, and `web`'s service carries the readiness
+    /// fields the test supplies.
+    ///
+    /// `api` holds a task rather than a service, so whether it started is visible in
+    /// `running_tasks` and not just in a status.
+    fn write_dependent_ready_config(config_path: &Path, marker: &Path, extra_service_fields: &str) {
+        let config = format!(
+            r#"
+[[group]]
+name = "web"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "web"
+command = "sleep 30"
+no_pty = true
+{extra}
+
+[[group]]
+name = "api"
+patterns = ["*.never-matches"]
+depends_on = ["web"]
+
+[[group.task]]
+name = "api"
+command = "touch '{marker}'"
+"#,
+            extra = extra_service_fields,
+            marker = marker.display(),
+        );
+        std::fs::write(config_path, config).unwrap();
+    }
+
+    fn group_status(engine: &Engine, group: &str) -> GroupStatus {
+        engine.groups.get(group).unwrap().state.status
+    }
+
+    /// Drive `check_services` until `group` reports `expected`, or give up after five seconds.
+    async fn pump_until_group(
+        engine: &mut Engine,
+        group: &str,
+        expected: GroupStatus,
+    ) -> GroupStatus {
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            engine.process_task_completions().await;
+            if group_status(engine, group) == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        group_status(engine, group)
+    }
+
+    #[tokio::test]
+    async fn test_a_dependent_waits_for_its_dependency_to_report_ready() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let listening = temp_dir.path().join("listening");
+        let api_ran = temp_dir.path().join("api-ran");
+
+        write_dependent_ready_config(
+            &config_path,
+            &api_ran,
+            &format!(
+                "ready_check = \"test -f '{listening}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                listening = listening.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        assert_eq!(
+            group_status(&engine, "web"),
+            GroupStatus::Running,
+            "a group whose service is still proving itself has not finished starting"
+        );
+        assert_eq!(group_status(&engine, "api"), GroupStatus::Waiting);
+
+        for _ in 0..5 {
+            engine.check_services().await.unwrap();
+            engine.process_task_completions().await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            group_status(&engine, "api"),
+            GroupStatus::Waiting,
+            "a dependent must not start while the check it waits on keeps failing"
+        );
+        assert!(
+            !api_ran.exists(),
+            "the dependent's task ran before its dependency could accept work"
+        );
+
+        std::fs::write(&listening, "").unwrap();
+
+        let web = pump_until_group(&mut engine, "web", GroupStatus::Ready).await;
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(web, GroupStatus::Ready);
+        assert!(
+            !engine.dependency_resolver.is_waiting("api"),
+            "the passing check must unblock the dependent"
+        );
+        assert!(
+            api_ran.exists(),
+            "the dependent never ran once its dependency reported ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_readiness_timeout_fails_its_group_and_skips_dependents() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let api_ran = temp_dir.path().join("api-ran");
+
+        write_dependent_ready_config(
+            &config_path,
+            &api_ran,
+            "ready_check = \"echo not listening yet >&2; exit 7\"\n\
+             ready_poll_interval = \"20ms\"\n\
+             ready_timeout = \"200ms\"",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let web = pump_until_group(&mut engine, "web", GroupStatus::Failed).await;
+        let api = group_status(&engine, "api");
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            web,
+            GroupStatus::Failed,
+            "the group that broke must say so rather than read as skipped behind itself"
+        );
+        assert_eq!(api, GroupStatus::Skipped);
+        assert!(
+            !api_ran.exists(),
+            "a dependent behind a service that never came up must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_dependent_of_a_service_without_a_ready_check_starts_at_once() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let api_ran = temp_dir.path().join("api-ran");
+
+        write_dependent_ready_config(&config_path, &api_ran, "");
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let web = group_status(&engine, "web");
+        assert!(engine.wait_for_tasks().await);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            web,
+            GroupStatus::Ready,
+            "a group with no readiness check anywhere must reach Ready the moment it spawns"
+        );
+        assert!(
+            api_ran.exists(),
+            "the dependent must start on spawn, exactly as it always has"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_readiness_checked_group_with_no_dependents_still_reaches_ready() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let listening = temp_dir.path().join("listening");
+        std::fs::write(&listening, "").unwrap();
+
+        write_ready_check_config(
+            &config_path,
+            &format!(
+                "ready_check = \"test -f '{listening}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                listening = listening.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let status = pump_until_group(&mut engine, "hooked", GroupStatus::Ready).await;
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            status,
+            GroupStatus::Ready,
+            "a group with nothing downstream still owes itself the transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_ready_group_stays_ready_while_a_restarted_service_checks_again() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let listening = temp_dir.path().join("listening");
+        std::fs::write(&listening, "").unwrap();
+
+        write_ready_check_config(
+            &config_path,
+            &format!(
+                "ready_check = \"test -f '{listening}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                listening = listening.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert_eq!(
+            pump_until_group(&mut engine, "hooked", GroupStatus::Ready).await,
+            GroupStatus::Ready
+        );
+
+        std::fs::remove_file(&listening).unwrap();
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        assert_eq!(
+            pump_until_status(&mut engine, ProcessStatus::Starting).await,
+            ProcessStatus::Starting
+        );
+        let status = group_status(&engine, "hooked");
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            status,
+            GroupStatus::Ready,
+            "only the first transition is gated; a group already Ready keeps it while a \
+             respawned service checks again, the same as it does through a backoff"
         );
     }
 }
