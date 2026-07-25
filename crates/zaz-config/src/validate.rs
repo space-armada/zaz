@@ -309,6 +309,9 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
                     errors,
                 );
             }
+            if let Some(ready) = &service.ready_check {
+                validate_service_command_field(&group.name, name, "ready_check", ready, errors);
+            }
             if let Some(stop) = &service.stop_command {
                 validate_service_command_field(&group.name, name, "stop_command", stop, errors);
             }
@@ -317,6 +320,7 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
             }
 
             validate_service_stop_mechanism(&group.name, service, errors);
+            validate_service_readiness(&group.name, service, errors);
 
             if service_names.contains(name) {
                 let mut error = ValidationError::new(ValidationErrorKind::DuplicateServiceName {
@@ -391,10 +395,54 @@ fn validate_service_stop_mechanism(
     }
 }
 
+/// Validate a service's readiness configuration.
+///
+/// `ready_poll_interval` and `ready_timeout` only ever apply to a `ready_check`, so either one
+/// set alone does nothing at runtime. Rejecting the pairing keeps a config that gates nothing
+/// from reading as if it does.
+///
+/// A zero poll interval is rejected separately: it would run the check back to back with no
+/// pause, spinning until the timeout rather than polling.
+fn validate_service_readiness(
+    group: &str,
+    service: &ServiceCommand,
+    errors: &mut ValidationErrors,
+) {
+    if service.ready_check.is_none() {
+        for (field, set) in [
+            ("ready_poll_interval", service.ready_poll_interval.is_some()),
+            ("ready_timeout", service.ready_timeout.is_some()),
+        ] {
+            if !set {
+                continue;
+            }
+
+            errors.push(
+                ValidationError::new(ValidationErrorKind::ReadyTuningWithoutCheck {
+                    group: group.to_string(),
+                    service: service.name().to_string(),
+                    field: field.to_string(),
+                })
+                .with_hint("this only applies to a ready_check; add one or remove the field"),
+            );
+        }
+    }
+
+    if service.ready_poll_interval_ms() == Some(0) {
+        errors.push(
+            ValidationError::new(ValidationErrorKind::ZeroReadyPollInterval {
+                group: group.to_string(),
+                service: service.name().to_string(),
+            })
+            .with_hint("use a positive interval, or leave it unset for the 100ms default"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Group, ServiceCommand, Signal, TaskCommand};
+    use crate::{Group, HumanDuration, ServiceCommand, Signal, TaskCommand};
 
     fn make_group(name: &str) -> Group {
         Group {
@@ -934,6 +982,133 @@ mod tests {
             ..Default::default()
         };
         validate(&config).expect("a signal without a stop_command must validate");
+    }
+
+    #[test]
+    fn test_ready_check_rejects_file_context_builtins() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some("./probe ${zaz:files}".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' ready_check references ${zaz:files}"),
+            "expected ready_check named in error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_empty_ready_check_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some(String::new());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' has empty ready_check"),
+            "expected empty ready_check error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_unset_ready_check_validates() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "./bin/handler")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("an unset ready_check must not affect validation");
+    }
+
+    #[test]
+    fn test_ready_tuning_without_a_ready_check_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_poll_interval = Some(HumanDuration::from_millis(250));
+        service.ready_timeout = Some(HumanDuration::from_millis(60_000));
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' sets ready_poll_interval without a ready_check"),
+            "expected ready_poll_interval reported on its own, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("service 'watcher' sets ready_timeout without a ready_check"),
+            "expected ready_timeout reported on its own, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("hint:"),
+            "expected hint pointing at the missing ready_check, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_ready_tuning_alongside_a_ready_check_validates() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some("./probe".to_string());
+        service.ready_poll_interval = Some(HumanDuration::from_millis(250));
+        service.ready_timeout = Some(HumanDuration::from_millis(60_000));
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("tuning a configured ready_check must validate");
+    }
+
+    #[test]
+    fn test_zero_ready_poll_interval_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some("./probe".to_string());
+        service.ready_poll_interval = Some(HumanDuration::from_millis(0));
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.kind.code() == "zero_ready_poll_interval"),
+            "a zero interval would run the check back to back until the timeout"
+        );
+    }
+
+    #[test]
+    fn test_zero_ready_timeout_validates() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some("./probe".to_string());
+        service.ready_timeout = Some(HumanDuration::from_millis(0));
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("a zero timeout means one check then give up, which is coherent");
     }
 
     #[test]

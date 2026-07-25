@@ -621,6 +621,107 @@ command = "./server"
     }
 
     #[test]
+    fn test_ready_check_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+ready_check = "curl -sf localhost:8080/healthz"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].ready_check,
+            Some("curl -sf localhost:8080/healthz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ready_check_parsing_json() {
+        let json = r#"{
+            "groups": [{
+                "name": "test",
+                "patterns": ["*.txt"],
+                "services": [{
+                    "name": "server",
+                    "command": "./server",
+                    "ready_check": "curl -sf localhost:8080/healthz"
+                }]
+            }]
+        }"#;
+        let config = parse_json(json).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].ready_check,
+            Some("curl -sf localhost:8080/healthz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ready_poll_interval_and_timeout_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+ready_check = "./healthz"
+ready_poll_interval = "250ms"
+ready_timeout = "1m"
+"#;
+        let config = parse_toml(toml).unwrap();
+        let service = &config.groups[0].services[0];
+
+        assert_eq!(service.ready_poll_interval_ms(), Some(250));
+        assert_eq!(service.ready_timeout_ms(), Some(60_000));
+    }
+
+    #[test]
+    fn test_ready_durations_accept_integer_milliseconds() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+ready_check = "./healthz"
+ready_poll_interval = 500
+ready_timeout = 45000
+"#;
+        let config = parse_toml(toml).unwrap();
+        let service = &config.groups[0].services[0];
+
+        assert_eq!(service.ready_poll_interval_ms(), Some(500));
+        assert_eq!(service.ready_timeout_ms(), Some(45_000));
+    }
+
+    #[test]
+    fn test_ready_check_unset_leaves_service_unchanged() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+"#;
+        let config = parse_toml(toml).unwrap();
+        let service = &config.groups[0].services[0];
+
+        assert_eq!(*service, ServiceCommand::new("server", "./server"));
+        assert!(service.ready_check.is_none());
+        assert!(service.ready_poll_interval.is_none());
+        assert!(service.ready_timeout.is_none());
+    }
+
+    #[test]
     fn test_config_round_trips_through_toml() {
         let toml = r#"
 [settings]
@@ -638,10 +739,13 @@ command = "make"
 name = "server"
 command = "./server"
 cleanup_command = "rm -f ./server.pid"
+ready_check = "./server-ctl ping"
 stop_command = "./server-ctl drain"
 kill_command = "./server-ctl abort"
 delay = "500ms"
 stop_timeout = "30s"
+ready_poll_interval = "250ms"
+ready_timeout = "1m"
 "#;
         let config = parse_toml(toml).unwrap();
         let reserialized = toml::to_string(&config).unwrap();

@@ -415,6 +415,8 @@ Validation error codes (from `crates/zaz-config/src/error.rs`):
 | `duplicate_service_name` | Two services in the same group share an explicit name. |
 | `service_command_file_builtin` | A service command field references a file-context built-in. |
 | `conflicting_stop_mechanism` | Service sets both `signal` and `stop_command`. |
+| `ready_tuning_without_check` | Service sets `ready_poll_interval` or `ready_timeout` without a `ready_check`. |
+| `zero_ready_poll_interval` | Service sets a `ready_poll_interval` of zero. |
 
 Parse-level failures (TOML/JSON syntax errors, unknown fields, I/O errors)
 are reported as a single error with code `parse_error`.

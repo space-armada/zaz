@@ -178,10 +178,13 @@ deprecated aliases for backwards compatibility. New configs should use
 | `name` | string | derived | Same derivation rule as task `name`. |
 | `command` | string | required | Shell command to run; non-empty. |
 | `cleanup_command` | string | unset | Runs before every spawn, including the first. Clears state a prior run left behind. |
+| `ready_check` | string | unset | Reports whether the service has finished starting. Zero exit means ready. Unset means spawning counts as ready. |
 | `stop_command` | string | unset | Stops the service instead of signalling its process group, on restart and on shutdown alike. Conflicts with `signal`. |
 | `kill_command` | string | unset | Force kills the service instead of sending SIGKILL once `stop_timeout` elapses. |
 | `signal` | enum | `SIGTERM` | Signal sent on restart. See [`Signal`](#signal). |
 | `stop_timeout` | duration | `10s` | How long to wait for an exit after the stop before force killing. Also bounds `stop_command` itself. |
+| `ready_poll_interval` | duration | `100ms` | How long to wait between `ready_check` runs. Requires `ready_check`; must be non-zero. |
+| `ready_timeout` | duration | `30s` | How long `ready_check` may keep failing before the service is treated as failed to start. Requires `ready_check`. |
 | `no_pty` | bool | `false` | Disable PTY allocation. PTY is on by default so tools like `tailwind --watch` work. |
 | `silence` | enum | `none` | TUI suppression level. See [`Silence`](#silence). |
 | `delay` | duration | unset | Wait this long after preceding tasks before starting. Alias: `delay_ms`. |
@@ -293,8 +296,8 @@ is `SIGTERM`.
 
 ## Duration parsing
 
-Duration-typed fields (`debounce`, `delay`, `stop_timeout`) accept three input
-forms:
+Duration-typed fields (`debounce`, `delay`, `stop_timeout`,
+`ready_poll_interval`, `ready_timeout`) accept three input forms:
 
 - A human-readable string parsed by [`humantime`](https://docs.rs/humantime):
   `"500ms"`, `"2s"`, `"1m30s"`, `"1s 500ms"`.
@@ -332,12 +335,20 @@ human message.
 | Duplicate service name | `group '{g}': duplicate service name '{n}'` |
 | File-context built-in in a service command field | `group '{g}': service '{n}' {field} references ${b}, ...` |
 | Conflicting stop mechanism | `group '{g}': service '{n}' sets both signal and stop_command` |
+| Readiness tuning without a check | `group '{g}': service '{n}' sets {field} without a ready_check` |
+| Zero readiness poll interval | `group '{g}': service '{n}' has a zero ready_poll_interval` |
 
 Service errors report `{field}` as the name of the offending field, so a
 service carrying more than one command string points at the right one.
 
 `stop_command` replaces the restart signal outright, so a service setting both
 it and `signal` is rejected rather than having its signal silently ignored.
+
+`ready_poll_interval` and `ready_timeout` only ever apply to a `ready_check`,
+so either one set alone is rejected rather than accepted and ignored. A zero
+`ready_poll_interval` is rejected separately, because it would run the check
+back to back with no pause. A zero `ready_timeout` is allowed: it means one
+check, then give up.
 
 Unknown-dependency errors include a "did you mean '{x}'?" hint when a
 group name within Levenshtein distance 2 exists, otherwise an

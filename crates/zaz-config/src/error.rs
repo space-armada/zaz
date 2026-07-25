@@ -249,6 +249,23 @@ pub enum ValidationErrorKind {
         /// Name of the service.
         service: String,
     },
+    /// Service tunes its readiness polling without configuring a `ready_check` for the
+    /// tuning to apply to.
+    ReadyTuningWithoutCheck {
+        /// Name of the group.
+        group: String,
+        /// Name of the service.
+        service: String,
+        /// The offending field, `ready_poll_interval` or `ready_timeout`.
+        field: String,
+    },
+    /// Service sets a `ready_poll_interval` of zero, which would poll without pausing.
+    ZeroReadyPollInterval {
+        /// Name of the group.
+        group: String,
+        /// Name of the service.
+        service: String,
+    },
 }
 
 impl ValidationErrorKind {
@@ -269,6 +286,8 @@ impl ValidationErrorKind {
             Self::DuplicateServiceName { .. } => "duplicate_service_name",
             Self::ServiceCommandFileBuiltin { .. } => "service_command_file_builtin",
             Self::ConflictingStopMechanism { .. } => "conflicting_stop_mechanism",
+            Self::ReadyTuningWithoutCheck { .. } => "ready_tuning_without_check",
+            Self::ZeroReadyPollInterval { .. } => "zero_ready_poll_interval",
         }
     }
 }
@@ -365,6 +384,24 @@ impl fmt::Display for ValidationErrorKind {
                 write!(
                     f,
                     "group '{}': service '{}' sets both signal and stop_command",
+                    group, service
+                )
+            }
+            Self::ReadyTuningWithoutCheck {
+                group,
+                service,
+                field,
+            } => {
+                write!(
+                    f,
+                    "group '{}': service '{}' sets {} without a ready_check",
+                    group, service, field
+                )
+            }
+            Self::ZeroReadyPollInterval { group, service } => {
+                write!(
+                    f,
+                    "group '{}': service '{}' has a zero ready_poll_interval",
                     group, service
                 )
             }

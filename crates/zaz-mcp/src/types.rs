@@ -267,6 +267,7 @@ pub struct ConfigService {
     pub name: String,
     pub command: String,
     pub cleanup_command: Option<String>,
+    pub ready_check: Option<String>,
     pub stop_command: Option<String>,
     pub kill_command: Option<String>,
     pub signal: SignalReport,
@@ -275,6 +276,8 @@ pub struct ConfigService {
     pub working_dir: Option<String>,
     pub delay_ms: Option<u64>,
     pub stop_timeout_ms: Option<u64>,
+    pub ready_poll_interval_ms: Option<u64>,
+    pub ready_timeout_ms: Option<u64>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -504,6 +507,7 @@ impl From<&ServiceCommand> for ConfigService {
             name: d.name().to_string(),
             command: d.command.clone(),
             cleanup_command: d.cleanup_command.clone(),
+            ready_check: d.ready_check.clone(),
             stop_command: d.stop_command.clone(),
             kill_command: d.kill_command.clone(),
             signal: d.signal().into(),
@@ -512,6 +516,8 @@ impl From<&ServiceCommand> for ConfigService {
             working_dir: d.working_dir.clone(),
             delay_ms: d.delay_ms(),
             stop_timeout_ms: d.stop_timeout_ms(),
+            ready_poll_interval_ms: d.ready_poll_interval_ms(),
+            ready_timeout_ms: d.ready_timeout_ms(),
             env: d.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }

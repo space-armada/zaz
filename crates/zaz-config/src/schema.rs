@@ -328,6 +328,14 @@ pub struct ServiceCommand {
     #[serde(default)]
     pub cleanup_command: Option<String>,
 
+    /// Command that reports whether this service has finished starting. A zero exit means
+    /// ready; any nonzero exit means not yet.
+    ///
+    /// Unset means a service counts as ready the moment it spawns, which is how every service
+    /// behaved before this field existed.
+    #[serde(default)]
+    pub ready_check: Option<String>,
+
     /// Command that stops this service, replacing the signal sent to its process group.
     ///
     /// Lets a service that wraps an external system stop what it wraps rather than only its
@@ -375,6 +383,24 @@ pub struct ServiceCommand {
     #[serde(default)]
     pub stop_timeout: Option<HumanDuration>,
 
+    /// How long to wait between `ready_check` runs.
+    ///
+    /// Accepts human-readable strings ("250ms", "1s") or integer milliseconds. Unset falls
+    /// back to a 100-millisecond default. Setting this without `ready_check` is a validation
+    /// error.
+    #[serde(default)]
+    pub ready_poll_interval: Option<HumanDuration>,
+
+    /// How long `ready_check` may keep failing before the service is treated as failed to
+    /// start.
+    ///
+    /// Accepts human-readable strings ("30s", "2m") or integer milliseconds. Unset falls back
+    /// to a 30-second default, which is longer than the stop timeout because legitimate
+    /// startup times vary far more widely than shutdowns do. Setting this without
+    /// `ready_check` is a validation error.
+    #[serde(default)]
+    pub ready_timeout: Option<HumanDuration>,
+
     /// Environment variables for this service (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -387,6 +413,7 @@ impl ServiceCommand {
             name: Some(name.into()),
             command: command.into(),
             cleanup_command: None,
+            ready_check: None,
             stop_command: None,
             kill_command: None,
             signal: None,
@@ -395,6 +422,8 @@ impl ServiceCommand {
             working_dir: None,
             delay: None,
             stop_timeout: None,
+            ready_poll_interval: None,
+            ready_timeout: None,
             env: HashMap::new(),
         }
     }
@@ -405,6 +434,7 @@ impl ServiceCommand {
             name: None,
             command: command.into(),
             cleanup_command: None,
+            ready_check: None,
             stop_command: None,
             kill_command: None,
             signal: None,
@@ -413,6 +443,8 @@ impl ServiceCommand {
             working_dir: None,
             delay: None,
             stop_timeout: None,
+            ready_poll_interval: None,
+            ready_timeout: None,
             env: HashMap::new(),
         }
     }
@@ -455,6 +487,20 @@ impl ServiceCommand {
     /// Returns None when unset, leaving the default to the process layer.
     pub fn stop_timeout_ms(&self) -> Option<u64> {
         self.stop_timeout.map(|t| t.as_millis())
+    }
+
+    /// Get the configured readiness poll interval in milliseconds.
+    ///
+    /// Returns None when unset, leaving the default to the readiness poller.
+    pub fn ready_poll_interval_ms(&self) -> Option<u64> {
+        self.ready_poll_interval.map(|t| t.as_millis())
+    }
+
+    /// Get the configured readiness timeout in milliseconds.
+    ///
+    /// Returns None when unset, leaving the default to the readiness poller.
+    pub fn ready_timeout_ms(&self) -> Option<u64> {
+        self.ready_timeout.map(|t| t.as_millis())
     }
 }
 
