@@ -272,6 +272,7 @@ pub struct ConfigService {
     pub silence: SilenceReport,
     pub working_dir: Option<String>,
     pub delay_ms: Option<u64>,
+    pub stop_timeout_ms: Option<u64>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -506,6 +507,7 @@ impl From<&ServiceCommand> for ConfigService {
             silence: d.silence.into(),
             working_dir: d.working_dir.clone(),
             delay_ms: d.delay_ms(),
+            stop_timeout_ms: d.stop_timeout_ms(),
             env: d.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }

@@ -351,6 +351,14 @@ pub struct ServiceCommand {
     #[serde(default, alias = "delay_ms")]
     pub delay: Option<HumanDuration>,
 
+    /// How long to wait for the service to exit after its stop signal before escalating to
+    /// SIGKILL. Applies to every restart and to daemon shutdown.
+    ///
+    /// Accepts human-readable strings ("30s", "2m") or integer milliseconds. Unset falls
+    /// back to a 10-second default.
+    #[serde(default)]
+    pub stop_timeout: Option<HumanDuration>,
+
     /// Environment variables for this service (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -368,6 +376,7 @@ impl ServiceCommand {
             silence: Silence::None,
             working_dir: None,
             delay: None,
+            stop_timeout: None,
             env: HashMap::new(),
         }
     }
@@ -383,6 +392,7 @@ impl ServiceCommand {
             silence: Silence::None,
             working_dir: None,
             delay: None,
+            stop_timeout: None,
             env: HashMap::new(),
         }
     }
@@ -402,6 +412,13 @@ impl ServiceCommand {
     /// Get delay in milliseconds (for backwards compatibility).
     pub fn delay_ms(&self) -> Option<u64> {
         self.delay.map(|d| d.as_millis())
+    }
+
+    /// Get the configured stop timeout in milliseconds.
+    ///
+    /// Returns None when unset, leaving the default to the process layer.
+    pub fn stop_timeout_ms(&self) -> Option<u64> {
+        self.stop_timeout.map(|t| t.as_millis())
     }
 }
 

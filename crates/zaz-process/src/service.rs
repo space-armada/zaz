@@ -17,6 +17,9 @@ const MAX_RESTART_DELAY: Duration = Duration::from_secs(8);
 /// Multiplier for exponential backoff.
 const BACKOFF_MULTIPLIER: u32 = 2;
 
+/// Grace period before escalating to SIGKILL when a service sets no `stop_timeout`.
+const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Information about a service that has exited.
 #[derive(Debug)]
 pub struct ServiceExitInfo {
@@ -50,6 +53,7 @@ pub struct Service {
     state: ServiceState,
     restart_delay: Duration,
     last_start: Option<Instant>,
+    stop_deadline: Option<Instant>,
 }
 
 impl Service {
@@ -62,6 +66,7 @@ impl Service {
             state: ServiceState::Stopped,
             restart_delay: MIN_RESTART_DELAY,
             last_start: None,
+            stop_deadline: None,
         }
     }
 
@@ -128,8 +133,22 @@ impl Service {
         self.child = Some(child);
         self.state = ServiceState::Running;
         self.last_start = Some(Instant::now());
+        self.stop_deadline = None;
 
         Ok(())
+    }
+
+    /// How long the service gets to exit after a stop signal before it is force killed.
+    pub fn stop_timeout(&self) -> Duration {
+        self.config
+            .stop_timeout
+            .map(|t| t.as_duration())
+            .unwrap_or(DEFAULT_STOP_TIMEOUT)
+    }
+
+    /// Returns true while the service owes an exit within its stop timeout.
+    pub fn has_stop_deadline(&self) -> bool {
+        self.stop_deadline.is_some()
     }
 
     /// Send restart signal to the service.
@@ -144,6 +163,7 @@ impl Service {
                     "sending restart signal"
                 );
                 SignalHandler::send_to_group(pid as i32, signal)?;
+                self.stop_deadline = Some(Instant::now() + self.stop_timeout());
             }
         }
         Ok(())
@@ -157,10 +177,60 @@ impl Service {
             if let Some(pid) = child.id() {
                 tracing::info!(name = %self.config.name(), pid = pid, "stopping service");
                 SignalHandler::send_to_group(pid as i32, Signal::SIGTERM)?;
+                self.stop_deadline = Some(Instant::now() + self.stop_timeout());
             }
         }
 
         Ok(())
+    }
+
+    /// Force kill the service if its stop timeout has elapsed. Returns true if SIGKILL was
+    /// delivered.
+    ///
+    /// The deadline is armed by whichever of `signal_restart` or `stop` sent the signal,
+    /// and is one-shot. It clears whether or not the signal lands, so a caller polling this
+    /// cannot spin forever on a process it is unable to kill.
+    ///
+    /// A signal that fails is logged rather than returned. The group can exit between the
+    /// caller's liveness check and this signal, and a stop must not be blocked by a service
+    /// that is already gone.
+    ///
+    /// Unlike `kill`, this keeps the child so the ordinary `check` path reaps the exit and
+    /// schedules the restart. Dropping it here would strand a restarting service with no
+    /// exit for anyone to observe.
+    pub fn enforce_stop_deadline(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.stop_deadline else {
+            return false;
+        };
+
+        if now < deadline {
+            return false;
+        }
+
+        self.stop_deadline = None;
+
+        let Some(pid) = self.child.as_ref().and_then(|child| child.id()) else {
+            return false;
+        };
+
+        tracing::warn!(
+            name = %self.config.name(),
+            pid = pid,
+            timeout_ms = self.stop_timeout().as_millis(),
+            "stop timeout expired, force killing service"
+        );
+
+        if let Err(e) = SignalHandler::send_to_group(pid as i32, Signal::SIGKILL) {
+            tracing::warn!(
+                name = %self.config.name(),
+                pid = pid,
+                error = %e,
+                "could not force kill service; it has most likely already exited"
+            );
+            return false;
+        }
+
+        true
     }
 
     /// Force kill the service (SIGKILL).
@@ -173,6 +243,7 @@ impl Service {
         }
         self.child = None;
         self.state = ServiceState::Stopped;
+        self.stop_deadline = None;
         Ok(())
     }
 
@@ -219,6 +290,7 @@ impl Service {
 
                 self.child = None;
                 self.state = ServiceState::Stopped;
+                self.stop_deadline = None;
                 Ok(Some(ServiceExitInfo {
                     duration,
                     exit_code: status.code(),
@@ -258,11 +330,68 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn service_with_cleanup(command: &str, cleanup: Option<&str>) -> ServiceCommand {
         let mut config = ServiceCommand::new("svc", command);
         config.cleanup_command = cleanup.map(str::to_string);
         config
+    }
+
+    /// Build a service whose only way out is the escalation to SIGKILL.
+    fn stubborn_service(stop_timeout: Option<Duration>) -> Service {
+        let mut config = ServiceCommand::new("svc", "unused");
+        config.no_pty = true;
+        config.stop_timeout = stop_timeout.map(zaz_config::HumanDuration::new);
+
+        Service::new(config, Executor::new(Some("/bin/sh".to_string())))
+    }
+
+    /// A command that ignores SIGTERM, touching `ready` once the trap is installed.
+    ///
+    /// Signalling before the marker appears races the shell's own startup, and the default
+    /// disposition kills it outright before the trap takes effect.
+    fn stubborn_command(ready: &Path) -> String {
+        format!(
+            "trap '' TERM; : > '{}'; while true; do sleep 1; done",
+            ready.display()
+        )
+    }
+
+    /// Poll until the stubborn service has installed its SIGTERM trap.
+    async fn wait_until_trapping(ready: &Path) {
+        for _ in 0..200 {
+            if ready.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("service never installed its SIGTERM trap");
+    }
+
+    /// Poll `enforce_stop_deadline` until it escalates, or give up after a second.
+    async fn wait_for_escalation(service: &mut Service) -> bool {
+        for _ in 0..100 {
+            if service.enforce_stop_deadline(Instant::now()) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        false
+    }
+
+    /// Poll `check` until the service reports its exit, or give up after a second.
+    async fn wait_for_exit(service: &mut Service) -> Option<ServiceExitInfo> {
+        for _ in 0..100 {
+            if let Some(info) = service.check().await.unwrap() {
+                return Some(info);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        None
     }
 
     fn drain(mut rx: mpsc::UnboundedReceiver<OutputLine>) -> Vec<String> {
@@ -343,5 +472,98 @@ mod tests {
             output.stdout,
             vec![canonical.display().to_string(), "marked".to_string()]
         );
+    }
+
+    #[test]
+    fn test_unset_stop_timeout_falls_back_to_the_default() {
+        let service = stubborn_service(None);
+
+        assert_eq!(service.stop_timeout(), DEFAULT_STOP_TIMEOUT);
+    }
+
+    #[test]
+    fn test_configured_stop_timeout_overrides_the_default() {
+        let service = stubborn_service(Some(Duration::from_secs(45)));
+
+        assert_eq!(service.stop_timeout(), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn test_no_deadline_is_armed_until_a_signal_is_sent() {
+        let mut service = stubborn_service(Some(Duration::from_millis(50)));
+
+        assert!(!service.has_stop_deadline());
+        assert!(!service.enforce_stop_deadline(Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn test_restart_signal_escalates_to_sigkill_after_the_stop_timeout() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let ready = temp_dir.path().join("trapping");
+
+        let mut service = stubborn_service(Some(Duration::from_millis(100)));
+        service.start(&stubborn_command(&ready)).unwrap();
+        wait_until_trapping(&ready).await;
+
+        service.signal_restart().unwrap();
+        assert!(service.has_stop_deadline());
+
+        assert!(
+            wait_for_escalation(&mut service).await,
+            "stop timeout never escalated to SIGKILL"
+        );
+        assert!(
+            !service.has_stop_deadline(),
+            "the deadline must clear so the escalation stays one-shot"
+        );
+
+        let exit = wait_for_exit(&mut service)
+            .await
+            .expect("SIGKILLed service never reported its exit");
+        assert_eq!(
+            exit.exit_code, None,
+            "a signalled exit carries no exit code, so SIGKILL is what ended it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_service_that_exits_within_the_timeout_never_escalates() {
+        let mut service = stubborn_service(Some(Duration::from_secs(30)));
+        service.start("sleep 30").unwrap();
+
+        service.signal_restart().unwrap();
+
+        let exit = wait_for_exit(&mut service)
+            .await
+            .expect("service ignored its restart signal");
+        assert_eq!(exit.exit_code, None);
+        assert!(
+            !service.has_stop_deadline(),
+            "an observed exit must disarm the deadline"
+        );
+        assert!(!service.enforce_stop_deadline(Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn test_stop_arms_the_same_deadline_as_a_restart() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let ready = temp_dir.path().join("trapping");
+
+        let mut service = stubborn_service(Some(Duration::from_millis(100)));
+        service.start(&stubborn_command(&ready)).unwrap();
+        wait_until_trapping(&ready).await;
+
+        service.stop().unwrap();
+        assert!(service.has_stop_deadline());
+
+        assert!(
+            wait_for_escalation(&mut service).await,
+            "shutdown-path stop never escalated to SIGKILL"
+        );
+
+        let exit = wait_for_exit(&mut service)
+            .await
+            .expect("SIGKILLed service never reported its exit");
+        assert_eq!(exit.exit_code, None);
     }
 }

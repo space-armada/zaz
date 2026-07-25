@@ -1625,6 +1625,16 @@ impl Engine {
                         .await;
 
                     group.pending_restarts[idx] = Some(now + delay);
+                } else if service.enforce_stop_deadline(now) {
+                    let log_msg = format!(
+                        "stop timeout expired after {:.2}s; sent SIGKILL",
+                        service.stop_timeout().as_secs_f64()
+                    );
+                    let _ = log_tx
+                        .send(
+                            LogLine::daemon(service.name(), log_msg).with_group(group_name.clone()),
+                        )
+                        .await;
                 }
             }
         }
@@ -1639,10 +1649,9 @@ impl Engine {
 
     /// Shutdown all processes gracefully.
     ///
-    /// Sends SIGTERM to all services, waits up to grace_period for them to exit,
-    /// then sends SIGKILL to any that are still running.
+    /// Sends SIGTERM to all services, waits up to each service's own `stop_timeout` for it
+    /// to exit, then sends SIGKILL to any that are still running.
     pub async fn shutdown(&mut self) -> Result<(), DaemonError> {
-        const GRACE_PERIOD: Duration = Duration::from_secs(10);
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
         tracing::info!("shutting down");
@@ -1655,32 +1664,30 @@ impl Engine {
             }
         }
 
-        // Wait for services to exit, up to grace period
-        let deadline = std::time::Instant::now() + GRACE_PERIOD;
+        // Wait for services to exit, each on its own deadline. The loop terminates because
+        // every service either exits, escalates once and clears its deadline, or is still
+        // inside its window.
         loop {
-            let mut any_running = false;
+            let now = std::time::Instant::now();
+            let mut waiting = false;
+
             for group in self.groups.values_mut() {
                 for service in &mut group.services {
-                    if service.is_running() {
-                        any_running = true;
+                    if !service.is_running() {
+                        continue;
+                    }
+
+                    if service.enforce_stop_deadline(now) {
+                        continue;
+                    }
+
+                    if service.has_stop_deadline() {
+                        waiting = true;
                     }
                 }
             }
 
-            if !any_running {
-                tracing::info!("all services exited");
-                break;
-            }
-
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!("grace period expired, force killing remaining services");
-                for group in self.groups.values_mut() {
-                    for service in &mut group.services {
-                        if service.is_running() {
-                            service.kill().map_err(DaemonError::Process)?;
-                        }
-                    }
-                }
+            if !waiting {
                 break;
             }
 
@@ -5255,6 +5262,135 @@ no_pty = true
                 .any(|line| line.starts_with("cleanup completed in")),
             "silence must not suppress the hook's own lifecycle lines: {:?}",
             logs
+        );
+    }
+
+    /// Write a config whose service ignores SIGTERM and traces every spawn.
+    ///
+    /// The service touches `ready_path` once its trap is installed. Signalling before that
+    /// marker appears races the shell's own startup, where SIGTERM's default disposition
+    /// kills it outright and the escalation never gets exercised.
+    fn write_stubborn_service_config(
+        config_path: &Path,
+        trace_path: &Path,
+        ready_path: &Path,
+        stop_timeout: &str,
+    ) {
+        let config = format!(
+            r#"
+[[group]]
+name = "stubborn"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "stubborn"
+command = "trap '' TERM; echo start >> '{trace}'; : > '{ready}'; while true; do sleep 1; done"
+no_pty = true
+stop_timeout = "{timeout}"
+"#,
+            trace = trace_path.display(),
+            ready = ready_path.display(),
+            timeout = stop_timeout,
+        );
+        std::fs::write(config_path, config).unwrap();
+    }
+
+    /// Poll until the stubborn service has installed its SIGTERM trap.
+    async fn wait_until_trapping(ready_path: &Path) {
+        for _ in 0..200 {
+            if ready_path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("service never installed its SIGTERM trap");
+    }
+
+    #[tokio::test]
+    async fn test_restart_escalates_to_sigkill_when_the_stop_signal_is_ignored() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+        let ready_path = temp_dir.path().join("trapping");
+
+        write_stubborn_service_config(&config_path, &trace_path, &ready_path, "200ms");
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&ready_path).await;
+
+        engine
+            .restart_process("stubborn", "stubborn")
+            .await
+            .unwrap();
+
+        let mut trace = Vec::new();
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            trace = read_trace(&trace_path);
+            if trace.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("stubborn", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace.len(),
+            2,
+            "service that ignores SIGTERM never respawned; trace was {:?}",
+            trace
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("stop timeout expired after")),
+            "escalation was not reported to the operator: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_honors_a_service_stop_timeout() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+        let ready_path = temp_dir.path().join("trapping");
+
+        write_stubborn_service_config(&config_path, &trace_path, &ready_path, "200ms");
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&ready_path).await;
+
+        let started = Instant::now();
+        engine.shutdown().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "shutdown killed the service before its stop_timeout elapsed, taking {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown fell back to the fixed grace period instead of the service's own \
+             stop_timeout, taking {:?}",
+            elapsed
         );
     }
 
