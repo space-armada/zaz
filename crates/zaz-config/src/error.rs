@@ -213,12 +213,14 @@ pub enum ValidationErrorKind {
         /// The duplicated name.
         name: String,
     },
-    /// Service has empty command.
+    /// Service has an empty command field.
     EmptyServiceCommand {
         /// Name of the group.
         group: String,
         /// Name of the service.
         service: String,
+        /// The offending field, e.g. `command` or `cleanup_command`.
+        field: String,
     },
     /// Duplicate service name.
     DuplicateServiceName {
@@ -235,6 +237,8 @@ pub enum ValidationErrorKind {
         group: String,
         /// Name of the service.
         service: String,
+        /// The offending field, e.g. `command` or `cleanup_command`.
+        field: String,
         /// The offending built-in name, e.g. `zaz:files`.
         builtin: String,
     },
@@ -322,11 +326,15 @@ impl fmt::Display for ValidationErrorKind {
             Self::DuplicateTaskName { group, name } => {
                 write!(f, "group '{}': duplicate task name '{}'", group, name)
             }
-            Self::EmptyServiceCommand { group, service } => {
+            Self::EmptyServiceCommand {
+                group,
+                service,
+                field,
+            } => {
                 write!(
                     f,
-                    "group '{}': service '{}' has empty command",
-                    group, service
+                    "group '{}': service '{}' has empty {}",
+                    group, service, field
                 )
             }
             Self::DuplicateServiceName { group, name } => {
@@ -335,13 +343,14 @@ impl fmt::Display for ValidationErrorKind {
             Self::ServiceCommandFileBuiltin {
                 group,
                 service,
+                field,
                 builtin,
             } => {
                 write!(
                     f,
-                    "group '{}': service '{}' references ${{{}}}, which is only \
+                    "group '{}': service '{}' {} references ${{{}}}, which is only \
                      populated for file-change triggers and is unavailable to services",
-                    group, service, builtin
+                    group, service, field, builtin
                 )
             }
         }

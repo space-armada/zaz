@@ -266,6 +266,7 @@ pub struct ConfigTask {
 pub struct ConfigService {
     pub name: String,
     pub command: String,
+    pub cleanup_command: Option<String>,
     pub signal: SignalReport,
     pub no_pty: bool,
     pub silence: SilenceReport,
@@ -499,6 +500,7 @@ impl From<&ServiceCommand> for ConfigService {
         Self {
             name: d.name().to_string(),
             command: d.command.clone(),
+            cleanup_command: d.cleanup_command.clone(),
             signal: d.signal.into(),
             no_pty: d.no_pty,
             silence: d.silence.into(),

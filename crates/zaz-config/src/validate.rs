@@ -298,14 +298,18 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
         let mut service_names: HashSet<&str> = HashSet::new();
         for service in &group.services {
             let name = service.name();
-            if service.command.is_empty() {
-                errors.push(ValidationError::new(
-                    ValidationErrorKind::EmptyServiceCommand {
-                        group: group.name.clone(),
-                        service: name.to_string(),
-                    },
-                ));
+
+            validate_service_command_field(&group.name, name, "command", &service.command, errors);
+            if let Some(cleanup) = &service.cleanup_command {
+                validate_service_command_field(
+                    &group.name,
+                    name,
+                    "cleanup_command",
+                    cleanup,
+                    errors,
+                );
             }
+
             if service_names.contains(name) {
                 let mut error = ValidationError::new(ValidationErrorKind::DuplicateServiceName {
                     group: group.name.clone(),
@@ -317,23 +321,44 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
                 errors.push(error);
             }
             service_names.insert(name);
+        }
+    }
+}
 
-            // Services run wholesale, not per-file. References to file-context
-            // built-ins would silently expand to empty strings at spawn time.
-            for var_name in zaz_vars::references(&service.command) {
-                if zaz_vars::FILE_CONTEXT_BUILTINS.contains(&var_name) {
-                    errors.push(
-                        ValidationError::new(ValidationErrorKind::ServiceCommandFileBuiltin {
-                            group: group.name.clone(),
-                            service: name.to_string(),
-                            builtin: var_name.to_string(),
-                        })
-                        .with_hint(
-                            "move this expansion into a [[group.task]] that runs on file changes",
-                        ),
-                    );
-                }
-            }
+/// Validate one command-carrying field of a service.
+///
+/// Every service field that becomes a shell command shares these rules, so `command` and
+/// the lifecycle hooks run the same checks rather than each growing its own copy.
+fn validate_service_command_field(
+    group: &str,
+    service: &str,
+    field: &str,
+    command: &str,
+    errors: &mut ValidationErrors,
+) {
+    if command.is_empty() {
+        errors.push(ValidationError::new(
+            ValidationErrorKind::EmptyServiceCommand {
+                group: group.to_string(),
+                service: service.to_string(),
+                field: field.to_string(),
+            },
+        ));
+    }
+
+    // Services run wholesale, not per-file. References to file-context
+    // built-ins would silently expand to empty strings at spawn time.
+    for var_name in zaz_vars::references(command) {
+        if zaz_vars::FILE_CONTEXT_BUILTINS.contains(&var_name) {
+            errors.push(
+                ValidationError::new(ValidationErrorKind::ServiceCommandFileBuiltin {
+                    group: group.to_string(),
+                    service: service.to_string(),
+                    field: field.to_string(),
+                    builtin: var_name.to_string(),
+                })
+                .with_hint("move this expansion into a [[group.task]] that runs on file changes"),
+            );
         }
     }
 }
@@ -666,6 +691,107 @@ mod tests {
             ..Default::default()
         };
         validate(&config).expect("escaped ${zaz:files} must be allowed in service commands");
+    }
+
+    #[test]
+    fn test_service_command_file_builtin_names_the_field() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "./bin/handler ${zaz:files}")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' command references"),
+            "expected the offending field named in the error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_cleanup_command_rejects_file_context_builtins() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.cleanup_command = Some("rm -f ${zaz:files}".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' cleanup_command references ${zaz:files}"),
+            "expected cleanup_command named in error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("hint:"),
+            "expected hint pointing at task workaround, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_cleanup_command_allows_user_variables_and_root() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.cleanup_command = Some("rm -f ${zaz:root}/${lexicon}.pid".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("user vars and ${zaz:root} must be allowed in cleanup_command");
+    }
+
+    #[test]
+    fn test_empty_cleanup_command_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.cleanup_command = Some(String::new());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' has empty cleanup_command"),
+            "expected empty cleanup_command error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_unset_cleanup_command_validates() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "./bin/handler")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("an unset cleanup_command must not affect validation");
+    }
+
+    #[test]
+    fn test_empty_service_command_rejected() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' has empty command"),
+            "expected empty command error, got: {}",
+            msg
+        );
     }
 
     #[test]

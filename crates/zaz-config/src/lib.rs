@@ -423,6 +423,89 @@ command = "./srv"
     }
 
     #[test]
+    fn test_cleanup_command_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "docker run --rm --name api img"
+cleanup_command = "docker rm -f api"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].cleanup_command,
+            Some("docker rm -f api".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cleanup_command_parsing_json() {
+        let json = r#"{
+            "groups": [{
+                "name": "test",
+                "patterns": ["*.txt"],
+                "services": [{
+                    "name": "server",
+                    "command": "docker run --rm --name api img",
+                    "cleanup_command": "docker rm -f api"
+                }]
+            }]
+        }"#;
+        let config = parse_json(json).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].cleanup_command,
+            Some("docker rm -f api".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cleanup_command_unset_leaves_service_unchanged() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(
+            config.groups[0].services[0],
+            ServiceCommand::new("server", "./server")
+        );
+    }
+
+    #[test]
+    fn test_config_round_trips_through_toml() {
+        let toml = r#"
+[settings]
+shell = "bash"
+
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.task]]
+name = "build"
+command = "make"
+
+[[group.service]]
+name = "server"
+command = "./server"
+cleanup_command = "rm -f ./server.pid"
+delay = "500ms"
+"#;
+        let config = parse_toml(toml).unwrap();
+        let reserialized = toml::to_string(&config).unwrap();
+        let reparsed = parse_toml(&reserialized).unwrap();
+        assert_eq!(config, reparsed);
+    }
+
+    #[test]
     fn test_daemon_delay_ms() {
         let toml = r#"
 [[group]]

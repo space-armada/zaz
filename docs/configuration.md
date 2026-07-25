@@ -266,8 +266,12 @@ human message.
 | Invalid glob in `ignore` | `group '{name}': invalid ignore pattern '{p}': {err}` |
 | Empty task command | `group '{g}': task '{n}' has empty command` |
 | Duplicate task name | `group '{g}': duplicate task name '{n}'` |
-| Empty service command | `group '{g}': service '{n}' has empty command` |
+| Empty service command field | `group '{g}': service '{n}' has empty {field}` |
 | Duplicate service name | `group '{g}': duplicate service name '{n}'` |
+| File-context built-in in a service command field | `group '{g}': service '{n}' {field} references ${b}, ...` |
+
+Service errors report `{field}` as the name of the offending field, so a
+service carrying more than one command string points at the right one.
 
 Unknown-dependency errors include a "did you mean '{x}'?" hint when a
 group name within Levenshtein distance 2 exists, otherwise an

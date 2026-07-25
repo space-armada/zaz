@@ -411,8 +411,9 @@ Validation error codes (from `crates/zaz-config/src/error.rs`):
 | `invalid_ignore_pattern` | An `ignore` entry failed glob parsing. |
 | `empty_task_command` | Task has an empty `command`. |
 | `duplicate_task_name` | Two tasks in the same group share an explicit name. |
-| `empty_service_command` | Service has an empty `command`. |
+| `empty_service_command` | Service has an empty `command` or `cleanup_command`. |
 | `duplicate_service_name` | Two services in the same group share an explicit name. |
+| `service_command_file_builtin` | A service command field references a file-context built-in. |
 
 Parse-level failures (TOML/JSON syntax errors, unknown fields, I/O errors)
 are reported as a single error with code `parse_error`.

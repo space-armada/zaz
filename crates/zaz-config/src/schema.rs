@@ -320,6 +320,14 @@ pub struct ServiceCommand {
     /// Shell command to execute.
     pub command: String,
 
+    /// Command run immediately before every spawn of this service, including the first
+    /// start of a freshly-started group.
+    ///
+    /// Clears state a prior run left behind, such as a stale container, lockfile, or PID
+    /// file. A failure is logged and the spawn proceeds.
+    #[serde(default)]
+    pub cleanup_command: Option<String>,
+
     /// Signal to send when restarting.
     #[serde(default)]
     pub signal: Signal,
@@ -354,6 +362,7 @@ impl ServiceCommand {
         Self {
             name: Some(name.into()),
             command: command.into(),
+            cleanup_command: None,
             signal: Signal::default(),
             no_pty: false,
             silence: Silence::None,
@@ -368,6 +377,7 @@ impl ServiceCommand {
         Self {
             name: None,
             command: command.into(),
+            cleanup_command: None,
             signal: Signal::default(),
             no_pty: false,
             silence: Silence::None,
