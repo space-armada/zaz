@@ -197,6 +197,63 @@ delay = "500ms"
 no_pty = true
 ```
 
+### Lifecycle hooks
+
+zaz spawns every service in its own process group and stops it by
+signalling that group. A service that leaves the group — one that calls
+`setsid`, a wrapper script, a `docker run` whose container belongs to the
+Docker daemon — never receives those signals. `cleanup_command`,
+`stop_command`, and `kill_command` replace the parts of that lifecycle that
+assume a well-behaved local child. A service that sets none of them behaves
+exactly as it always has.
+
+Hook commands expand exactly what `command` expands: the `[variables]`
+table and the `${zaz:*}` built-ins. The file-context built-ins
+(`${zaz:files}`, `${zaz:dirs}`, `${zaz:prefix}`) are rejected in a hook, the
+same as in `command`.
+
+`cleanup_command` runs immediately before every spawn, including the very
+first start of a freshly started group. There is no "restart only" mode:
+zaz keeps no memory across runs, so a crashed daemon's leftover state looks
+exactly like a first start.
+
+`stop_command` replaces the signal everywhere a service is stopped: on
+restart, on daemon shutdown, and on config reload. That is why setting
+`signal` beside it is rejected rather than silently ignored.
+
+A stop then proceeds in a fixed order:
+
+1. The stop runs: `stop_command` if set, otherwise the configured signal.
+2. `stop_timeout` starts. Nothing further happens if the service exits
+   inside it.
+3. When the window closes, a `stop_command` process still running is killed
+   first, so it cannot outlive the stop it was supposed to perform.
+4. Then the force kill: `kill_command` if set, otherwise SIGKILL to the
+   service's process group.
+
+Every hook is best-effort and never blocks the lifecycle step it belongs
+to. A nonzero exit is reported and the start or stop proceeds anyway.
+
+A hook whose variables fail to expand is reported and does not run.
+`cleanup_command` is skipped in that case and the service starts. A stop or
+kill hook falls back to the signal instead, so a typo in a variable name
+cannot leave a service with nothing asking it to go down.
+
+Each hook run reports itself in the service's own log as a header naming the
+expanded command, the hook's own output, and a footer with its duration and
+exit code. `silence` suppresses the output but not the header and footer, so
+a suppressed hook's failure stays visible.
+
+zaz observes only the local process it spawned. It knows whether that
+process exited within `stop_timeout`; it cannot know whether a container or
+a remote job behind it is actually gone. A `stop_command` carrying its own
+internal timeout keeps that timeout, independent of `stop_timeout`, and
+escalation is decided purely on the local process's exit timing.
+
+Worked configurations for both cases:
+[docker-service](examples/docker-service/README.md) and
+[local-service-cleanup](examples/local-service-cleanup/README.md).
+
 ## Enums
 
 ### `Silence`
