@@ -213,12 +213,14 @@ pub enum ValidationErrorKind {
         /// The duplicated name.
         name: String,
     },
-    /// Service has empty command.
+    /// Service has an empty command field.
     EmptyServiceCommand {
         /// Name of the group.
         group: String,
         /// Name of the service.
         service: String,
+        /// The offending field, e.g. `command` or `cleanup_command`.
+        field: String,
     },
     /// Duplicate service name.
     DuplicateServiceName {
@@ -235,8 +237,34 @@ pub enum ValidationErrorKind {
         group: String,
         /// Name of the service.
         service: String,
+        /// The offending field, e.g. `command` or `cleanup_command`.
+        field: String,
         /// The offending built-in name, e.g. `zaz:files`.
         builtin: String,
+    },
+    /// Service specifies its stop mechanism twice, as both a signal and a command.
+    ConflictingStopMechanism {
+        /// Name of the group.
+        group: String,
+        /// Name of the service.
+        service: String,
+    },
+    /// Service tunes its readiness polling without configuring a `ready_check` for the
+    /// tuning to apply to.
+    ReadyTuningWithoutCheck {
+        /// Name of the group.
+        group: String,
+        /// Name of the service.
+        service: String,
+        /// The offending field, `ready_poll_interval` or `ready_timeout`.
+        field: String,
+    },
+    /// Service sets a `ready_poll_interval` of zero, which would poll without pausing.
+    ZeroReadyPollInterval {
+        /// Name of the group.
+        group: String,
+        /// Name of the service.
+        service: String,
     },
 }
 
@@ -257,6 +285,9 @@ impl ValidationErrorKind {
             Self::EmptyServiceCommand { .. } => "empty_service_command",
             Self::DuplicateServiceName { .. } => "duplicate_service_name",
             Self::ServiceCommandFileBuiltin { .. } => "service_command_file_builtin",
+            Self::ConflictingStopMechanism { .. } => "conflicting_stop_mechanism",
+            Self::ReadyTuningWithoutCheck { .. } => "ready_tuning_without_check",
+            Self::ZeroReadyPollInterval { .. } => "zero_ready_poll_interval",
         }
     }
 }
@@ -322,11 +353,15 @@ impl fmt::Display for ValidationErrorKind {
             Self::DuplicateTaskName { group, name } => {
                 write!(f, "group '{}': duplicate task name '{}'", group, name)
             }
-            Self::EmptyServiceCommand { group, service } => {
+            Self::EmptyServiceCommand {
+                group,
+                service,
+                field,
+            } => {
                 write!(
                     f,
-                    "group '{}': service '{}' has empty command",
-                    group, service
+                    "group '{}': service '{}' has empty {}",
+                    group, service, field
                 )
             }
             Self::DuplicateServiceName { group, name } => {
@@ -335,13 +370,39 @@ impl fmt::Display for ValidationErrorKind {
             Self::ServiceCommandFileBuiltin {
                 group,
                 service,
+                field,
                 builtin,
             } => {
                 write!(
                     f,
-                    "group '{}': service '{}' references ${{{}}}, which is only \
+                    "group '{}': service '{}' {} references ${{{}}}, which is only \
                      populated for file-change triggers and is unavailable to services",
-                    group, service, builtin
+                    group, service, field, builtin
+                )
+            }
+            Self::ConflictingStopMechanism { group, service } => {
+                write!(
+                    f,
+                    "group '{}': service '{}' sets both signal and stop_command",
+                    group, service
+                )
+            }
+            Self::ReadyTuningWithoutCheck {
+                group,
+                service,
+                field,
+            } => {
+                write!(
+                    f,
+                    "group '{}': service '{}' sets {} without a ready_check",
+                    group, service, field
+                )
+            }
+            Self::ZeroReadyPollInterval { group, service } => {
+                write!(
+                    f,
+                    "group '{}': service '{}' has a zero ready_poll_interval",
+                    group, service
                 )
             }
         }

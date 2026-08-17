@@ -452,6 +452,7 @@ impl FullStyle {
 
                 let task_icon = match task.status {
                     zaz_daemon::ProcessStatus::Pending => "○",
+                    zaz_daemon::ProcessStatus::Starting => "◐",
                     zaz_daemon::ProcessStatus::Running => {
                         if app.blink_on() {
                             "●"
@@ -466,6 +467,7 @@ impl FullStyle {
 
                 let task_color = match task.status {
                     zaz_daemon::ProcessStatus::Pending => Color::DarkGray,
+                    zaz_daemon::ProcessStatus::Starting => Color::Cyan,
                     zaz_daemon::ProcessStatus::Running => Color::Yellow,
                     zaz_daemon::ProcessStatus::Success => Color::Green,
                     zaz_daemon::ProcessStatus::Failed => Color::Red,
@@ -514,6 +516,7 @@ impl FullStyle {
 
                 let service_icon = match service.status {
                     zaz_daemon::ProcessStatus::Pending => "○",
+                    zaz_daemon::ProcessStatus::Starting => "◐",
                     zaz_daemon::ProcessStatus::Running => {
                         if app.blink_on() {
                             "●"
@@ -528,6 +531,7 @@ impl FullStyle {
 
                 let service_color = match service.status {
                     zaz_daemon::ProcessStatus::Pending => Color::DarkGray,
+                    zaz_daemon::ProcessStatus::Starting => Color::Cyan,
                     zaz_daemon::ProcessStatus::Running => Color::Yellow,
                     zaz_daemon::ProcessStatus::Success => Color::Green,
                     zaz_daemon::ProcessStatus::Failed => Color::Red,
@@ -535,10 +539,12 @@ impl FullStyle {
                 };
 
                 let suffix = match service.status {
-                    zaz_daemon::ProcessStatus::Running => service
-                        .pid
-                        .map(|p| format!(" (pid {})", p))
-                        .unwrap_or_default(),
+                    zaz_daemon::ProcessStatus::Starting | zaz_daemon::ProcessStatus::Running => {
+                        service
+                            .pid
+                            .map(|p| format!(" (pid {})", p))
+                            .unwrap_or_default()
+                    }
                     _ => String::new(),
                 };
 

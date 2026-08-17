@@ -246,7 +246,14 @@ impl Supervisor {
         let mut handle =
             crate::start_daemon_via_launcher(config_path, &socket, self.debug, None, &output_log)?;
 
-        match wait_for_daemon_ready(&socket, &mut handle, 20, Duration::from_millis(100)).await? {
+        match wait_for_daemon_ready(
+            &socket,
+            &mut handle,
+            crate::DAEMON_READY_ATTEMPTS,
+            crate::DAEMON_READY_INTERVAL,
+        )
+        .await?
+        {
             DaemonReadyOutcome::Ready => {
                 tracing::info!(
                     config = %config_path.display(),
@@ -269,11 +276,14 @@ impl Supervisor {
                 status,
                 output_log.display()
             ),
-            DaemonReadyOutcome::Timeout => bail!(
-                "member daemon for {} did not become ready within 2s; see {}",
-                config_path.display(),
-                output_log.display()
-            ),
+            DaemonReadyOutcome::Timeout => {
+                let _ = handle.kill();
+                bail!(
+                    "member daemon for {} did not become ready in time; see {}",
+                    config_path.display(),
+                    output_log.display()
+                )
+            }
         }
     }
 
@@ -282,11 +292,21 @@ impl Supervisor {
     /// running, honoring adopt's "don't kill" intent.
     async fn detach_all(&mut self) {
         let members = std::mem::take(&mut self.members);
-        for member in members {
+        for mut member in members {
             if member.adopted {
                 continue;
             }
+
             stop_child(&member.socket_path).await;
+
+            // Hard-reap the child we spawned after the graceful stop. A member
+            // under load can be slow to act on the socket shutdown. Once this
+            // supervisor exits, an un-reaped child reparents to init and leaks.
+            // The handle is present only for spawned members; adopted members
+            // are skipped above and left running.
+            if let Some(mut handle) = member.handle.take() {
+                let _ = handle.kill();
+            }
         }
     }
 

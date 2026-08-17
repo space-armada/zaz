@@ -460,6 +460,7 @@ impl MultiPaneStyle {
                     group: group_name.clone(),
                     status: match task.status {
                         zaz_daemon::ProcessStatus::Pending => ProcessStatus::Pending,
+                        zaz_daemon::ProcessStatus::Starting => ProcessStatus::Pending,
                         zaz_daemon::ProcessStatus::Running => ProcessStatus::Running,
                         zaz_daemon::ProcessStatus::Success => ProcessStatus::Ready,
                         zaz_daemon::ProcessStatus::Failed => ProcessStatus::Failed,
@@ -476,6 +477,7 @@ impl MultiPaneStyle {
                     group: group_name.clone(),
                     status: match service.status {
                         zaz_daemon::ProcessStatus::Pending => ProcessStatus::Pending,
+                        zaz_daemon::ProcessStatus::Starting => ProcessStatus::Pending,
                         zaz_daemon::ProcessStatus::Running => ProcessStatus::Running,
                         zaz_daemon::ProcessStatus::Success => ProcessStatus::Ready,
                         zaz_daemon::ProcessStatus::Failed => ProcessStatus::Failed,

@@ -177,7 +177,14 @@ deprecated aliases for backwards compatibility. New configs should use
 |-------|------|---------|-------|
 | `name` | string | derived | Same derivation rule as task `name`. |
 | `command` | string | required | Shell command to run; non-empty. |
+| `cleanup_command` | string | unset | Runs before every spawn, including the first. Clears state a prior run left behind. |
+| `ready_check` | string | unset | Reports whether the service has finished starting. Zero exit means ready. Unset means spawning counts as ready. |
+| `stop_command` | string | unset | Stops the service instead of signalling its process group, on restart and on shutdown alike. Conflicts with `signal`. |
+| `kill_command` | string | unset | Force kills the service instead of sending SIGKILL once `stop_timeout` elapses. |
 | `signal` | enum | `SIGTERM` | Signal sent on restart. See [`Signal`](#signal). |
+| `stop_timeout` | duration | `10s` | How long to wait for an exit after the stop before force killing. Also bounds `stop_command` itself. |
+| `ready_poll_interval` | duration | `100ms` | How long to wait between `ready_check` runs. Requires `ready_check`; must be non-zero. |
+| `ready_timeout` | duration | `30s` | How long `ready_check` may keep failing before the service is treated as failed to start. Requires `ready_check`. |
 | `no_pty` | bool | `false` | Disable PTY allocation. PTY is on by default so tools like `tailwind --watch` work. |
 | `silence` | enum | `none` | TUI suppression level. See [`Silence`](#silence). |
 | `delay` | duration | unset | Wait this long after preceding tasks before starting. Alias: `delay_ms`. |
@@ -192,6 +199,119 @@ signal = "SIGUSR2"
 delay = "500ms"
 no_pty = true
 ```
+
+### Lifecycle hooks
+
+zaz spawns every service in its own process group and stops it by
+signalling that group. A service that leaves the group — one that calls
+`setsid`, a wrapper script, a `docker run` whose container belongs to the
+Docker daemon — never receives those signals. `cleanup_command`,
+`stop_command`, and `kill_command` replace the parts of that lifecycle that
+assume a well-behaved local child. A service that sets none of them behaves
+exactly as it always has.
+
+Hook commands expand exactly what `command` expands: the `[variables]`
+table and the `${zaz:*}` built-ins. The file-context built-ins
+(`${zaz:files}`, `${zaz:dirs}`, `${zaz:prefix}`) are rejected in a hook, the
+same as in `command`.
+
+`cleanup_command` runs immediately before every spawn, including the very
+first start of a freshly started group. There is no "restart only" mode:
+zaz keeps no memory across runs, so a crashed daemon's leftover state looks
+exactly like a first start.
+
+`stop_command` replaces the signal everywhere a service is stopped: on
+restart, on daemon shutdown, and on config reload. That is why setting
+`signal` beside it is rejected rather than silently ignored.
+
+A stop then proceeds in a fixed order:
+
+1. The stop runs: `stop_command` if set, otherwise the configured signal.
+2. `stop_timeout` starts. Nothing further happens if the service exits
+   inside it.
+3. When the window closes, a `stop_command` process still running is killed
+   first, so it cannot outlive the stop it was supposed to perform.
+4. Then the force kill: `kill_command` if set, otherwise SIGKILL to the
+   service's process group.
+
+Every hook is best-effort and never blocks the lifecycle step it belongs
+to. A nonzero exit is reported and the start or stop proceeds anyway.
+
+A hook whose variables fail to expand is reported and does not run.
+`cleanup_command` is skipped in that case and the service starts. A stop or
+kill hook falls back to the signal instead, so a typo in a variable name
+cannot leave a service with nothing asking it to go down.
+
+Each hook run reports itself in the service's own log as a header naming the
+expanded command, the hook's own output, and a footer with its duration and
+exit code. `silence` suppresses the output but not the header and footer, so
+a suppressed hook's failure stays visible.
+
+zaz observes only the local process it spawned. It knows whether that
+process exited within `stop_timeout`; it cannot know whether a container or
+a remote job behind it is actually gone. A `stop_command` carrying its own
+internal timeout keeps that timeout, independent of `stop_timeout`, and
+escalation is decided purely on the local process's exit timing.
+
+Worked configurations for both cases:
+[docker-service](examples/docker-service/README.md) and
+[local-service-cleanup](examples/local-service-cleanup/README.md).
+
+### Readiness checks
+
+A service reads `Running` the instant it spawns. Spawned is not the same as
+listening on a port, or done replaying a write-ahead log, or past a JVM
+warmup. `ready_check` closes that gap. zaz runs it after the spawn and
+treats the service as ready only once it exits zero. A service that sets no
+check counts as ready the moment it starts, exactly as before.
+
+A check expands what `command` expands: the `[variables]` table and the
+`${zaz:*}` built-ins. The file-context built-ins (`${zaz:files}`,
+`${zaz:dirs}`, `${zaz:prefix}`) are rejected, the same as in `command` and
+in the lifecycle hooks. Expansion happens per probe rather than once per
+window.
+
+The first probe runs immediately. A service that is already up should not
+have to sit through an interval before it can say so. After that,
+`ready_poll_interval` is measured from the start of each probe rather than
+from its end, which makes it a floor on the gap between starts. Probes never
+overlap. A check slower than its own interval simply runs back to back.
+
+`ready_timeout` bounds the whole window. A window always runs its check at
+least once, so a timeout too short to contain a poll tick, zero included,
+means run the check and give up rather than give up without running it.
+
+A service reads `Starting` while its window is open. A zero exit promotes it
+to `Running`. A window that closes without one marks it `Failed` and leaves
+the process alone. Stopping it would feed it straight back into the restart
+path, which would spawn it, arm a fresh window, and reach the same timeout
+again. A slow-booting service is also usually still worth inspecting.
+
+A check whose variables do not expand, or whose shell will not spawn, fails
+the service immediately rather than polling to the timeout. Neither gets
+better inside the window.
+
+A group holds at `Running` until every service in it that declares a
+`ready_check` has answered. Only then does it become `Ready`. Groups listing
+it in `depends_on` wait on that, which is the point of the feature: a
+dependent starts once the thing it depends on can actually take work. A
+check that runs out its window makes its group `Failed` and every group
+waiting behind it `Skipped`.
+
+Only a group's first transition to `Ready` is gated. A group that has
+already reached it keeps it while a crashed service respawns and checks
+again, the same way it stays `Ready` through a restart backoff.
+
+The service's own log names the check once per window, then carries either
+the pass or the give-up. The give-up line quotes the last failing probe's
+exit code and output. Individual probes stream nothing. A thirty-second
+window at the default interval runs three hundred of them, and streaming
+each one would bury the service's own output. `silence` has nothing to
+suppress here.
+
+Worked configurations for both cases:
+[http-service-readiness](examples/http-service-readiness/README.md) and
+[docker-service-readiness](examples/docker-service-readiness/README.md).
 
 ## Enums
 
@@ -232,7 +352,8 @@ is `SIGTERM`.
 
 ## Duration parsing
 
-Duration-typed fields (`debounce`, `delay`) accept three input forms:
+Duration-typed fields (`debounce`, `delay`, `stop_timeout`,
+`ready_poll_interval`, `ready_timeout`) accept three input forms:
 
 - A human-readable string parsed by [`humantime`](https://docs.rs/humantime):
   `"500ms"`, `"2s"`, `"1m30s"`, `"1s 500ms"`.
@@ -266,8 +387,24 @@ human message.
 | Invalid glob in `ignore` | `group '{name}': invalid ignore pattern '{p}': {err}` |
 | Empty task command | `group '{g}': task '{n}' has empty command` |
 | Duplicate task name | `group '{g}': duplicate task name '{n}'` |
-| Empty service command | `group '{g}': service '{n}' has empty command` |
+| Empty service command field | `group '{g}': service '{n}' has empty {field}` |
 | Duplicate service name | `group '{g}': duplicate service name '{n}'` |
+| File-context built-in in a service command field | `group '{g}': service '{n}' {field} references ${b}, ...` |
+| Conflicting stop mechanism | `group '{g}': service '{n}' sets both signal and stop_command` |
+| Readiness tuning without a check | `group '{g}': service '{n}' sets {field} without a ready_check` |
+| Zero readiness poll interval | `group '{g}': service '{n}' has a zero ready_poll_interval` |
+
+Service errors report `{field}` as the name of the offending field, so a
+service carrying more than one command string points at the right one.
+
+`stop_command` replaces the restart signal outright, so a service setting both
+it and `signal` is rejected rather than having its signal silently ignored.
+
+`ready_poll_interval` and `ready_timeout` only ever apply to a `ready_check`,
+so either one set alone is rejected rather than accepted and ignored. A zero
+`ready_poll_interval` is rejected separately, because it would run the check
+back to back with no pause. A zero `ready_timeout` is allowed: it means one
+check, then give up.
 
 Unknown-dependency errors include a "did you mean '{x}'?" hint when a
 group name within Levenshtein distance 2 exists, otherwise an

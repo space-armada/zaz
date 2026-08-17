@@ -207,6 +207,16 @@ impl DependencyResolver {
         self.cascade_skip_from(group)
     }
 
+    /// Mark a group as failed and compute cascade skips.
+    ///
+    /// Use this for the group that actually broke. It keeps `Failed` while everything behind
+    /// it is skipped, so a chain of skipped groups still names the one that caused them.
+    /// Either status blocks a dependent, so the distinction is for the reader.
+    pub fn mark_failed(&mut self, group: &str) -> FailureResult {
+        self.set_status(group, GroupStatus::Failed);
+        self.cascade_skip_from(group)
+    }
+
     /// Reset waiting state and statuses for a new full execution wave.
     pub fn reset_for_rerun(&mut self) {
         self.waiting.clear();
@@ -305,12 +315,6 @@ impl DependencyResolver {
     /// Get the set of dependencies a group is waiting for.
     pub fn waiting_for(&self, group: &str) -> Option<&HashSet<String>> {
         self.waiting.get(group)
-    }
-
-    /// Mark a group as failed and compute cascade skips.
-    pub fn mark_failed(&mut self, group: &str) -> FailureResult {
-        self.set_status(group, GroupStatus::Failed);
-        self.cascade_skip_from(group)
     }
 
     /// Compute the initial state for all groups.

@@ -83,6 +83,7 @@ pub enum ProcessKind {
 #[serde(rename_all = "lowercase")]
 pub enum ProcessStatusReport {
     Pending,
+    Starting,
     Running,
     Success,
     Failed,
@@ -266,11 +267,18 @@ pub struct ConfigTask {
 pub struct ConfigService {
     pub name: String,
     pub command: String,
+    pub cleanup_command: Option<String>,
+    pub ready_check: Option<String>,
+    pub stop_command: Option<String>,
+    pub kill_command: Option<String>,
     pub signal: SignalReport,
     pub no_pty: bool,
     pub silence: SilenceReport,
     pub working_dir: Option<String>,
     pub delay_ms: Option<u64>,
+    pub stop_timeout_ms: Option<u64>,
+    pub ready_poll_interval_ms: Option<u64>,
+    pub ready_timeout_ms: Option<u64>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -371,6 +379,7 @@ impl From<ProcessStatus> for ProcessStatusReport {
     fn from(value: ProcessStatus) -> Self {
         match value {
             ProcessStatus::Pending => Self::Pending,
+            ProcessStatus::Starting => Self::Starting,
             ProcessStatus::Running => Self::Running,
             ProcessStatus::Success => Self::Success,
             ProcessStatus::Failed => Self::Failed,
@@ -499,11 +508,18 @@ impl From<&ServiceCommand> for ConfigService {
         Self {
             name: d.name().to_string(),
             command: d.command.clone(),
-            signal: d.signal.into(),
+            cleanup_command: d.cleanup_command.clone(),
+            ready_check: d.ready_check.clone(),
+            stop_command: d.stop_command.clone(),
+            kill_command: d.kill_command.clone(),
+            signal: d.signal().into(),
             no_pty: d.no_pty,
             silence: d.silence.into(),
             working_dir: d.working_dir.clone(),
             delay_ms: d.delay_ms(),
+            stop_timeout_ms: d.stop_timeout_ms(),
+            ready_poll_interval_ms: d.ready_poll_interval_ms(),
+            ready_timeout_ms: d.ready_timeout_ms(),
             env: d.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }

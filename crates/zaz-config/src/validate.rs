@@ -2,7 +2,7 @@
 
 use crate::error::{ValidationError, ValidationErrorKind, ValidationErrors};
 use crate::toml_spanned::SpanInfo;
-use crate::Config;
+use crate::{Config, ServiceCommand};
 use std::collections::{HashMap, HashSet};
 use strsim::levenshtein;
 
@@ -298,14 +298,30 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
         let mut service_names: HashSet<&str> = HashSet::new();
         for service in &group.services {
             let name = service.name();
-            if service.command.is_empty() {
-                errors.push(ValidationError::new(
-                    ValidationErrorKind::EmptyServiceCommand {
-                        group: group.name.clone(),
-                        service: name.to_string(),
-                    },
-                ));
+
+            validate_service_command_field(&group.name, name, "command", &service.command, errors);
+            if let Some(cleanup) = &service.cleanup_command {
+                validate_service_command_field(
+                    &group.name,
+                    name,
+                    "cleanup_command",
+                    cleanup,
+                    errors,
+                );
             }
+            if let Some(ready) = &service.ready_check {
+                validate_service_command_field(&group.name, name, "ready_check", ready, errors);
+            }
+            if let Some(stop) = &service.stop_command {
+                validate_service_command_field(&group.name, name, "stop_command", stop, errors);
+            }
+            if let Some(kill) = &service.kill_command {
+                validate_service_command_field(&group.name, name, "kill_command", kill, errors);
+            }
+
+            validate_service_stop_mechanism(&group.name, service, errors);
+            validate_service_readiness(&group.name, service, errors);
+
             if service_names.contains(name) {
                 let mut error = ValidationError::new(ValidationErrorKind::DuplicateServiceName {
                     group: group.name.clone(),
@@ -317,31 +333,116 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
                 errors.push(error);
             }
             service_names.insert(name);
-
-            // Services run wholesale, not per-file. References to file-context
-            // built-ins would silently expand to empty strings at spawn time.
-            for var_name in zaz_vars::references(&service.command) {
-                if zaz_vars::FILE_CONTEXT_BUILTINS.contains(&var_name) {
-                    errors.push(
-                        ValidationError::new(ValidationErrorKind::ServiceCommandFileBuiltin {
-                            group: group.name.clone(),
-                            service: name.to_string(),
-                            builtin: var_name.to_string(),
-                        })
-                        .with_hint(
-                            "move this expansion into a [[group.task]] that runs on file changes",
-                        ),
-                    );
-                }
-            }
         }
+    }
+}
+
+/// Validate one command-carrying field of a service.
+///
+/// Every service field that becomes a shell command shares these rules, so `command` and
+/// the lifecycle hooks run the same checks rather than each growing its own copy.
+fn validate_service_command_field(
+    group: &str,
+    service: &str,
+    field: &str,
+    command: &str,
+    errors: &mut ValidationErrors,
+) {
+    if command.is_empty() {
+        errors.push(ValidationError::new(
+            ValidationErrorKind::EmptyServiceCommand {
+                group: group.to_string(),
+                service: service.to_string(),
+                field: field.to_string(),
+            },
+        ));
+    }
+
+    // Services run wholesale, not per-file. References to file-context
+    // built-ins would silently expand to empty strings at spawn time.
+    for var_name in zaz_vars::references(command) {
+        if zaz_vars::FILE_CONTEXT_BUILTINS.contains(&var_name) {
+            errors.push(
+                ValidationError::new(ValidationErrorKind::ServiceCommandFileBuiltin {
+                    group: group.to_string(),
+                    service: service.to_string(),
+                    field: field.to_string(),
+                    builtin: var_name.to_string(),
+                })
+                .with_hint("move this expansion into a [[group.task]] that runs on file changes"),
+            );
+        }
+    }
+}
+
+/// Reject a service whose stop mechanism is specified twice.
+///
+/// `stop_command` replaces the signal outright, so a `signal` set alongside it is silently
+/// ignored at runtime. Rejecting the pair at load time keeps that from reading as working.
+fn validate_service_stop_mechanism(
+    group: &str,
+    service: &ServiceCommand,
+    errors: &mut ValidationErrors,
+) {
+    if service.has_explicit_signal() && service.stop_command.is_some() {
+        errors.push(
+            ValidationError::new(ValidationErrorKind::ConflictingStopMechanism {
+                group: group.to_string(),
+                service: service.name().to_string(),
+            })
+            .with_hint("stop_command replaces the restart signal; remove one"),
+        );
+    }
+}
+
+/// Validate a service's readiness configuration.
+///
+/// `ready_poll_interval` and `ready_timeout` only ever apply to a `ready_check`, so either one
+/// set alone does nothing at runtime. Rejecting the pairing keeps a config that gates nothing
+/// from reading as if it does.
+///
+/// A zero poll interval is rejected separately: it would run the check back to back with no
+/// pause, spinning until the timeout rather than polling.
+fn validate_service_readiness(
+    group: &str,
+    service: &ServiceCommand,
+    errors: &mut ValidationErrors,
+) {
+    if service.ready_check.is_none() {
+        for (field, set) in [
+            ("ready_poll_interval", service.ready_poll_interval.is_some()),
+            ("ready_timeout", service.ready_timeout.is_some()),
+        ] {
+            if !set {
+                continue;
+            }
+
+            errors.push(
+                ValidationError::new(ValidationErrorKind::ReadyTuningWithoutCheck {
+                    group: group.to_string(),
+                    service: service.name().to_string(),
+                    field: field.to_string(),
+                })
+                .with_hint("this only applies to a ready_check; add one or remove the field"),
+            );
+        }
+    }
+
+    if service.ready_poll_interval_ms() == Some(0) {
+        errors.push(
+            ValidationError::new(ValidationErrorKind::ZeroReadyPollInterval {
+                group: group.to_string(),
+                service: service.name().to_string(),
+            })
+            .with_hint("use a positive interval, or leave it unset for the 100ms default"),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Group, ServiceCommand, TaskCommand};
+    use crate::{Group, HumanDuration, ServiceCommand, Signal, TaskCommand};
 
     fn make_group(name: &str) -> Group {
         Group {
@@ -666,6 +767,365 @@ mod tests {
             ..Default::default()
         };
         validate(&config).expect("escaped ${zaz:files} must be allowed in service commands");
+    }
+
+    #[test]
+    fn test_service_command_file_builtin_names_the_field() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "./bin/handler ${zaz:files}")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' command references"),
+            "expected the offending field named in the error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_cleanup_command_rejects_file_context_builtins() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.cleanup_command = Some("rm -f ${zaz:files}".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' cleanup_command references ${zaz:files}"),
+            "expected cleanup_command named in error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("hint:"),
+            "expected hint pointing at task workaround, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_cleanup_command_allows_user_variables_and_root() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.cleanup_command = Some("rm -f ${zaz:root}/${lexicon}.pid".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("user vars and ${zaz:root} must be allowed in cleanup_command");
+    }
+
+    #[test]
+    fn test_empty_cleanup_command_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.cleanup_command = Some(String::new());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' has empty cleanup_command"),
+            "expected empty cleanup_command error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_unset_cleanup_command_validates() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "./bin/handler")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("an unset cleanup_command must not affect validation");
+    }
+
+    #[test]
+    fn test_stop_and_kill_commands_reject_file_context_builtins() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.stop_command = Some("./ctl drain ${zaz:files}".to_string());
+        service.kill_command = Some("./ctl abort ${zaz:dirs}".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' stop_command references ${zaz:files}"),
+            "expected stop_command named in error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("service 'watcher' kill_command references ${zaz:dirs}"),
+            "expected kill_command named in error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_empty_stop_and_kill_commands_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.stop_command = Some(String::new());
+        service.kill_command = Some(String::new());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' has empty stop_command"),
+            "expected empty stop_command error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("service 'watcher' has empty kill_command"),
+            "expected empty kill_command error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_unset_stop_and_kill_commands_validate() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "./bin/handler")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("unset stop_command and kill_command must not affect validation");
+    }
+
+    #[test]
+    fn test_stop_command_without_a_signal_validates() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.stop_command = Some("./ctl drain".to_string());
+        service.kill_command = Some("./ctl abort".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("stop_command alone must validate");
+    }
+
+    #[test]
+    fn test_signal_alongside_stop_command_rejected() {
+        let mut group = make_group("server");
+        let mut service =
+            ServiceCommand::new("watcher", "./bin/handler").with_signal(Signal::Sigint);
+        service.stop_command = Some("./ctl drain".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' sets both signal and stop_command"),
+            "expected conflicting stop mechanism error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("hint:"),
+            "expected hint pointing at the redundant field, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_explicit_default_signal_alongside_stop_command_rejected() {
+        let mut group = make_group("server");
+        let mut service =
+            ServiceCommand::new("watcher", "./bin/handler").with_signal(Signal::Sigterm);
+        service.stop_command = Some("./ctl drain".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.kind.code() == "conflicting_stop_mechanism"),
+            "an explicit SIGTERM is still a signal the stop_command would silence"
+        );
+    }
+
+    #[test]
+    fn test_signal_without_a_stop_command_validates() {
+        let mut group = make_group("server");
+        group.services =
+            vec![ServiceCommand::new("watcher", "./bin/handler").with_signal(Signal::Sigint)];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("a signal without a stop_command must validate");
+    }
+
+    #[test]
+    fn test_ready_check_rejects_file_context_builtins() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some("./probe ${zaz:files}".to_string());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' ready_check references ${zaz:files}"),
+            "expected ready_check named in error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_empty_ready_check_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some(String::new());
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' has empty ready_check"),
+            "expected empty ready_check error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_unset_ready_check_validates() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "./bin/handler")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("an unset ready_check must not affect validation");
+    }
+
+    #[test]
+    fn test_ready_tuning_without_a_ready_check_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_poll_interval = Some(HumanDuration::from_millis(250));
+        service.ready_timeout = Some(HumanDuration::from_millis(60_000));
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' sets ready_poll_interval without a ready_check"),
+            "expected ready_poll_interval reported on its own, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("service 'watcher' sets ready_timeout without a ready_check"),
+            "expected ready_timeout reported on its own, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("hint:"),
+            "expected hint pointing at the missing ready_check, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_ready_tuning_alongside_a_ready_check_validates() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some("./probe".to_string());
+        service.ready_poll_interval = Some(HumanDuration::from_millis(250));
+        service.ready_timeout = Some(HumanDuration::from_millis(60_000));
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("tuning a configured ready_check must validate");
+    }
+
+    #[test]
+    fn test_zero_ready_poll_interval_rejected() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some("./probe".to_string());
+        service.ready_poll_interval = Some(HumanDuration::from_millis(0));
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        assert!(
+            err.iter()
+                .any(|e| e.kind.code() == "zero_ready_poll_interval"),
+            "a zero interval would run the check back to back until the timeout"
+        );
+    }
+
+    #[test]
+    fn test_zero_ready_timeout_validates() {
+        let mut group = make_group("server");
+        let mut service = ServiceCommand::new("watcher", "./bin/handler");
+        service.ready_check = Some("./probe".to_string());
+        service.ready_timeout = Some(HumanDuration::from_millis(0));
+        group.services = vec![service];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        validate(&config).expect("a zero timeout means one check then give up, which is coherent");
+    }
+
+    #[test]
+    fn test_empty_service_command_rejected() {
+        let mut group = make_group("server");
+        group.services = vec![ServiceCommand::new("watcher", "")];
+        let config = Config {
+            groups: vec![group],
+            ..Default::default()
+        };
+        let err = validate(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("service 'watcher' has empty command"),
+            "expected empty command error, got: {}",
+            msg
+        );
     }
 
     #[test]

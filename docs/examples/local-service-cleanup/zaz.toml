@@ -1,0 +1,22 @@
+# Local service that leaves state behind when it is force killed.
+#
+# The indexer takes a lockfile and forks a worker that calls `setsid`. A
+# service that is SIGKILLed never runs its own cleanup, so the next start
+# finds the lockfile still held. The forked worker has left the process
+# group zaz tracks, so an ordinary signal never reaches it either.
+
+[variables]
+lockfile = ".indexer.lock"
+
+[[group]]
+name = "indexer"
+patterns = ["src/**/*.py", "pyproject.toml"]
+ignore = ["**/__pycache__/**", ".venv/**"]
+
+  [[group.service]]
+  name = "indexer"
+  command = "python -m app.indexer"
+  cleanup_command = "rm -f ${lockfile}; pkill -f 'app.indexer' || true"
+  stop_command = "pkill -TERM -f 'app.indexer'"
+  stop_timeout = "30s"
+  no_pty = true

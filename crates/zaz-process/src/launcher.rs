@@ -109,6 +109,21 @@ impl LaunchHandle {
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProcessError> {
         self.child.try_wait().map_err(ProcessError::Spawn)
     }
+
+    /// Force-kill the launched daemon and reap it. Callers use this when the
+    /// daemon fails to become ready. The process is detached via `setsid`, so a
+    /// dropped handle would otherwise leave a slow-starting daemon running with
+    /// no owner to stop it.
+    ///
+    /// The kill is best-effort: the child may have exited on its own between the
+    /// last readiness poll and this call, so a failed signal is ignored. The
+    /// reaping `wait` still runs to avoid leaving a zombie.
+    pub fn kill(&mut self) -> Result<(), ProcessError> {
+        let _ = self.child.kill();
+        self.child.wait().map_err(ProcessError::Spawn)?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +202,27 @@ mod tests {
         assert!(
             matches!(err, ProcessError::LaunchDaemon(_)),
             "expected LaunchDaemon, got: {err}"
+        );
+    }
+
+    #[test]
+    fn kill_terminates_a_running_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("test-output.log");
+
+        let mut launcher = DaemonLauncher::new("/bin/sh", &log_path);
+        launcher.args(["-c", "sleep 600"]);
+
+        let mut handle = launcher.launch().unwrap();
+        let pid = nix::unistd::Pid::from_raw(handle.id() as i32);
+
+        handle.kill().unwrap();
+
+        // The child was killed and reaped, so a signal-0 existence probe reports
+        // no such process. A still-running sleep would answer Ok here.
+        assert!(
+            nix::sys::signal::kill(pid, None).is_err(),
+            "daemon should be reaped and gone after kill"
         );
     }
 }

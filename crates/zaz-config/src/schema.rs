@@ -320,9 +320,41 @@ pub struct ServiceCommand {
     /// Shell command to execute.
     pub command: String,
 
-    /// Signal to send when restarting.
+    /// Command run immediately before every spawn of this service, including the first
+    /// start of a freshly-started group.
+    ///
+    /// Clears state a prior run left behind, such as a stale container, lockfile, or PID
+    /// file. A failure is logged and the spawn proceeds.
     #[serde(default)]
-    pub signal: Signal,
+    pub cleanup_command: Option<String>,
+
+    /// Command that reports whether this service has finished starting. A zero exit means
+    /// ready; any nonzero exit means not yet.
+    ///
+    /// Unset means a service counts as ready the moment it spawns, which is how every service
+    /// behaved before this field existed.
+    #[serde(default)]
+    pub ready_check: Option<String>,
+
+    /// Command that stops this service, replacing the signal sent to its process group.
+    ///
+    /// Lets a service that wraps an external system stop what it wraps rather than only its
+    /// local process. A failure is logged and the stop proceeds.
+    #[serde(default)]
+    pub stop_command: Option<String>,
+
+    /// Command that force kills this service, replacing the SIGKILL sent to its process
+    /// group once `stop_timeout` elapses.
+    #[serde(default)]
+    pub kill_command: Option<String>,
+
+    /// Signal to send when restarting.
+    ///
+    /// Unset falls back to SIGTERM. The distinction between unset and an explicit SIGTERM
+    /// matters: setting a signal alongside `stop_command`, which replaces the signal
+    /// outright, is a validation error.
+    #[serde(default)]
+    signal: Option<Signal>,
 
     /// Disable PTY allocation for this process.
     /// By default, PTY is enabled (no_pty = false).
@@ -343,6 +375,32 @@ pub struct ServiceCommand {
     #[serde(default, alias = "delay_ms")]
     pub delay: Option<HumanDuration>,
 
+    /// How long to wait for the service to exit after its stop signal before escalating to
+    /// SIGKILL. Applies to every restart and to daemon shutdown.
+    ///
+    /// Accepts human-readable strings ("30s", "2m") or integer milliseconds. Unset falls
+    /// back to a 10-second default.
+    #[serde(default)]
+    pub stop_timeout: Option<HumanDuration>,
+
+    /// How long to wait between `ready_check` runs.
+    ///
+    /// Accepts human-readable strings ("250ms", "1s") or integer milliseconds. Unset falls
+    /// back to a 100-millisecond default. Setting this without `ready_check` is a validation
+    /// error.
+    #[serde(default)]
+    pub ready_poll_interval: Option<HumanDuration>,
+
+    /// How long `ready_check` may keep failing before the service is treated as failed to
+    /// start.
+    ///
+    /// Accepts human-readable strings ("30s", "2m") or integer milliseconds. Unset falls back
+    /// to a 30-second default, which is longer than the stop timeout because legitimate
+    /// startup times vary far more widely than shutdowns do. Setting this without
+    /// `ready_check` is a validation error.
+    #[serde(default)]
+    pub ready_timeout: Option<HumanDuration>,
+
     /// Environment variables for this service (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -354,11 +412,18 @@ impl ServiceCommand {
         Self {
             name: Some(name.into()),
             command: command.into(),
-            signal: Signal::default(),
+            cleanup_command: None,
+            ready_check: None,
+            stop_command: None,
+            kill_command: None,
+            signal: None,
             no_pty: false,
             silence: Silence::None,
             working_dir: None,
             delay: None,
+            stop_timeout: None,
+            ready_poll_interval: None,
+            ready_timeout: None,
             env: HashMap::new(),
         }
     }
@@ -368,11 +433,18 @@ impl ServiceCommand {
         Self {
             name: None,
             command: command.into(),
-            signal: Signal::default(),
+            cleanup_command: None,
+            ready_check: None,
+            stop_command: None,
+            kill_command: None,
+            signal: None,
             no_pty: false,
             silence: Silence::None,
             working_dir: None,
             delay: None,
+            stop_timeout: None,
+            ready_poll_interval: None,
+            ready_timeout: None,
             env: HashMap::new(),
         }
     }
@@ -389,9 +461,46 @@ impl ServiceCommand {
         self.name.is_some()
     }
 
+    /// Set the restart signal explicitly.
+    pub fn with_signal(mut self, signal: Signal) -> Self {
+        self.signal = Some(signal);
+        self
+    }
+
+    /// Get the restart signal, falling back to SIGTERM when unset.
+    pub fn signal(&self) -> Signal {
+        self.signal.unwrap_or_default()
+    }
+
+    /// Returns true if this service has an explicitly set restart signal.
+    pub fn has_explicit_signal(&self) -> bool {
+        self.signal.is_some()
+    }
+
     /// Get delay in milliseconds (for backwards compatibility).
     pub fn delay_ms(&self) -> Option<u64> {
         self.delay.map(|d| d.as_millis())
+    }
+
+    /// Get the configured stop timeout in milliseconds.
+    ///
+    /// Returns None when unset, leaving the default to the process layer.
+    pub fn stop_timeout_ms(&self) -> Option<u64> {
+        self.stop_timeout.map(|t| t.as_millis())
+    }
+
+    /// Get the configured readiness poll interval in milliseconds.
+    ///
+    /// Returns None when unset, leaving the default to the readiness poller.
+    pub fn ready_poll_interval_ms(&self) -> Option<u64> {
+        self.ready_poll_interval.map(|t| t.as_millis())
+    }
+
+    /// Get the configured readiness timeout in milliseconds.
+    ///
+    /// Returns None when unset, leaving the default to the readiness poller.
+    pub fn ready_timeout_ms(&self) -> Option<u64> {
+        self.ready_timeout.map(|t| t.as_millis())
     }
 }
 

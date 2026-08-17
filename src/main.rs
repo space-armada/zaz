@@ -603,8 +603,8 @@ async fn try_main() -> Result<()> {
                     match wait_for_daemon_ready(
                         &socket_path,
                         &mut handle,
-                        20,
-                        Duration::from_millis(100),
+                        DAEMON_READY_ATTEMPTS,
+                        DAEMON_READY_INTERVAL,
                     )
                     .await?
                     {
@@ -614,10 +614,13 @@ async fn try_main() -> Result<()> {
                             status,
                             daemon_output_log.display()
                         ),
-                        DaemonReadyOutcome::Timeout => bail!(
-                            "daemon did not become ready within 2s; see {} for details",
-                            daemon_output_log.display()
-                        ),
+                        DaemonReadyOutcome::Timeout => {
+                            let _ = handle.kill();
+                            bail!(
+                                "daemon did not become ready in time; see {} for details",
+                                daemon_output_log.display()
+                            )
+                        }
                     }
                 }
             } else {
@@ -959,7 +962,14 @@ async fn start_daemon_command(
         daemon_output_log,
     )?;
 
-    match wait_for_daemon_ready(socket_path, &mut handle, 20, Duration::from_millis(100)).await? {
+    match wait_for_daemon_ready(
+        socket_path,
+        &mut handle,
+        DAEMON_READY_ATTEMPTS,
+        DAEMON_READY_INTERVAL,
+    )
+    .await?
+    {
         DaemonReadyOutcome::Ready => {
             println!("daemon started (pid {})", handle.id());
             Ok(())
@@ -969,10 +979,13 @@ async fn start_daemon_command(
             status,
             daemon_output_log.display()
         ),
-        DaemonReadyOutcome::Timeout => bail!(
-            "daemon did not become ready within 2s; see {} for details",
-            daemon_output_log.display()
-        ),
+        DaemonReadyOutcome::Timeout => {
+            let _ = handle.kill();
+            bail!(
+                "daemon did not become ready in time; see {} for details",
+                daemon_output_log.display()
+            )
+        }
     }
 }
 
@@ -1052,16 +1065,10 @@ async fn start_supervisor_command(
     let mut handle = launcher.launch()?;
 
     // The supervisor binds its control socket only after its boot attach loop
-    // brings every member up, so allow extra readiness budget per member.
-    let attempts = 30 + 30 * config_paths.len();
-    match wait_for_daemon_ready(
-        socket_path,
-        &mut handle,
-        attempts,
-        Duration::from_millis(100),
-    )
-    .await?
-    {
+    // brings every member up. Each member can take a full readiness window, so
+    // the supervisor budget must exceed the sum across the set.
+    let attempts = DAEMON_READY_ATTEMPTS + DAEMON_READY_ATTEMPTS * config_paths.len();
+    match wait_for_daemon_ready(socket_path, &mut handle, attempts, DAEMON_READY_INTERVAL).await? {
         DaemonReadyOutcome::Ready => {
             println!("workspace supervisor started (pid {})", handle.id());
             Ok(())
@@ -1071,10 +1078,17 @@ async fn start_supervisor_command(
             status,
             daemon_output_log.display()
         ),
-        DaemonReadyOutcome::Timeout => bail!(
-            "supervisor did not become ready in time; see {} for details",
-            daemon_output_log.display()
-        ),
+        DaemonReadyOutcome::Timeout => {
+            // NOTE: this stops the wedged supervisor process, but any member
+            // daemons it already spawned are not reaped here. Graceful cleanup
+            // would need the supervisor's own detach_all, which is unreachable
+            // once its control socket never binds.
+            let _ = handle.kill();
+            bail!(
+                "supervisor did not become ready in time; see {} for details",
+                daemon_output_log.display()
+            )
+        }
     }
 }
 
@@ -1467,6 +1481,14 @@ pub(crate) fn start_daemon_via_launcher(
     launcher.args(args);
     Ok(launcher.launch()?)
 }
+
+/// Per-daemon readiness polling budget. Each attempt sleeps DAEMON_READY_INTERVAL
+/// before probing the socket, so the window is attempts * interval. Sized to
+/// tolerate slow debug-build starts under load, where a healthy daemon can take
+/// several seconds to bind its socket. Too tight a window kills or misses a
+/// legitimately-slow daemon, which surfaces as leaks and flaky startup failures.
+pub(crate) const DAEMON_READY_ATTEMPTS: usize = 100;
+pub(crate) const DAEMON_READY_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 pub(crate) enum DaemonReadyOutcome {

@@ -270,7 +270,7 @@ command = "./srv"
 signal = "SIGHUP"
 "#;
         let config = parse_toml(toml).unwrap();
-        assert_eq!(config.groups[0].services[0].signal, Signal::Sighup);
+        assert_eq!(config.groups[0].services[0].signal(), Signal::Sighup);
     }
 
     #[test]
@@ -420,6 +420,337 @@ command = "./srv"
         assert!(config.groups[0].working_dir.is_none());
         assert!(config.groups[0].tasks[0].working_dir.is_none());
         assert!(config.groups[0].services[0].working_dir.is_none());
+    }
+
+    #[test]
+    fn test_cleanup_command_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "docker run --rm --name api img"
+cleanup_command = "docker rm -f api"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].cleanup_command,
+            Some("docker rm -f api".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cleanup_command_parsing_json() {
+        let json = r#"{
+            "groups": [{
+                "name": "test",
+                "patterns": ["*.txt"],
+                "services": [{
+                    "name": "server",
+                    "command": "docker run --rm --name api img",
+                    "cleanup_command": "docker rm -f api"
+                }]
+            }]
+        }"#;
+        let config = parse_json(json).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].cleanup_command,
+            Some("docker rm -f api".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stop_and_kill_command_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "docker run --rm --name api img"
+stop_command = "docker stop api"
+kill_command = "docker kill api"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].stop_command,
+            Some("docker stop api".to_string())
+        );
+        assert_eq!(
+            config.groups[0].services[0].kill_command,
+            Some("docker kill api".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stop_and_kill_command_parsing_json() {
+        let json = r#"{
+            "groups": [{
+                "name": "test",
+                "patterns": ["*.txt"],
+                "services": [{
+                    "name": "server",
+                    "command": "docker run --rm --name api img",
+                    "stop_command": "docker stop api",
+                    "kill_command": "docker kill api"
+                }]
+            }]
+        }"#;
+        let config = parse_json(json).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].stop_command,
+            Some("docker stop api".to_string())
+        );
+        assert_eq!(
+            config.groups[0].services[0].kill_command,
+            Some("docker kill api".to_string())
+        );
+    }
+
+    #[test]
+    fn test_stop_and_kill_command_unset_leaves_service_unchanged() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+"#;
+        let config = parse_toml(toml).unwrap();
+        let service = &config.groups[0].services[0];
+
+        assert_eq!(*service, ServiceCommand::new("server", "./server"));
+        assert!(service.stop_command.is_none());
+        assert!(service.kill_command.is_none());
+    }
+
+    #[test]
+    fn test_omitted_signal_stays_omitted_through_a_round_trip() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert!(!config.groups[0].services[0].has_explicit_signal());
+        assert_eq!(config.groups[0].services[0].signal(), Signal::Sigterm);
+
+        let reparsed = parse_toml(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(
+            !reparsed.groups[0].services[0].has_explicit_signal(),
+            "a service that never set a signal must not gain one by round-tripping"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_command_unset_leaves_service_unchanged() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(
+            config.groups[0].services[0],
+            ServiceCommand::new("server", "./server")
+        );
+    }
+
+    #[test]
+    fn test_stop_timeout_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+stop_timeout = "30s"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.groups[0].services[0].stop_timeout_ms(), Some(30_000));
+    }
+
+    #[test]
+    fn test_stop_timeout_accepts_integer_milliseconds() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+stop_timeout = 2500
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(config.groups[0].services[0].stop_timeout_ms(), Some(2500));
+    }
+
+    #[test]
+    fn test_stop_timeout_unset_leaves_service_unchanged() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(
+            config.groups[0].services[0],
+            ServiceCommand::new("server", "./server")
+        );
+        assert!(config.groups[0].services[0].stop_timeout.is_none());
+    }
+
+    #[test]
+    fn test_ready_check_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+ready_check = "curl -sf localhost:8080/healthz"
+"#;
+        let config = parse_toml(toml).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].ready_check,
+            Some("curl -sf localhost:8080/healthz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ready_check_parsing_json() {
+        let json = r#"{
+            "groups": [{
+                "name": "test",
+                "patterns": ["*.txt"],
+                "services": [{
+                    "name": "server",
+                    "command": "./server",
+                    "ready_check": "curl -sf localhost:8080/healthz"
+                }]
+            }]
+        }"#;
+        let config = parse_json(json).unwrap();
+        assert_eq!(
+            config.groups[0].services[0].ready_check,
+            Some("curl -sf localhost:8080/healthz".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ready_poll_interval_and_timeout_parsing() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+ready_check = "./healthz"
+ready_poll_interval = "250ms"
+ready_timeout = "1m"
+"#;
+        let config = parse_toml(toml).unwrap();
+        let service = &config.groups[0].services[0];
+
+        assert_eq!(service.ready_poll_interval_ms(), Some(250));
+        assert_eq!(service.ready_timeout_ms(), Some(60_000));
+    }
+
+    #[test]
+    fn test_ready_durations_accept_integer_milliseconds() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+ready_check = "./healthz"
+ready_poll_interval = 500
+ready_timeout = 45000
+"#;
+        let config = parse_toml(toml).unwrap();
+        let service = &config.groups[0].services[0];
+
+        assert_eq!(service.ready_poll_interval_ms(), Some(500));
+        assert_eq!(service.ready_timeout_ms(), Some(45_000));
+    }
+
+    #[test]
+    fn test_ready_check_unset_leaves_service_unchanged() {
+        let toml = r#"
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.service]]
+name = "server"
+command = "./server"
+"#;
+        let config = parse_toml(toml).unwrap();
+        let service = &config.groups[0].services[0];
+
+        assert_eq!(*service, ServiceCommand::new("server", "./server"));
+        assert!(service.ready_check.is_none());
+        assert!(service.ready_poll_interval.is_none());
+        assert!(service.ready_timeout.is_none());
+    }
+
+    #[test]
+    fn test_config_round_trips_through_toml() {
+        let toml = r#"
+[settings]
+shell = "bash"
+
+[[group]]
+name = "test"
+patterns = ["*.txt"]
+
+[[group.task]]
+name = "build"
+command = "make"
+
+[[group.service]]
+name = "server"
+command = "./server"
+cleanup_command = "rm -f ./server.pid"
+ready_check = "./server-ctl ping"
+stop_command = "./server-ctl drain"
+kill_command = "./server-ctl abort"
+delay = "500ms"
+stop_timeout = "30s"
+ready_poll_interval = "250ms"
+ready_timeout = "1m"
+"#;
+        let config = parse_toml(toml).unwrap();
+        let reserialized = toml::to_string(&config).unwrap();
+        let reparsed = parse_toml(&reserialized).unwrap();
+        assert_eq!(config, reparsed);
     }
 
     #[test]

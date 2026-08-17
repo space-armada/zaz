@@ -12,11 +12,15 @@ use crate::{ApiResponse, DaemonError};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group, LogStorageBackend};
-use zaz_process::{Executor, OutputLine, Service, TaskRunner};
+use zaz_process::{
+    CommandOutput, Executor, HookRun, KillAction, OutputLine, ProcessError, ReadyPoll, Service,
+    StopEscalation, TaskRunner,
+};
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
 
@@ -212,6 +216,559 @@ async fn execute_task(ctx: TaskExecutionContext, log_tx: mpsc::Sender<LogLine>) 
             }
         }
     }
+}
+
+/// Which lifecycle hook a run belongs to. The label prefixes every line the run logs, so an
+/// operator reading a service's log can tell a cleanup from a stop from a kill.
+#[derive(Debug, Clone, Copy)]
+enum HookKind {
+    Cleanup,
+    Ready,
+    Stop,
+    Kill,
+}
+
+impl HookKind {
+    fn label(self) -> &'static str {
+        match self {
+            HookKind::Cleanup => "cleanup",
+            HookKind::Ready => "ready check",
+            HookKind::Stop => "stop",
+            HookKind::Kill => "kill",
+        }
+    }
+}
+
+/// Run a service's pre-spawn cleanup hook to completion, streaming its output to the log
+/// store. Does nothing when the service has no hook configured.
+///
+/// The hook is best-effort. A failed expansion, a spawn failure, or a nonzero exit is logged
+/// and the caller goes on to spawn the service anyway. A hook that failed to clear stale
+/// state usually makes the spawn itself fail loudly on its own.
+///
+/// This one is awaited inline rather than detached, since the spawn it precedes must not
+/// happen until it is done.
+async fn run_cleanup_hook(
+    service: &Service,
+    group_name: &str,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let name = service.name();
+
+    let Some(template) = service.cleanup_command_template() else {
+        return;
+    };
+
+    let command = match expander.expand(template) {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "cleanup_command expansion failed; starting service anyway"
+            );
+            log_hook_skipped(HookKind::Cleanup, name, group_name, &e.to_string(), log_tx).await;
+            return;
+        }
+    };
+
+    tracing::info!(service = %name, command = %command, "running service cleanup hook");
+
+    log_hook_header(HookKind::Cleanup, name, group_name, &command, log_tx).await;
+
+    let (output_tx, output_rx) = mpsc::unbounded_channel::<OutputLine>();
+    let run = service.run_cleanup(&command, output_tx);
+
+    drive_hook(
+        HookKind::Cleanup,
+        run,
+        output_rx,
+        name,
+        group_name,
+        service.silence(),
+        log_tx,
+    )
+    .await;
+}
+
+/// The signal a service falls back to when no `stop_command` runs.
+#[derive(Debug, Clone, Copy)]
+enum StopFallback {
+    /// SIGTERM, as the shutdown and reload paths send.
+    Terminate,
+
+    /// The service's configured restart signal.
+    Restart,
+}
+
+/// Stop a service, through its `stop_command` when it sets one.
+///
+/// A hook replaces the signal outright, which is why configuring both is a load-time error.
+/// A hook that cannot be expanded or spawned falls back to the signal: a hook that never ran
+/// is not replacing anything, and a service still has to be asked to go down.
+///
+/// The stop timeout is armed either way, so the escalation bounds the stop whichever path
+/// ran. The hook itself is driven detached, since the poll branch that starts it is
+/// cancelled whenever an API command arrives.
+async fn stop_service(
+    service: &mut Service,
+    group_name: &str,
+    fallback: StopFallback,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) -> Result<(), ProcessError> {
+    let Some(template) = service.stop_command_template().map(str::to_string) else {
+        return signal_service(service, fallback);
+    };
+
+    let name = service.name().to_string();
+    let silence = service.silence();
+
+    let command = match expander.expand(&template) {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "stop_command expansion failed; signalling the service instead"
+            );
+            log_hook_skipped(HookKind::Stop, &name, group_name, &e.to_string(), log_tx).await;
+            return signal_service(service, fallback);
+        }
+    };
+
+    tracing::info!(service = %name, command = %command, "running service stop hook");
+
+    log_hook_header(HookKind::Stop, &name, group_name, &command, log_tx).await;
+
+    let hook = match service.begin_hook(&command) {
+        Ok(hook) => hook,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "stop_command could not spawn; signalling the service instead"
+            );
+            let _ = log_tx
+                .send(
+                    LogLine::daemon(&name, format!("stop failed: {}", e))
+                        .with_group(group_name.to_string()),
+                )
+                .await;
+            return signal_service(service, fallback);
+        }
+    };
+
+    service.arm_stop_deadline();
+    spawn_hook_driver(
+        HookKind::Stop,
+        hook,
+        name,
+        group_name.to_string(),
+        silence,
+        log_tx.clone(),
+    );
+
+    Ok(())
+}
+
+/// Force kill a service whose stop timeout expired, through its `kill_command` when it sets
+/// one. Falls back to SIGKILL on the same terms `stop_service` falls back to its signal.
+async fn kill_service(
+    service: &mut Service,
+    group_name: &str,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let Some(template) = service.kill_command_template().map(str::to_string) else {
+        service.force_kill();
+        return;
+    };
+
+    let name = service.name().to_string();
+    let silence = service.silence();
+
+    let command = match expander.expand(&template) {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "kill_command expansion failed; force killing the service instead"
+            );
+            log_hook_skipped(HookKind::Kill, &name, group_name, &e.to_string(), log_tx).await;
+            service.force_kill();
+            return;
+        }
+    };
+
+    tracing::warn!(service = %name, command = %command, "running service kill hook");
+
+    log_hook_header(HookKind::Kill, &name, group_name, &command, log_tx).await;
+
+    match service.begin_hook(&command) {
+        Ok(hook) => spawn_hook_driver(
+            HookKind::Kill,
+            hook,
+            name,
+            group_name.to_string(),
+            silence,
+            log_tx.clone(),
+        ),
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "kill_command could not spawn; force killing the service instead"
+            );
+            let _ = log_tx
+                .send(
+                    LogLine::daemon(&name, format!("kill failed: {}", e))
+                        .with_group(group_name.to_string()),
+                )
+                .await;
+            service.force_kill();
+        }
+    }
+}
+
+/// Act on an expired stop timeout and report what it did to the service's own log.
+///
+/// An operator reads a service's lifecycle in that log, where its exits and its cleanup runs
+/// already report themselves, so a force kill belongs there beside them.
+async fn handle_escalation(
+    service: &mut Service,
+    group_name: &str,
+    escalation: StopEscalation,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let mut steps = Vec::new();
+
+    if escalation.killed_hook {
+        steps.push("killed the lifecycle hook still running".to_string());
+    }
+
+    match escalation.action {
+        Some(KillAction::SentSignal) => steps.push("sent SIGKILL".to_string()),
+        Some(KillAction::RunKillCommand) => steps.push("running the kill command".to_string()),
+        None => {}
+    }
+
+    if steps.is_empty() {
+        return;
+    }
+
+    let log_msg = format!(
+        "stop timeout expired after {:.2}s; {}",
+        service.stop_timeout().as_secs_f64(),
+        steps.join("; ")
+    );
+    let _ = log_tx
+        .send(LogLine::daemon(service.name(), log_msg).with_group(group_name.to_string()))
+        .await;
+
+    if escalation.action == Some(KillAction::RunKillCommand) {
+        kill_service(service, group_name, expander, log_tx).await;
+    }
+}
+
+/// Send the signal that stands in for an absent or unusable `stop_command`.
+fn signal_service(service: &mut Service, fallback: StopFallback) -> Result<(), ProcessError> {
+    match fallback {
+        StopFallback::Terminate => service.stop(),
+        StopFallback::Restart => service.signal_restart(),
+    }
+}
+
+/// Drive a stop or kill hook to completion in a detached task.
+///
+/// Detaching is what keeps the hook alive across a cancelled poll. The daemon's main loop
+/// selects over the poll branch and the API command channel, so an arriving command would
+/// otherwise drop a hook mid-stop and leave the service neither stopped nor escalated.
+fn spawn_hook_driver(
+    kind: HookKind,
+    hook: HookRun,
+    name: String,
+    group_name: String,
+    silence: zaz_config::Silence,
+    log_tx: mpsc::Sender<LogLine>,
+) {
+    tokio::spawn(async move {
+        let (output_tx, output_rx) = mpsc::unbounded_channel::<OutputLine>();
+        let run = hook.stream(output_tx);
+
+        drive_hook(kind, run, output_rx, &name, &group_name, silence, &log_tx).await;
+    });
+}
+
+/// Advance a service's readiness window by one tick.
+///
+/// Returns the status the service has settled on, or None while it is still starting or has
+/// no `ready_check` at all. A service that never reports ready is left running: tearing it
+/// down here would feed it straight back into the restart path, which would spawn it, arm a
+/// fresh window, time out, and tear it down again.
+///
+/// Probe output is deliberately not streamed. A thirty-second window at the default interval
+/// runs three hundred checks, and three hundred hook headers would bury the service's own
+/// output. What the last failing check printed is carried by the timeout line instead, which
+/// is where an operator actually needs it.
+async fn tick_readiness(
+    service: &mut Service,
+    group_name: &str,
+    now: Instant,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) -> Option<ProcessStatus> {
+    match service.poll_readiness(now) {
+        ReadyPoll::Idle | ReadyPoll::Waiting => None,
+
+        ReadyPoll::Due { first } => {
+            start_ready_probe(service, group_name, first, expander, log_tx).await
+        }
+
+        ReadyPoll::Passed { waited } => {
+            tracing::info!(
+                service = %service.name(),
+                waited_ms = waited.as_millis(),
+                "service reported ready"
+            );
+
+            let log_msg = format!("ready after {:.2}s", waited.as_secs_f64());
+            let _ = log_tx
+                .send(LogLine::daemon(service.name(), log_msg).with_group(group_name.to_string()))
+                .await;
+
+            Some(ProcessStatus::Running)
+        }
+
+        ReadyPoll::TimedOut {
+            waited,
+            last_failure,
+        } => {
+            tracing::warn!(
+                service = %service.name(),
+                waited_ms = waited.as_millis(),
+                "ready timeout expired; treating the service as failed to start"
+            );
+
+            let log_msg = match last_failure {
+                Some(failure) => format!(
+                    "gave up waiting for readiness after {:.2}s: {}",
+                    waited.as_secs_f64(),
+                    failure
+                ),
+                None => format!(
+                    "gave up waiting for readiness after {:.2}s",
+                    waited.as_secs_f64()
+                ),
+            };
+            let _ = log_tx
+                .send(LogLine::daemon(service.name(), log_msg).with_group(group_name.to_string()))
+                .await;
+
+            Some(ProcessStatus::Failed)
+        }
+    }
+}
+
+/// Spawn one readiness probe, detached, and report the status when the check cannot run.
+///
+/// A check whose variables do not expand, or whose shell will not spawn, fails the service
+/// outright rather than polling on to the timeout. Neither gets better inside the window, so
+/// waiting would only repeat the same failure every interval before reaching the same verdict.
+async fn start_ready_probe(
+    service: &mut Service,
+    group_name: &str,
+    first: bool,
+    expander: &zaz_vars::Expander<'_>,
+    log_tx: &mpsc::Sender<LogLine>,
+) -> Option<ProcessStatus> {
+    let name = service.name().to_string();
+    let template = service.ready_check_template()?.to_string();
+
+    let command = match expander.expand(&template) {
+        Ok(command) => command,
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "ready_check expansion failed; the service cannot report ready"
+            );
+            log_hook_skipped(HookKind::Ready, &name, group_name, &e.to_string(), log_tx).await;
+            service.abandon_readiness();
+
+            return Some(ProcessStatus::Failed);
+        }
+    };
+
+    if first {
+        log_hook_header(HookKind::Ready, &name, group_name, &command, log_tx).await;
+    }
+
+    match service.begin_ready_probe(&command) {
+        Ok(probe) => {
+            tokio::spawn(probe.run());
+            None
+        }
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                error = %e,
+                "ready_check could not spawn; the service cannot report ready"
+            );
+            let _ = log_tx
+                .send(
+                    LogLine::daemon(&name, format!("ready check failed: {}", e))
+                        .with_group(group_name.to_string()),
+                )
+                .await;
+            service.abandon_readiness();
+
+            Some(ProcessStatus::Failed)
+        }
+    }
+}
+
+/// Pump a hook's output into the log store until the run ends, then log its footer.
+///
+/// The header is logged by the caller, before the hook is spawned, so a hook that fails to
+/// spawn still reports the command it would have run.
+async fn drive_hook(
+    kind: HookKind,
+    run: impl Future<Output = Result<CommandOutput, ProcessError>>,
+    mut output_rx: mpsc::UnboundedReceiver<OutputLine>,
+    name: &str,
+    group_name: &str,
+    silence: zaz_config::Silence,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let start = std::time::Instant::now();
+
+    tokio::pin!(run);
+
+    let result = loop {
+        tokio::select! {
+            biased;
+
+            result = &mut run => {
+                while let Some(line) = output_rx.recv().await {
+                    forward_hook_line(line, name, group_name, silence, log_tx).await;
+                }
+                break result;
+            }
+
+            Some(line) = output_rx.recv() => {
+                forward_hook_line(line, name, group_name, silence, log_tx).await;
+            }
+        }
+    };
+
+    let duration = start.elapsed();
+    let label = kind.label();
+
+    let log_msg = match result {
+        Ok(output) => match output.exit_code {
+            Some(0) => format!(
+                "{} completed in {:.2}s (exit code: 0)",
+                label,
+                duration.as_secs_f64()
+            ),
+            Some(code) => {
+                tracing::warn!(
+                    service = %name,
+                    hook = %label,
+                    exit_code = code,
+                    "service lifecycle hook exited nonzero; proceeding anyway"
+                );
+                format!("{} failed: process exited with status {}", label, code)
+            }
+            // A hook the stop timeout killed lands here, so reporting no exit code as
+            // success would contradict the escalation line that killed it.
+            None => {
+                tracing::warn!(
+                    service = %name,
+                    hook = %label,
+                    "service lifecycle hook was killed by a signal; proceeding anyway"
+                );
+                format!("{} failed: process was killed by a signal", label)
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                service = %name,
+                hook = %label,
+                error = %e,
+                "service lifecycle hook could not run; proceeding anyway"
+            );
+            format!("{} failed: {}", label, e)
+        }
+    };
+
+    let _ = log_tx
+        .send(LogLine::daemon(name, log_msg).with_group(group_name.to_string()))
+        .await;
+}
+
+/// Log the header naming the expanded command a hook is about to run.
+async fn log_hook_header(
+    kind: HookKind,
+    name: &str,
+    group_name: &str,
+    command: &str,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let _ = log_tx
+        .send(
+            LogLine::daemon(name, format!("{}: {}", kind.label(), command))
+                .with_group(group_name.to_string()),
+        )
+        .await;
+}
+
+/// Log a hook that never ran, naming why.
+async fn log_hook_skipped(
+    kind: HookKind,
+    name: &str,
+    group_name: &str,
+    reason: &str,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let _ = log_tx
+        .send(
+            LogLine::daemon(name, format!("{} skipped: {}", kind.label(), reason))
+                .with_group(group_name.to_string()),
+        )
+        .await;
+}
+
+/// Send one line of hook output to the log store, honoring the service's silence.
+async fn forward_hook_line(
+    line: OutputLine,
+    name: &str,
+    group_name: &str,
+    silence: zaz_config::Silence,
+    log_tx: &mpsc::Sender<LogLine>,
+) {
+    let (content, is_stderr) = match line {
+        OutputLine::Stdout(s) => (s, false),
+        OutputLine::Stderr(s) => (s, true),
+    };
+
+    if should_suppress(silence, is_stderr) {
+        return;
+    }
+
+    let log_line = if is_stderr {
+        LogLine::stderr(name, content)
+    } else {
+        LogLine::stdout(name, content)
+    };
+
+    let _ = log_tx
+        .send(log_line.with_group(group_name.to_string()))
+        .await;
 }
 
 // =============================================================================
@@ -425,6 +982,18 @@ struct ConfigDiff {
     unchanged: Vec<String>,
 }
 
+/// The `Ready` transition a service's readiness check is holding back.
+///
+/// Both fields are decided where the services spawn. The tick that eventually settles
+/// readiness runs far from that decision and cannot rebuild it: the two spawn sites read the
+/// lifecycle phase at different points relative to `services_started`, and a suppressed
+/// cascade is not recoverable at all.
+#[derive(Debug, Clone, Copy)]
+struct PendingReady {
+    phase: LifecyclePhase,
+    cascade: bool,
+}
+
 /// A managed watch group with its processes.
 struct ManagedGroup {
     /// Group configuration.
@@ -445,6 +1014,13 @@ struct ManagedGroup {
 
     /// Pending restart times for services
     pending_restarts: Vec<Option<Instant>>,
+
+    /// The `Ready` transition this group owes once its services report ready.
+    ///
+    /// Only the group's first `Ready` is gated. A group that already reached it stays there
+    /// while a crashed service respawns and checks again, the same way it stays `Ready` while
+    /// a crashed service sits in backoff.
+    pending_ready: Option<PendingReady>,
 }
 
 impl Engine {
@@ -864,6 +1440,11 @@ impl Engine {
                     );
                     continue;
                 }
+
+                if self.group_awaits_readiness(group_name) {
+                    self.defer_ready(group_name, phase, trigger_ctx.should_cascade);
+                    continue;
+                }
             } else {
                 // Groups with nothing runnable still become Ready so dependency
                 // markers and task-only service groups can unblock dependents.
@@ -1002,7 +1583,7 @@ impl Engine {
         // Collect groups that need service action
         // (group_name, should_start_not_signal, should_cascade_to_dependents)
         let mut service_actions: Vec<(String, bool, bool)> = Vec::new();
-        // Collect groups that failed (for cascade_skip)
+        // Collect groups that failed (for the failure cascade)
         let mut failed_groups: Vec<String> = Vec::new();
 
         while let Ok(completion) = self.task_completion_rx.try_recv() {
@@ -1091,7 +1672,7 @@ impl Engine {
                             &self.notification_config,
                             crate::notify::NotifyEvent::group_failed(&completion.group_name),
                         );
-                        // Queue cascade_skip for this failed group
+                        // Queue the failure cascade for this group
                         failed_groups.push(completion.group_name.clone());
                     } else {
                         crate::notify::send_notification(
@@ -1173,9 +1754,9 @@ impl Engine {
             self.update_state();
         }
 
-        // Process cascade_skip for failed groups
+        // Skip everything waiting behind a group whose task failed
         for group_name in failed_groups {
-            self.cascade_skip(&group_name);
+            self.cascade_failure(&group_name);
         }
 
         // Process service actions after releasing borrows from the loop
@@ -1205,6 +1786,12 @@ impl Engine {
                 should_cascade,
                 "propagating task completion to dependents"
             );
+
+            if self.group_awaits_readiness(&group_name) {
+                self.defer_ready(&group_name, phase, should_cascade);
+                continue;
+            }
+
             if should_cascade {
                 if let Err(e) = self.propagate_to_dependents(&group_name, phase).await {
                     tracing::error!(
@@ -1264,6 +1851,10 @@ impl Engine {
             .with_root(config_dir);
         let expander = zaz_vars::Expander::new(&var_context);
 
+        // Lifecycle hooks log through a pre-cloned sender: `push_log` takes `&mut self` and
+        // is unusable while the borrow on `self.groups` below is live.
+        let log_tx = self.log_store.sender();
+
         if let Some(group) = self.groups.get_mut(group_name) {
             for (idx, service) in group.services.iter_mut().enumerate() {
                 // Check if service is actually running before deciding what to do
@@ -1302,9 +1893,12 @@ impl Engine {
                         }
                     };
 
+                    run_cleanup_hook(service, group_name, &expander, &log_tx).await;
+
                     // Start service
                     tracing::info!(service = %service.name(), "starting service");
                     service.start(&command).map_err(DaemonError::Process)?;
+                    service.arm_readiness();
 
                     // Get PTY reader for streaming output
                     if let Some(reader) = service.try_clone_reader() {
@@ -1317,15 +1911,42 @@ impl Engine {
                 } else {
                     // Signal existing service to restart
                     tracing::info!(service = %service.name(), "signaling service restart");
-                    service.signal_restart().map_err(DaemonError::Process)?;
+                    stop_service(
+                        service,
+                        group_name,
+                        StopFallback::Restart,
+                        &expander,
+                        &log_tx,
+                    )
+                    .await
+                    .map_err(DaemonError::Process)?;
                 }
 
-                group.state.services[idx].status = ProcessStatus::Running;
+                // A service with a `ready_check` is spawned, not ready. Only the readiness
+                // tick moves it on from here. The signal branch above armed nothing, so a
+                // service being asked to restart stays where it was until it respawns.
+                group.state.services[idx].status = if service.awaiting_readiness() {
+                    ProcessStatus::Starting
+                } else {
+                    ProcessStatus::Running
+                };
                 group.state.services[idx].pid = service.pid();
             }
 
             group.services_started = true;
-            group.state.status = GroupStatus::Ready;
+
+            // This spawn supersedes whatever the last one was still waiting on. The caller
+            // records a fresh transition when this one has checks of its own outstanding.
+            group.pending_ready = None;
+
+            // A group whose services are still proving themselves has not finished starting.
+            // The readiness tick is what moves it on, and the caller holds back the
+            // propagation that goes with it until then.
+            group.state.status = if group.services.iter().any(|s| s.awaiting_readiness()) {
+                GroupStatus::Running
+            } else {
+                GroupStatus::Ready
+            };
         }
 
         // Spawn PTY reader tasks (outside the mutable borrow)
@@ -1387,6 +2008,10 @@ impl Engine {
         let mut pty_readers: Vec<(String, Option<String>, Box<dyn std::io::Read + Send>)> =
             Vec::new();
 
+        // Groups whose readiness settled this tick, applied once the borrow below ends. The
+        // transition they owe reaches for `&mut self` through the dependency cascade.
+        let mut settled: Vec<(String, bool)> = Vec::new();
+
         // Build expansion context up front so the mutable borrow on `self.groups`
         // below does not conflict with reads of `self.config` / `self.config_path`.
         let config_dir = self
@@ -1398,6 +2023,10 @@ impl Engine {
             .with_variables(self.config.variables.clone())
             .with_root(config_dir);
         let expander = zaz_vars::Expander::new(&var_context);
+
+        // Lifecycle hooks log through a pre-cloned sender: `push_log` takes `&mut self` and
+        // is unusable while the borrow on `self.groups` below is live.
+        let log_tx = self.log_store.sender();
 
         let now = Instant::now();
         for (group_name, group) in self.groups.iter_mut() {
@@ -1417,8 +2046,15 @@ impl Engine {
                                 continue;
                             }
                         };
+                        // The pending restart stays scheduled across this await. A cancelled
+                        // poll re-runs the hook next tick, which an idempotent cleanup
+                        // tolerates; clearing the slot first would strand the service with
+                        // no child and nothing left to reschedule it.
+                        run_cleanup_hook(service, group_name, &expander, &log_tx).await;
+
                         tracing::info!(service = %service.name(), "restarting service");
                         service.start(&command).map_err(DaemonError::Process)?;
+                        service.arm_readiness();
 
                         if let Some(reader) = service.try_clone_reader() {
                             pty_readers.push((
@@ -1428,7 +2064,11 @@ impl Engine {
                             ));
                         }
 
-                        group.state.services[idx].status = ProcessStatus::Running;
+                        group.state.services[idx].status = if service.awaiting_readiness() {
+                            ProcessStatus::Starting
+                        } else {
+                            ProcessStatus::Running
+                        };
                         group.state.services[idx].pid = service.pid();
                         group.pending_restarts[idx] = None;
                     }
@@ -1469,7 +2109,31 @@ impl Engine {
                         .await;
 
                     group.pending_restarts[idx] = Some(now + delay);
+                } else {
+                    if let Some(escalation) = service.enforce_stop_deadline(now) {
+                        handle_escalation(service, group_name, escalation, &expander, &log_tx)
+                            .await;
+                    }
+
+                    if let Some(status) =
+                        tick_readiness(service, group_name, now, &expander, &log_tx).await
+                    {
+                        group.state.services[idx].status = status;
+                    }
                 }
+            }
+
+            // Checked after the per-service loop, so a group with several services settles
+            // only once the last of them has an answer.
+            if group.pending_ready.is_some()
+                && !group.services.iter().any(|s| s.awaiting_readiness())
+            {
+                let failed = group
+                    .state
+                    .services
+                    .iter()
+                    .any(|s| s.status == ProcessStatus::Failed);
+                settled.push((group_name.clone(), !failed));
             }
         }
 
@@ -1477,54 +2141,146 @@ impl Engine {
             self.spawn_pty_reader(process, group, reader);
         }
 
+        for (group_name, all_ready) in settled {
+            self.settle_group_readiness(&group_name, all_ready).await;
+        }
+
         self.update_state();
         Ok(())
     }
 
+    /// Finish the `Ready` transition a group's readiness checks were holding back.
+    ///
+    /// A group whose every check passed reaches `Ready` and propagates to its dependents, on
+    /// the phase and cascade decision its spawn recorded. A group where one check timed out
+    /// failed to come up: it is reported failed and everything waiting behind it is skipped,
+    /// the same treatment a group whose task failed gets.
+    ///
+    /// A service that crashes inside its readiness window disarms the window rather than
+    /// failing it, so a crash-looping service settles its group as ready. That matches what a
+    /// group without any readiness check does today.
+    async fn settle_group_readiness(&mut self, group_name: &str, all_ready: bool) {
+        let Some(pending) = self
+            .groups
+            .get_mut(group_name)
+            .and_then(|group| group.pending_ready.take())
+        else {
+            return;
+        };
+
+        // Only the first transition is gated. A group that reached `Ready` between the spawn
+        // that recorded this and the tick that settled it has already told its dependents
+        // everything they were waiting to hear.
+        if self
+            .groups
+            .get(group_name)
+            .is_some_and(|group| group.state.status == GroupStatus::Ready)
+        {
+            return;
+        }
+
+        if !all_ready {
+            tracing::warn!(group = %group_name, "group failed to become ready");
+
+            crate::notify::send_notification(
+                &self.notification_config,
+                crate::notify::NotifyEvent::group_failed(group_name),
+            );
+            self.cascade_failure(group_name);
+
+            return;
+        }
+
+        tracing::info!(group = %group_name, "group ready, every readiness check passed");
+
+        // Only the engine's own copy moves here, matching the spawn site this stands in for.
+        // The resolver learns the group is done through `trigger_dependents` below.
+        if let Some(group) = self.groups.get_mut(group_name) {
+            group.state.status = GroupStatus::Ready;
+        }
+
+        if !pending.cascade {
+            return;
+        }
+
+        if let Err(e) = self
+            .propagate_to_dependents(group_name, pending.phase)
+            .await
+        {
+            tracing::error!(
+                group = %group_name,
+                error = %e,
+                "failed to propagate readiness to dependents"
+            );
+        }
+    }
+
     /// Shutdown all processes gracefully.
     ///
-    /// Sends SIGTERM to all services, waits up to grace_period for them to exit,
-    /// then sends SIGKILL to any that are still running.
+    /// Stops every service, through its `stop_command` where one is configured and by
+    /// SIGTERM otherwise, waits up to each service's own `stop_timeout` for it to exit, then
+    /// force kills whatever is still running.
     pub async fn shutdown(&mut self) -> Result<(), DaemonError> {
-        const GRACE_PERIOD: Duration = Duration::from_secs(10);
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
         tracing::info!("shutting down");
         self.state.status = DaemonStatus::Stopping;
 
-        // Send SIGTERM to all services
-        for group in self.groups.values_mut() {
+        let config_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let var_context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir);
+        let expander = zaz_vars::Expander::new(&var_context);
+
+        // Lifecycle hooks log through a pre-cloned sender: `push_log` takes `&mut self` and
+        // is unusable while the borrow on `self.groups` below is live.
+        let log_tx = self.log_store.sender();
+
+        for (group_name, group) in self.groups.iter_mut() {
             for service in &mut group.services {
-                service.stop().map_err(DaemonError::Process)?;
+                stop_service(
+                    service,
+                    group_name,
+                    StopFallback::Terminate,
+                    &expander,
+                    &log_tx,
+                )
+                .await
+                .map_err(DaemonError::Process)?;
             }
         }
 
-        // Wait for services to exit, up to grace period
-        let deadline = std::time::Instant::now() + GRACE_PERIOD;
+        // Wait for services to exit, each on its own deadline. A stop hook that outlives its
+        // service is waited on too, so its output lands before the daemon goes away. The loop
+        // terminates because every service either exits, escalates once and clears its
+        // deadline, or is still inside its window.
         loop {
-            let mut any_running = false;
-            for group in self.groups.values_mut() {
+            let now = std::time::Instant::now();
+            let mut waiting = false;
+
+            for (group_name, group) in self.groups.iter_mut() {
                 for service in &mut group.services {
-                    if service.is_running() {
-                        any_running = true;
+                    if !service.is_running() && !service.has_running_hook() {
+                        continue;
+                    }
+
+                    if let Some(escalation) = service.enforce_stop_deadline(now) {
+                        handle_escalation(service, group_name, escalation, &expander, &log_tx)
+                            .await;
+                        continue;
+                    }
+
+                    if service.has_stop_deadline() {
+                        waiting = true;
                     }
                 }
             }
 
-            if !any_running {
-                tracing::info!("all services exited");
-                break;
-            }
-
-            if std::time::Instant::now() >= deadline {
-                tracing::warn!("grace period expired, force killing remaining services");
-                for group in self.groups.values_mut() {
-                    for service in &mut group.services {
-                        if service.is_running() {
-                            service.kill().map_err(DaemonError::Process)?;
-                        }
-                    }
-                }
+            if !waiting {
                 break;
             }
 
@@ -1604,27 +2360,41 @@ impl Engine {
         // 2. Compute changes
         let diff = self.get_config_diff(&new_config);
 
-        // 3. Stop services in removed groups
-        for group_name in &diff.removed {
-            if let Some(group) = self.groups.get_mut(group_name) {
-                for service in &mut group.services {
-                    if let Err(e) = service.stop() {
-                        tracing::warn!(
-                            service = %service.name(),
-                            group = %group_name,
-                            error = %e,
-                            "failed to stop service during reload"
-                        );
-                    }
-                }
-            }
-        }
+        // Stop hooks expand against the config being replaced, since they belong to the
+        // services that config started.
+        let config_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let var_context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir);
+        let expander = zaz_vars::Expander::new(&var_context);
+        let log_tx = self.log_store.sender();
 
-        // 4. Stop services in modified groups (they'll be restarted)
-        for group_name in &diff.modified {
+        // 3. Stop services in removed groups, then 4. in modified groups (they'll be
+        // restarted). A stop hook outlives the group it belongs to: it runs detached, so
+        // rebuilding the group below drops the service without cutting the hook short.
+        let stopping: Vec<String> = diff
+            .removed
+            .iter()
+            .chain(diff.modified.iter())
+            .cloned()
+            .collect();
+
+        for group_name in &stopping {
             if let Some(group) = self.groups.get_mut(group_name) {
                 for service in &mut group.services {
-                    if let Err(e) = service.stop() {
+                    if let Err(e) = stop_service(
+                        service,
+                        group_name,
+                        StopFallback::Terminate,
+                        &expander,
+                        &log_tx,
+                    )
+                    .await
+                    {
                         tracing::warn!(
                             service = %service.name(),
                             group = %group_name,
@@ -1823,10 +2593,27 @@ impl Engine {
                 LogLine::daemon(process_name, "restarting").with_group(group_name.to_string()),
             )?;
 
+            let config_dir = self
+                .config_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            let var_context = Context::new()
+                .with_variables(self.config.variables.clone())
+                .with_root(config_dir);
+            let expander = zaz_vars::Expander::new(&var_context);
+            let log_tx = self.log_store.sender();
+
             if let Some(group) = self.groups.get_mut(group_name) {
-                group.services[service_idx]
-                    .signal_restart()
-                    .map_err(DaemonError::Process)?;
+                stop_service(
+                    &mut group.services[service_idx],
+                    group_name,
+                    StopFallback::Restart,
+                    &expander,
+                    &log_tx,
+                )
+                .await
+                .map_err(DaemonError::Process)?;
             }
 
             // Cascade restart to dependent groups if enabled
@@ -2133,6 +2920,23 @@ impl Engine {
         }
     }
 
+    /// Whether any of the group's services is still running its readiness check.
+    fn group_awaits_readiness(&self, group_name: &str) -> bool {
+        self.groups
+            .get(group_name)
+            .is_some_and(|group| group.services.iter().any(|s| s.awaiting_readiness()))
+    }
+
+    /// Record the `Ready` transition a group's readiness checks are holding back, so the tick
+    /// that settles them can finish what this spawn started.
+    ///
+    /// A group that already reached `Ready` keeps it. Only the first transition is gated.
+    fn defer_ready(&mut self, group_name: &str, phase: LifecyclePhase, cascade: bool) {
+        if let Some(group) = self.groups.get_mut(group_name) {
+            group.pending_ready = Some(PendingReady { phase, cascade });
+        }
+    }
+
     /// Determine the lifecycle phase for a group.
     ///
     /// A group is in Runtime phase if it has already completed initial startup:
@@ -2232,12 +3036,11 @@ impl Engine {
         }
     }
 
-    /// Cascade skip status to dependents when a group fails.
+    /// Cascade skip status to dependents when a group is skipped.
     ///
     /// Marks the group as Skipped and recursively skips all dependents
     /// that were waiting for it.
     fn cascade_skip(&mut self, group_name: &str) {
-        // Use the resolver to mark as skipped and get cascading skips
         let result = self.dependency_resolver.mark_skipped(group_name);
 
         // Sync Engine's status for the source group
@@ -2245,8 +3048,27 @@ impl Engine {
             group.state.status = GroupStatus::Skipped;
         }
 
-        // Sync Engine's status for all transitively skipped groups
-        for skipped_group in result.to_skip {
+        self.sync_skipped(result.to_skip);
+    }
+
+    /// Cascade skip status to dependents when a group fails.
+    ///
+    /// The group that broke keeps `Failed` while everything waiting behind it is skipped. An
+    /// operator looking at a run of skipped groups needs to see which one caused them, and
+    /// folding the source into the skip it triggered hides exactly that.
+    fn cascade_failure(&mut self, group_name: &str) {
+        let result = self.dependency_resolver.mark_failed(group_name);
+
+        if let Some(group) = self.groups.get_mut(group_name) {
+            group.state.status = GroupStatus::Failed;
+        }
+
+        self.sync_skipped(result.to_skip);
+    }
+
+    /// Sync the engine's copy of the status for every group the resolver skipped.
+    fn sync_skipped(&mut self, skipped: Vec<String>) {
+        for skipped_group in skipped {
             if let Some(group) = self.groups.get_mut(&skipped_group) {
                 group.state.status = GroupStatus::Skipped;
             }
@@ -2328,7 +3150,7 @@ impl Engine {
                     );
 
                     // No tasks - signal services directly (without cascade, we handle it below)
-                    if let Err(e) = self.signal_group_services_no_cascade(&dependent) {
+                    if let Err(e) = self.signal_group_services_no_cascade(&dependent).await {
                         tracing::error!(
                             group = %dependent,
                             error = %e,
@@ -2373,11 +3195,33 @@ impl Engine {
     ///
     /// This is a low-level method used internally by cascade_service_restart.
     /// For most cases, use `restart_group_services` which also triggers the cascade.
-    fn signal_group_services_no_cascade(&mut self, group_name: &str) -> Result<(), DaemonError> {
+    async fn signal_group_services_no_cascade(
+        &mut self,
+        group_name: &str,
+    ) -> Result<(), DaemonError> {
+        let config_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let var_context = Context::new()
+            .with_variables(self.config.variables.clone())
+            .with_root(config_dir);
+        let expander = zaz_vars::Expander::new(&var_context);
+        let log_tx = self.log_store.sender();
+
         if let Some(group) = self.groups.get_mut(group_name) {
             for service in &mut group.services {
                 if service.is_running() {
-                    service.signal_restart().map_err(DaemonError::Process)?;
+                    stop_service(
+                        service,
+                        group_name,
+                        StopFallback::Restart,
+                        &expander,
+                        &log_tx,
+                    )
+                    .await
+                    .map_err(DaemonError::Process)?;
                 }
             }
         }
@@ -2461,6 +3305,7 @@ fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) 
         state: build_group_state(group),
         services_started: false,
         pending_restarts: vec![None; service_count],
+        pending_ready: None,
     }
 }
 
@@ -2711,6 +3556,29 @@ mod tests {
             services: vec![ServiceCommand::new("service", command)],
             ..Default::default()
         }
+    }
+
+    /// Read a lifecycle-hook trace file, one marker per line.
+    ///
+    /// The hook and the service command both append to the same file, so the line order is
+    /// what proves the hook ran before the spawn rather than merely alongside it.
+    fn read_trace(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .map(|read| read.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// Poll a hook-trace file until it holds at least `expected` markers.
+    async fn wait_for_trace(path: &Path, expected: usize) -> Vec<String> {
+        for _ in 0..200 {
+            let trace = read_trace(path);
+            if trace.len() >= expected {
+                return trace;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        read_trace(path)
     }
 
     /// Create a TaskCompletion for testing.
@@ -4819,6 +5687,817 @@ no_pty = true
         );
     }
 
+    /// Write a config whose service traces its own spawn and whose hook traces itself.
+    ///
+    /// `no_pty` is required for environments where openpty is disallowed, and the pattern
+    /// never matches so the only trigger under test is the one the test drives.
+    fn write_hook_trace_config(
+        config_path: &Path,
+        trace_path: &Path,
+        command_tail: &str,
+        cleanup_command: &str,
+        extra_service_fields: &str,
+    ) {
+        let config = format!(
+            r#"
+[[group]]
+name = "hooked"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "hooked"
+command = "echo start >> '{trace}'{tail}"
+cleanup_command = "{cleanup}"
+no_pty = true
+{extra}
+"#,
+            trace = trace_path.display(),
+            tail = command_tail,
+            cleanup = cleanup_command,
+            extra = extra_service_fields,
+        );
+        std::fs::write(config_path, config).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_command_runs_before_initial_start() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "; sleep 30",
+            &format!("echo cleanup >> '{}'; echo swept", trace_path.display()),
+            "",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        let trace = wait_for_trace(&trace_path, 2).await;
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace,
+            vec!["cleanup".to_string(), "start".to_string()],
+            "cleanup_command did not run before the initial spawn"
+        );
+
+        assert!(
+            logs.iter().any(|line| line.starts_with("cleanup: echo")),
+            "cleanup header missing from logs: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|line| line == "swept"),
+            "cleanup output missing from logs: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("cleanup completed in")),
+            "cleanup footer missing from logs: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_command_runs_before_every_restart() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        // The service exits as soon as it has traced itself, so the backoff restart path
+        // drives the second spawn.
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "",
+            &format!("echo cleanup >> '{}'", trace_path.display()),
+            "",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let mut trace = Vec::new();
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            trace = read_trace(&trace_path);
+            if trace.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        engine.shutdown().await.unwrap();
+
+        assert!(
+            trace.len() >= 4,
+            "service did not spawn twice; trace was {:?}",
+            trace
+        );
+        assert_eq!(
+            trace[..4],
+            ["cleanup", "start", "cleanup", "start"],
+            "cleanup_command did not run before the restart spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failing_cleanup_command_still_starts_service() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "; sleep 30",
+            &format!("echo cleanup >> '{}'; exit 3", trace_path.display()),
+            "",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let trace = wait_for_trace(&trace_path, 2).await;
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        let status = engine.groups.get("hooked").unwrap().state.services[0].status;
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(trace, vec!["cleanup".to_string(), "start".to_string()]);
+        assert_eq!(status, ProcessStatus::Running);
+        assert!(
+            logs.iter()
+                .any(|line| line == "cleanup failed: process exited with status 3"),
+            "nonzero cleanup exit was not reported: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unexpandable_cleanup_command_still_starts_service() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        // `${missing}` is undefined, and config load does not reject undefined variables, so
+        // the hook can only fail at spawn time.
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "; sleep 30",
+            &format!("echo cleanup-${{missing}} >> '{}'", trace_path.display()),
+            "",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let trace = wait_for_trace(&trace_path, 1).await;
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace,
+            vec!["start".to_string()],
+            "the hook must not run when its own expansion failed"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line == "cleanup skipped: undefined variable: ${missing}"),
+            "expansion failure was not reported: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silence_suppresses_cleanup_output_but_not_lifecycle_lines() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+
+        write_hook_trace_config(
+            &config_path,
+            &trace_path,
+            "; sleep 30",
+            &format!(
+                "echo cleanup >> '{}'; echo swept; echo griped >&2",
+                trace_path.display()
+            ),
+            r#"silence = "all""#,
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let trace = wait_for_trace(&trace_path, 2).await;
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(trace, vec!["cleanup".to_string(), "start".to_string()]);
+        assert!(
+            !logs.iter().any(|line| line == "swept" || line == "griped"),
+            "silence did not suppress cleanup output: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("cleanup completed in")),
+            "silence must not suppress the hook's own lifecycle lines: {:?}",
+            logs
+        );
+    }
+
+    /// Write a config whose service ignores SIGTERM and traces every spawn.
+    ///
+    /// The service touches `ready_path` once its trap is installed. Signalling before that
+    /// marker appears races the shell's own startup, where SIGTERM's default disposition
+    /// kills it outright and the escalation never gets exercised.
+    fn write_stubborn_service_config(
+        config_path: &Path,
+        trace_path: &Path,
+        ready_path: &Path,
+        stop_timeout: &str,
+    ) {
+        let config = format!(
+            r#"
+[[group]]
+name = "stubborn"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "stubborn"
+command = "trap '' TERM; echo start >> '{trace}'; : > '{ready}'; while true; do sleep 1; done"
+no_pty = true
+stop_timeout = "{timeout}"
+"#,
+            trace = trace_path.display(),
+            ready = ready_path.display(),
+            timeout = stop_timeout,
+        );
+        std::fs::write(config_path, config).unwrap();
+    }
+
+    /// Poll until the stubborn service has installed its SIGTERM trap.
+    async fn wait_until_trapping(ready_path: &Path) {
+        for _ in 0..200 {
+            if ready_path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("service never installed its SIGTERM trap");
+    }
+
+    #[tokio::test]
+    async fn test_restart_escalates_to_sigkill_when_the_stop_signal_is_ignored() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+        let ready_path = temp_dir.path().join("trapping");
+
+        write_stubborn_service_config(&config_path, &trace_path, &ready_path, "200ms");
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&ready_path).await;
+
+        engine
+            .restart_process("stubborn", "stubborn")
+            .await
+            .unwrap();
+
+        let mut trace = Vec::new();
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            trace = read_trace(&trace_path);
+            if trace.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        engine.process_incoming_logs().unwrap();
+        let logs: Vec<String> = engine
+            .get_logs("stubborn", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect();
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace.len(),
+            2,
+            "service that ignores SIGTERM never respawned; trace was {:?}",
+            trace
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("stop timeout expired after")),
+            "escalation was not reported to the operator: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_honors_a_service_stop_timeout() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let trace_path = temp_dir.path().join("trace");
+        let ready_path = temp_dir.path().join("trapping");
+
+        write_stubborn_service_config(&config_path, &trace_path, &ready_path, "200ms");
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&ready_path).await;
+
+        let started = Instant::now();
+        engine.shutdown().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "shutdown killed the service before its stop_timeout elapsed, taking {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown fell back to the fixed grace period instead of the service's own \
+             stop_timeout, taking {:?}",
+            elapsed
+        );
+    }
+
+    /// Files a hook-driven service test writes through.
+    struct HookPaths {
+        config: PathBuf,
+        trace: PathBuf,
+        ready: PathBuf,
+        pid: PathBuf,
+    }
+
+    fn hook_paths(dir: &Path) -> HookPaths {
+        HookPaths {
+            config: dir.join("zaz.toml"),
+            trace: dir.join("trace"),
+            ready: dir.join("trapping"),
+            pid: dir.join("pid"),
+        }
+    }
+
+    /// Write a config for a service whose stop runs through hooks.
+    ///
+    /// The service records its own process group so a hook can reach it, and traces every
+    /// spawn. Trapping SIGTERM is what makes a hook-driven stop observably different from a
+    /// signal-driven one: nothing else would tell them apart in the trace.
+    fn write_stop_hook_config(
+        paths: &HookPaths,
+        stop_timeout: &str,
+        trap_term: bool,
+        extra_service_fields: &str,
+    ) {
+        let trap = if trap_term { "trap '' TERM; " } else { "" };
+        let config = format!(
+            r#"
+[[group]]
+name = "hooked"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "hooked"
+command = "{trap}echo $$ > '{pid}'; echo start >> '{trace}'; : > '{ready}'; while true; do sleep 1; done"
+no_pty = true
+stop_timeout = "{timeout}"
+{extra}
+"#,
+            trap = trap,
+            pid = paths.pid.display(),
+            trace = paths.trace.display(),
+            ready = paths.ready.display(),
+            timeout = stop_timeout,
+            extra = extra_service_fields,
+        );
+        std::fs::write(&paths.config, config).unwrap();
+    }
+
+    /// A hook command that traces itself and then force kills the service it belongs to.
+    fn tracing_killer(paths: &HookPaths, marker: &str) -> String {
+        format!(
+            "echo {marker} >> '{trace}'; kill -KILL $(cat '{pid}')",
+            marker = marker,
+            trace = paths.trace.display(),
+            pid = paths.pid.display(),
+        )
+    }
+
+    /// Drive `check_services` until the trace holds `expected` markers.
+    async fn pump_until_trace(engine: &mut Engine, path: &Path, expected: usize) -> Vec<String> {
+        let mut trace = Vec::new();
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            trace = read_trace(path);
+            if trace.len() >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        trace
+    }
+
+    fn service_logs(engine: &mut Engine) -> Vec<String> {
+        engine.process_incoming_logs().unwrap();
+        engine
+            .get_logs("hooked", None)
+            .unwrap()
+            .into_iter()
+            .map(|line| line.content)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_stop_command_replaces_the_restart_signal() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        write_stop_hook_config(
+            &paths,
+            "5s",
+            true,
+            &format!(
+                r#"stop_command = "{}""#,
+                tracing_killer(&paths, "stop").replace('"', "\\\"")
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        let trace = pump_until_trace(&mut engine, &paths.trace, 3).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace[..3],
+            ["start", "stop", "start"],
+            "the stop hook did not replace the restart signal; trace was {:?}",
+            trace
+        );
+        assert!(
+            logs.iter().any(|line| line.starts_with("stop: echo stop")),
+            "stop hook header missing from logs: {:?}",
+            logs
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.starts_with("stop timeout expired")),
+            "the hook stopped the service, so nothing should have escalated: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_command_runs_on_shutdown() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        write_stop_hook_config(
+            &paths,
+            "5s",
+            true,
+            &format!(
+                r#"stop_command = "{}""#,
+                tracing_killer(&paths, "stop").replace('"', "\\\"")
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        let started = Instant::now();
+        engine.shutdown().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            read_trace(&paths.trace),
+            vec!["start".to_string(), "stop".to_string()],
+            "shutdown did not run the stop hook"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown waited out the stop timeout instead of the hook's own exit, taking {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kill_command_runs_when_the_stop_timeout_expires() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        // The stop hook only reports itself, so the service outlives its window and the
+        // kill hook is what actually ends it.
+        write_stop_hook_config(
+            &paths,
+            "200ms",
+            true,
+            &format!(
+                "stop_command = \"echo stop >> '{trace}'\"\nkill_command = \"{kill}\"",
+                trace = paths.trace.display(),
+                kill = tracing_killer(&paths, "kill").replace('"', "\\\""),
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        let trace = pump_until_trace(&mut engine, &paths.trace, 4).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace[..4],
+            ["start", "stop", "kill", "start"],
+            "the kill hook did not replace the escalation SIGKILL; trace was {:?}",
+            trace
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("stop timeout expired") && line.contains("kill command")),
+            "the escalation did not report running the kill command: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_stop_hook_outliving_its_window_is_killed_before_the_kill_command() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        write_stop_hook_config(
+            &paths,
+            "200ms",
+            true,
+            &format!(
+                "stop_command = \"echo stop >> '{trace}'; sleep 30\"\nkill_command = \"{kill}\"",
+                trace = paths.trace.display(),
+                kill = tracing_killer(&paths, "kill").replace('"', "\\\""),
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        let trace = pump_until_trace(&mut engine, &paths.trace, 4).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace[..4],
+            ["start", "stop", "kill", "start"],
+            "a hung stop hook blocked the kill hook; trace was {:?}",
+            trace
+        );
+
+        let escalation = logs
+            .iter()
+            .find(|line| line.starts_with("stop timeout expired"))
+            .unwrap_or_else(|| panic!("nothing reported the escalation: {:?}", logs));
+        let hook_kill = escalation
+            .find("killed the lifecycle hook")
+            .unwrap_or_else(|| panic!("the hung hook was not killed: {}", escalation));
+        let service_kill = escalation
+            .find("kill command")
+            .unwrap_or_else(|| panic!("the kill command did not run: {}", escalation));
+        assert!(
+            hook_kill < service_kill,
+            "the hung hook must be killed before the kill command runs: {}",
+            escalation
+        );
+
+        assert!(
+            logs.iter()
+                .any(|line| line == "stop failed: process was killed by a signal"),
+            "a killed hook must not report itself as completed: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unexpandable_stop_command_falls_back_to_the_signal() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        // `${missing}` is undefined, and config load does not reject undefined variables, so
+        // the hook can only fail at stop time. The service does not trap SIGTERM, so the
+        // fallback signal is enough to stop it.
+        write_stop_hook_config(
+            &paths,
+            "5s",
+            false,
+            &format!(
+                r#"stop_command = "echo stop-${{missing}} >> '{}'""#,
+                paths.trace.display()
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        let trace = pump_until_trace(&mut engine, &paths.trace, 2).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            trace[..2],
+            ["start", "start"],
+            "a hook that could not expand must not run; trace was {:?}",
+            trace
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line == "stop skipped: undefined variable: ${missing}"),
+            "expansion failure was not reported: {:?}",
+            logs
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.starts_with("stop timeout expired")),
+            "the fallback signal should have stopped the service without escalating: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silence_suppresses_stop_hook_output_but_not_lifecycle_lines() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        write_stop_hook_config(
+            &paths,
+            "5s",
+            true,
+            &format!(
+                "stop_command = \"echo swept; echo griped >&2; {kill}\"\nsilence = \"all\"",
+                kill = tracing_killer(&paths, "stop").replace('"', "\\\""),
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        pump_until_trace(&mut engine, &paths.trace, 3).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert!(
+            !logs.iter().any(|line| line == "swept" || line == "griped"),
+            "silence did not suppress stop hook output: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|line| line.starts_with("stop: echo swept")),
+            "silence must not suppress the hook's own header: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("stop completed in")),
+            "silence must not suppress the hook's own footer: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_waits_for_a_stop_hook_that_outlives_its_service() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let paths = hook_paths(temp_dir.path());
+
+        // The hook kills the service straight away and keeps working afterwards, which is
+        // what `docker stop` does once the container it waited on is gone.
+        write_stop_hook_config(
+            &paths,
+            "10s",
+            true,
+            &format!(
+                "stop_command = \"kill -KILL $(cat '{pid}'); sleep 1; echo late >> '{trace}'\"",
+                pid = paths.pid.display(),
+                trace = paths.trace.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&paths.config).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        wait_until_trapping(&paths.ready).await;
+
+        let started = Instant::now();
+        engine.shutdown().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            read_trace(&paths.trace),
+            vec!["start".to_string(), "late".to_string()],
+            "shutdown left before the stop hook finished"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "shutdown did not wait for the hook, taking {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "shutdown waited out the stop timeout instead of the hook's own exit, taking {:?}",
+            elapsed
+        );
+    }
+
     #[tokio::test]
     async fn test_trigger_dependents_on_restart_does_nothing_for_ready_groups() {
         // This test documents the current behavior: trigger_dependents only affects
@@ -4847,6 +6526,511 @@ no_pty = true
         assert_eq!(
             engine.groups.get("b").unwrap().state.status,
             GroupStatus::Ready
+        );
+    }
+
+    /// Write a config whose lone service waits on a readiness check the test controls.
+    ///
+    /// `no_pty` is required for environments where openpty is disallowed, and the pattern never
+    /// matches so the only trigger under test is the one the test drives.
+    fn write_ready_check_config(config_path: &Path, extra_service_fields: &str) {
+        let config = format!(
+            r#"
+[[group]]
+name = "hooked"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "hooked"
+command = "sleep 30"
+no_pty = true
+{extra}
+"#,
+            extra = extra_service_fields,
+        );
+        std::fs::write(config_path, config).unwrap();
+    }
+
+    fn ready_status(engine: &Engine) -> ProcessStatus {
+        engine.groups.get("hooked").unwrap().state.services[0].status
+    }
+
+    /// Drive `check_services` until the service reports `expected`, or give up after five
+    /// seconds. Readiness settles a tick or more after the probe that decided it, since the
+    /// probe runs detached and only a later tick reads its verdict.
+    async fn pump_until_status(engine: &mut Engine, expected: ProcessStatus) -> ProcessStatus {
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            if ready_status(engine) == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        ready_status(engine)
+    }
+
+    #[tokio::test]
+    async fn test_a_service_without_a_ready_check_is_running_the_moment_it_spawns() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+
+        write_ready_check_config(&config_path, "");
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        let status = ready_status(&engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            status,
+            ProcessStatus::Running,
+            "a service that configures no readiness check must behave exactly as it always has"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_service_stays_starting_until_its_ready_check_passes() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let marker = temp_dir.path().join("listening");
+
+        write_ready_check_config(
+            &config_path,
+            &format!(
+                "ready_check = \"test -f '{marker}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                marker = marker.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        assert_eq!(
+            ready_status(&engine),
+            ProcessStatus::Starting,
+            "a spawned service with a readiness check has not reported ready yet"
+        );
+
+        for _ in 0..5 {
+            engine.check_services().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            ready_status(&engine),
+            ProcessStatus::Starting,
+            "a check that keeps failing must not move the service on"
+        );
+
+        std::fs::write(&marker, "").unwrap();
+
+        let status = pump_until_status(&mut engine, ProcessStatus::Running).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(status, ProcessStatus::Running);
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("ready check: test -f")),
+            "the first probe must name the check being polled: {:?}",
+            logs
+        );
+        assert!(
+            logs.iter().any(|line| line.starts_with("ready after")),
+            "the pass must be reported: {:?}",
+            logs
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|line| line.starts_with("ready check: "))
+                .count(),
+            1,
+            "only the first probe of a window names the check; the rest would flood: {:?}",
+            logs
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_ready_check_that_never_passes_fails_the_service_but_leaves_it_running() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+
+        write_ready_check_config(
+            &config_path,
+            "ready_check = \"echo not listening yet >&2; exit 7\"\n\
+             ready_poll_interval = \"20ms\"\n\
+             ready_timeout = \"200ms\"",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        let status = pump_until_status(&mut engine, ProcessStatus::Failed).await;
+        let still_running = engine.groups.get_mut("hooked").unwrap().services[0].is_running();
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(status, ProcessStatus::Failed);
+        assert!(
+            still_running,
+            "tearing the service down would feed it back into the restart path and time out again"
+        );
+
+        let gave_up = logs
+            .iter()
+            .find(|line| line.starts_with("gave up waiting for readiness after"))
+            .unwrap_or_else(|| panic!("the timeout must be reported: {:?}", logs));
+        assert!(
+            gave_up.contains("exit code 7") && gave_up.contains("not listening yet"),
+            "the timeout must carry what the last check printed, got {:?}",
+            gave_up
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_restart_opens_a_fresh_readiness_window() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let marker = temp_dir.path().join("listening");
+        std::fs::write(&marker, "").unwrap();
+
+        write_ready_check_config(
+            &config_path,
+            &format!(
+                "ready_check = \"test -f '{marker}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                marker = marker.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        assert_eq!(
+            pump_until_status(&mut engine, ProcessStatus::Running).await,
+            ProcessStatus::Running
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        assert_eq!(
+            pump_until_status(&mut engine, ProcessStatus::Starting).await,
+            ProcessStatus::Starting,
+            "a respawned service owes its readiness check all over again"
+        );
+
+        std::fs::write(&marker, "").unwrap();
+
+        let status = pump_until_status(&mut engine, ProcessStatus::Running).await;
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(status, ProcessStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_an_unexpandable_ready_check_fails_the_service() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+
+        write_ready_check_config(
+            &config_path,
+            "ready_check = \"test -f ${no_such_variable}\"\n\
+             ready_poll_interval = \"20ms\"\n\
+             ready_timeout = \"10s\"",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        let status = pump_until_status(&mut engine, ProcessStatus::Failed).await;
+        let logs = service_logs(&mut engine);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            status,
+            ProcessStatus::Failed,
+            "a check that cannot be built is a check that can never pass, so waiting out the \
+             ten-second window would only reach the same verdict"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.starts_with("ready check skipped:")),
+            "the failed expansion must be reported: {:?}",
+            logs
+        );
+    }
+
+    /// Write a config where `api` depends on `web`, and `web`'s service carries the readiness
+    /// fields the test supplies.
+    ///
+    /// `api` holds a task rather than a service, so whether it started is visible in
+    /// `running_tasks` and not just in a status.
+    fn write_dependent_ready_config(config_path: &Path, marker: &Path, extra_service_fields: &str) {
+        let config = format!(
+            r#"
+[[group]]
+name = "web"
+patterns = ["*.never-matches"]
+
+[[group.service]]
+name = "web"
+command = "sleep 30"
+no_pty = true
+{extra}
+
+[[group]]
+name = "api"
+patterns = ["*.never-matches"]
+depends_on = ["web"]
+
+[[group.task]]
+name = "api"
+command = "touch '{marker}'"
+"#,
+            extra = extra_service_fields,
+            marker = marker.display(),
+        );
+        std::fs::write(config_path, config).unwrap();
+    }
+
+    fn group_status(engine: &Engine, group: &str) -> GroupStatus {
+        engine.groups.get(group).unwrap().state.status
+    }
+
+    /// Drive `check_services` until `group` reports `expected`, or give up after five seconds.
+    async fn pump_until_group(
+        engine: &mut Engine,
+        group: &str,
+        expected: GroupStatus,
+    ) -> GroupStatus {
+        for _ in 0..200 {
+            engine.check_services().await.unwrap();
+            engine.process_task_completions().await;
+            if group_status(engine, group) == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        group_status(engine, group)
+    }
+
+    #[tokio::test]
+    async fn test_a_dependent_waits_for_its_dependency_to_report_ready() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let listening = temp_dir.path().join("listening");
+        let api_ran = temp_dir.path().join("api-ran");
+
+        write_dependent_ready_config(
+            &config_path,
+            &api_ran,
+            &format!(
+                "ready_check = \"test -f '{listening}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                listening = listening.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        assert_eq!(
+            group_status(&engine, "web"),
+            GroupStatus::Running,
+            "a group whose service is still proving itself has not finished starting"
+        );
+        assert_eq!(group_status(&engine, "api"), GroupStatus::Waiting);
+
+        for _ in 0..5 {
+            engine.check_services().await.unwrap();
+            engine.process_task_completions().await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            group_status(&engine, "api"),
+            GroupStatus::Waiting,
+            "a dependent must not start while the check it waits on keeps failing"
+        );
+        assert!(
+            !api_ran.exists(),
+            "the dependent's task ran before its dependency could accept work"
+        );
+
+        std::fs::write(&listening, "").unwrap();
+
+        let web = pump_until_group(&mut engine, "web", GroupStatus::Ready).await;
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(web, GroupStatus::Ready);
+        assert!(
+            !engine.dependency_resolver.is_waiting("api"),
+            "the passing check must unblock the dependent"
+        );
+        assert!(
+            api_ran.exists(),
+            "the dependent never ran once its dependency reported ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_readiness_timeout_fails_its_group_and_skips_dependents() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let api_ran = temp_dir.path().join("api-ran");
+
+        write_dependent_ready_config(
+            &config_path,
+            &api_ran,
+            "ready_check = \"echo not listening yet >&2; exit 7\"\n\
+             ready_poll_interval = \"20ms\"\n\
+             ready_timeout = \"200ms\"",
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let web = pump_until_group(&mut engine, "web", GroupStatus::Failed).await;
+        let api = group_status(&engine, "api");
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            web,
+            GroupStatus::Failed,
+            "the group that broke must say so rather than read as skipped behind itself"
+        );
+        assert_eq!(api, GroupStatus::Skipped);
+        assert!(
+            !api_ran.exists(),
+            "a dependent behind a service that never came up must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_dependent_of_a_service_without_a_ready_check_starts_at_once() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let api_ran = temp_dir.path().join("api-ran");
+
+        write_dependent_ready_config(&config_path, &api_ran, "");
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let web = group_status(&engine, "web");
+        assert!(engine.wait_for_tasks().await);
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            web,
+            GroupStatus::Ready,
+            "a group with no readiness check anywhere must reach Ready the moment it spawns"
+        );
+        assert!(
+            api_ran.exists(),
+            "the dependent must start on spawn, exactly as it always has"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_readiness_checked_group_with_no_dependents_still_reaches_ready() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let listening = temp_dir.path().join("listening");
+        std::fs::write(&listening, "").unwrap();
+
+        write_ready_check_config(
+            &config_path,
+            &format!(
+                "ready_check = \"test -f '{listening}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                listening = listening.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+
+        let status = pump_until_group(&mut engine, "hooked", GroupStatus::Ready).await;
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            status,
+            GroupStatus::Ready,
+            "a group with nothing downstream still owes itself the transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_ready_group_stays_ready_while_a_restarted_service_checks_again() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        let listening = temp_dir.path().join("listening");
+        std::fs::write(&listening, "").unwrap();
+
+        write_ready_check_config(
+            &config_path,
+            &format!(
+                "ready_check = \"test -f '{listening}'\"\n\
+                 ready_poll_interval = \"20ms\"\n\
+                 ready_timeout = \"10s\"",
+                listening = listening.display(),
+            ),
+        );
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert_eq!(
+            pump_until_group(&mut engine, "hooked", GroupStatus::Ready).await,
+            GroupStatus::Ready
+        );
+
+        std::fs::remove_file(&listening).unwrap();
+        engine.restart_process("hooked", "hooked").await.unwrap();
+
+        assert_eq!(
+            pump_until_status(&mut engine, ProcessStatus::Starting).await,
+            ProcessStatus::Starting
+        );
+        let status = group_status(&engine, "hooked");
+        engine.shutdown().await.unwrap();
+
+        assert_eq!(
+            status,
+            GroupStatus::Ready,
+            "only the first transition is gated; a group already Ready keeps it while a \
+             respawned service checks again, the same as it does through a backoff"
         );
     }
 }

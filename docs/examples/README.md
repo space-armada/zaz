@@ -11,6 +11,10 @@ test, so the examples cannot silently fall out of sync.
 | [multi-group-dependencies/](multi-group-dependencies/README.md) | Backend + frontend monorepo with cross-group `depends_on`. |
 | [task-only-workflow/](task-only-workflow/README.md) | Lint and test loop with no services, suitable for pre-commit and CI. |
 | [pty-less-environment/](pty-less-environment/README.md) | Headless setup with `no_pty`, `delay`, and JSON logs. |
+| [docker-service/](docker-service/README.md) | Run a container as a service and stop it with `docker stop` rather than a signal. |
+| [local-service-cleanup/](local-service-cleanup/README.md) | Clear a stale lockfile and reach a process that left its tracked process group. |
+| [http-service-readiness/](http-service-readiness/README.md) | Hold a dependent group until an HTTP service answers on its health endpoint. |
+| [docker-service-readiness/](docker-service-readiness/README.md) | Wait on a container's own `HEALTHCHECK` before calling the service ready. |
 
 For the full schema, see [../configuration.md](../configuration.md). For
 subcommand and flag reference, see [../cli.md](../cli.md). Migration
