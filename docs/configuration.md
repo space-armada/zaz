@@ -17,19 +17,16 @@ relevant alias.
 
 ## File discovery
 
-zaz looks for `zaz.toml` first, then `zaz.json`, in the current working
-directory. Loading the config file is CWD-only — there is no walk up the
-directory tree. The first existing file wins. Override discovery with the
-global `--config` flag (see [cli.md](cli.md#global-flags)); when `--config`
-points at a file, the format is detected from the extension (`.toml` or
-`.json`).
+zaz walks upward from the current working directory looking for `zaz.toml`
+first, then `zaz.json`, and stops at the first directory holding either. The
+walk gives up at the filesystem root. So a command issued from anywhere inside
+a project resolves that project's config. Override discovery with the global
+`--config` flag (see [cli.md](cli.md#global-flags)); when `--config` points at
+a file, the format is detected from the extension (`.toml` or `.json`).
 
-Socket resolution is separate. Control commands that only talk to a running
-daemon — `zaz status`, `zaz restart`, `zaz stop`, `zaz reload` — do walk
-upward from the current directory to find a parent config, then derive the
-daemon socket from it. So a control command issued from a subdirectory reaches
-the project's daemon even though loading the config file itself stays CWD-only.
-See [Socket and config resolution](cli.md#socket-and-config-resolution).
+The daemon socket is derived from whichever config that walk found, so every
+subcommand agrees on both the config and the daemon it addresses. See
+[Socket and config resolution](cli.md#socket-and-config-resolution).
 
 ## Schema validation policy
 

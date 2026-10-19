@@ -19,37 +19,10 @@ pub use user::{
 };
 pub use validate::validate;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Default configuration file names to search for.
 pub const CONFIG_FILES: &[&str] = &["zaz.toml", "zaz.json"];
-
-/// Discover and load a configuration file from the current directory.
-///
-/// Searches for `zaz.toml` first, then `zaz.json`.
-pub fn discover() -> Result<(PathBuf, Config), ConfigError> {
-    discover_in(std::env::current_dir().map_err(|e| ConfigError::Io {
-        path: PathBuf::from("."),
-        source: e,
-    })?)
-}
-
-/// Discover and load a configuration file from the given directory.
-pub fn discover_in<P: AsRef<Path>>(dir: P) -> Result<(PathBuf, Config), ConfigError> {
-    let dir = dir.as_ref();
-
-    for filename in CONFIG_FILES {
-        let path = dir.join(filename);
-        if path.exists() {
-            let config = load(&path)?;
-            return Ok((path, config));
-        }
-    }
-
-    Err(ConfigError::NotFound {
-        searched: CONFIG_FILES.iter().map(|s| dir.join(s)).collect(),
-    })
-}
 
 /// Load configuration from a file, auto-detecting format by extension.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {

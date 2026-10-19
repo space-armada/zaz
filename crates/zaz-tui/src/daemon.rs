@@ -125,8 +125,11 @@ fn command_name(cmd: &ClientCommand) -> &'static str {
 impl DaemonConnection {
     /// Connect to the daemon at the given socket path.
     ///
-    /// Spawns a background task that handles async communication.
-    pub async fn connect(socket_path: &Path) -> Result<Self, TuiError> {
+    /// Spawns a background task that handles async communication. No socket is
+    /// touched here, so there is nothing to fail: the spawned task owns every
+    /// connection attempt behind its retry loop, and reports the outcome through
+    /// the shared `connected` flag.
+    pub async fn connect(socket_path: &Path) -> Self {
         tracing::debug!(
             socket = %socket_path.display(),
             "creating TUI daemon connection"
@@ -153,7 +156,7 @@ impl DaemonConnection {
             .await;
         });
 
-        Ok(Self {
+        Self {
             command_tx,
             state_rx,
             logs_rx,
@@ -161,7 +164,7 @@ impl DaemonConnection {
             connected,
             socket_path: socket_path.to_path_buf(),
             _task_handle: task_handle,
-        })
+        }
     }
 
     /// Check if we're currently connected to the daemon.
@@ -569,6 +572,14 @@ mod tests {
         assert_eq!(log.process, "server");
         assert_eq!(log.content, "Started on :8080");
         assert_eq!(log.source, LogSource::Process);
+    }
+
+    #[tokio::test]
+    async fn connect_succeeds_against_a_socket_nothing_is_listening_on() {
+        let connection = DaemonConnection::connect(Path::new("/nonexistent/zaz.sock")).await;
+
+        assert_eq!(connection.socket_path(), Path::new("/nonexistent/zaz.sock"));
+        assert!(!connection.is_connected());
     }
 
     #[test]

@@ -35,6 +35,32 @@ The two styles differ in their focus model:
   cycles backward, and arrow keys (or `h`/`l`) move within the grid. `j`/`k`
   scroll the focused pane's logs by a single line.
 
+## Status bar
+
+Both styles carry a connection indicator: a green `●` while the daemon
+connection is live, a red `○` while it is not. Beside it sits the connection
+state:
+
+| Text | Color | Meaning |
+|------|-------|---------|
+| `Connecting...` | dark gray | No daemon has answered yet since launch. |
+| the config name, prefixed `Loaded` in the Full style | default | Connected, state received. |
+| `Disconnected` | red | A live connection dropped. |
+| `Reconnected` | yellow | Reconnected, waiting for state to resync. |
+
+The status bar is the only place a missing daemon shows up. The TUI never
+fails to open because one is absent. It connects in the background and retries
+with exponential backoff capped at five seconds, so the bar advances on its own
+the moment a daemon appears.
+
+The distinction between the first and third rows is worth knowing. A daemon
+that has never answered leaves the bar on `Connecting...`; `Disconnected`
+means one was there and went away. So launching with `--no-autostart` against
+nothing shows `Connecting...` indefinitely, paired with the red `○`. Run
+`zaz status` to see the config and socket it is waiting on.
+
+Narrow or short terminals collapse the bar to the state text alone.
+
 ## Keyboard shortcuts
 
 Style-specific bindings are marked **Full** or **Multi-Pane**; rows without

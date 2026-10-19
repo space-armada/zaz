@@ -246,15 +246,14 @@ impl App {
     }
 
     /// Connect to the daemon.
-    pub async fn connect(&mut self, socket_path: &Path) -> Result<(), TuiError> {
+    pub async fn connect(&mut self, socket_path: &Path) {
         tracing::debug!(socket = %socket_path.display(), "App::connect starting");
-        let connection = DaemonConnection::connect(socket_path).await?;
+        let connection = DaemonConnection::connect(socket_path).await;
         tracing::debug!(
             socket = %connection.socket_path().display(),
             "App::connect initialized daemon connection"
         );
         self.daemon = Some(connection);
-        Ok(())
     }
 
     /// Check if connected to the daemon.

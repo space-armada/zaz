@@ -1,6 +1,6 @@
 //! Unix socket server.
 
-use crate::{ApiRequest, ApiResponse, DaemonError, EngineCommand};
+use crate::{ApiRequest, ApiResponse, ConfigOrigin, DaemonError, DaemonTarget, EngineCommand};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::os::unix::fs::PermissionsExt;
@@ -50,26 +50,26 @@ pub fn socket_path_for_config(config_path: &Path) -> PathBuf {
     state_dir.join(format!("{:016x}.sock", hash))
 }
 
-/// Resolve the daemon socket for a command invocation.
+/// Resolve the daemon a command invocation is addressing.
 ///
 /// Resolution order:
 /// 1. Explicit `--socket` override, if provided
 /// 2. Project config discovered by walking upward from `start_dir`
 /// 3. Actionable error if no project config can be found
-pub fn resolve_socket(
+pub fn resolve_target(
     explicit_socket: Option<PathBuf>,
     start_dir: &Path,
-) -> Result<PathBuf, DaemonError> {
+) -> Result<DaemonTarget, DaemonError> {
     if let Some(socket) = explicit_socket {
-        return Ok(socket);
+        return Ok(DaemonTarget::explicit(socket));
     }
 
-    let config_path =
-        discover_config_upward(start_dir).ok_or_else(|| DaemonError::SocketResolution {
+    let (config_path, origin) =
+        discover_config_with_origin(start_dir).ok_or_else(|| DaemonError::SocketResolution {
             start_dir: start_dir.to_path_buf(),
         })?;
 
-    Ok(socket_path_for_config(&config_path))
+    Ok(DaemonTarget::for_config(config_path, origin))
 }
 
 /// Walk upward from `start_dir` looking for a zaz config file.
@@ -77,23 +77,36 @@ pub fn resolve_socket(
 /// Returns the path of the first matching `zaz.toml` or `zaz.json` found, or
 /// `None` if the walk reaches the filesystem root without finding one.
 pub fn discover_config_upward(start_dir: &Path) -> Option<PathBuf> {
+    discover_config_with_origin(start_dir).map(|(path, _)| path)
+}
+
+/// Walk upward from `start_dir`, reporting whether the config was found in that
+/// directory or above it.
+///
+/// The distinction is what lets a message stay quiet about a config the operator
+/// is standing next to, and explain one that was found somewhere they cannot see.
+fn discover_config_with_origin(start_dir: &Path) -> Option<(PathBuf, ConfigOrigin)> {
     let mut current = if start_dir.is_file() {
         start_dir.parent()?.to_path_buf()
     } else {
         start_dir.to_path_buf()
     };
 
+    let mut origin = ConfigOrigin::CurrentDir;
+
     loop {
         for filename in zaz_config::CONFIG_FILES {
             let path = current.join(filename);
             if path.is_file() {
-                return Some(path);
+                return Some((path, origin));
             }
         }
 
         if !current.pop() {
             return None;
         }
+
+        origin = ConfigOrigin::Upward;
     }
 }
 
@@ -132,7 +145,7 @@ pub fn discover_workspace_root_upward(start_dir: &Path) -> Option<PathBuf> {
 
 /// Resolve the workspace supervisor's socket for a command invocation.
 ///
-/// Resolution order mirrors [`resolve_socket`]:
+/// Resolution order mirrors [`resolve_target`]:
 /// 1. Explicit `--socket` override, if provided
 /// 2. `<root>/.zaz/daemon.sock` for the nearest workspace root above `start_dir`
 /// 3. Actionable error if no workspace root can be found
@@ -414,30 +427,33 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_socket_explicit_socket_wins() {
+    fn test_resolve_target_explicit_socket_wins() {
         let temp = TempDir::new().unwrap();
         let config_path = temp.path().join("zaz.toml");
         std::fs::write(&config_path, "").unwrap();
 
         let explicit = temp.path().join("custom.sock");
-        let resolved = resolve_socket(Some(explicit.clone()), temp.path()).unwrap();
+        let target = resolve_target(Some(explicit.clone()), temp.path()).unwrap();
 
-        assert_eq!(resolved, explicit);
+        assert_eq!(target, DaemonTarget::explicit(explicit));
+        assert_eq!(target.config(), None);
     }
 
     #[test]
-    fn test_resolve_socket_uses_local_toml_config() {
+    fn test_resolve_target_uses_local_toml_config() {
         let temp = TempDir::new().unwrap();
         let config_path = temp.path().join("zaz.toml");
         std::fs::write(&config_path, "").unwrap();
 
-        let resolved = resolve_socket(None, temp.path()).unwrap();
+        let target = resolve_target(None, temp.path()).unwrap();
 
-        assert_eq!(resolved, socket_path_for_config(&config_path));
+        assert_eq!(target.socket(), socket_path_for_config(&config_path));
+        assert_eq!(target.config(), Some(config_path.as_path()));
+        assert_eq!(target.config_origin(), Some(ConfigOrigin::CurrentDir));
     }
 
     #[test]
-    fn test_resolve_socket_walks_upward_to_parent_config() {
+    fn test_resolve_target_walks_upward_to_parent_config() {
         let temp = TempDir::new().unwrap();
         let config_path = temp.path().join("zaz.toml");
         std::fs::write(&config_path, "").unwrap();
@@ -445,42 +461,56 @@ mod tests {
         let nested = temp.path().join("a/b/c");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let resolved = resolve_socket(None, &nested).unwrap();
+        let target = resolve_target(None, &nested).unwrap();
 
-        assert_eq!(resolved, socket_path_for_config(&config_path));
+        assert_eq!(target.socket(), socket_path_for_config(&config_path));
+        assert_eq!(target.config(), Some(config_path.as_path()));
+        assert_eq!(target.config_origin(), Some(ConfigOrigin::Upward));
     }
 
     #[test]
-    fn test_resolve_socket_prefers_toml_before_json() {
+    fn test_resolve_target_prefers_toml_before_json() {
         let temp = TempDir::new().unwrap();
         let toml_path = temp.path().join("zaz.toml");
         let json_path = temp.path().join("zaz.json");
         std::fs::write(&toml_path, "").unwrap();
         std::fs::write(&json_path, "{}").unwrap();
 
-        let resolved = resolve_socket(None, temp.path()).unwrap();
+        let target = resolve_target(None, temp.path()).unwrap();
 
-        assert_eq!(resolved, socket_path_for_config(&toml_path));
+        assert_eq!(target.socket(), socket_path_for_config(&toml_path));
     }
 
     #[test]
-    fn test_resolve_socket_uses_json_when_toml_absent() {
+    fn test_resolve_target_uses_json_when_toml_absent() {
         let temp = TempDir::new().unwrap();
         let json_path = temp.path().join("zaz.json");
         std::fs::write(&json_path, "{}").unwrap();
 
-        let resolved = resolve_socket(None, temp.path()).unwrap();
+        let target = resolve_target(None, temp.path()).unwrap();
 
-        assert_eq!(resolved, socket_path_for_config(&json_path));
+        assert_eq!(target.socket(), socket_path_for_config(&json_path));
     }
 
     #[test]
-    fn test_resolve_socket_errors_when_no_project_config_found() {
+    fn test_discover_config_upward_returns_the_path_alone() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let nested = temp.path().join("a/b/c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(discover_config_upward(&nested), Some(config_path));
+    }
+
+    #[test]
+    fn test_resolve_target_errors_when_no_project_config_found() {
         let temp = TempDir::new().unwrap();
         let nested = temp.path().join("a/b/c");
         std::fs::create_dir_all(&nested).unwrap();
 
-        let err = resolve_socket(None, &nested).unwrap_err();
+        let err = resolve_target(None, &nested).unwrap_err();
 
         match &err {
             DaemonError::SocketResolution { start_dir } => assert_eq!(start_dir, &nested),

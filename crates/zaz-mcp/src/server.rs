@@ -4,7 +4,7 @@
 //! `zaz_config` which loads the project config directly from disk. The bin
 //! resolves the daemon socket and an optional explicit config path, then hands
 //! them to [`run`] via [`McpRunOptions`]; this crate does not invoke
-//! `resolve_socket` itself. `zaz_shutdown` is intentionally not exposed.
+//! `resolve_target` itself. `zaz_shutdown` is intentionally not exposed.
 
 use std::path::PathBuf;
 

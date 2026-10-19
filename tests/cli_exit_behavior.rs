@@ -240,7 +240,9 @@ fn stop_returns_zero_when_daemon_is_not_running() {
     let stdout = stdout_string(&output);
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(stdout.contains("No daemon running"));
+    assert!(stdout.contains("no daemon running at"));
+    assert!(stdout.contains(socket));
+    assert!(!stdout.contains("hint:"));
 }
 
 #[test]
@@ -271,7 +273,7 @@ fn status_returns_exit_code_3_when_daemon_is_not_running() {
     assert_eq!(output.status.code(), Some(3));
     assert!(stdout.contains("no daemon running at"));
     assert!(stdout.contains(socket));
-    assert!(stdout.contains("hint: start a daemon with `zaz start`"));
+    assert!(stdout.contains("hint: start one with `zaz start`"));
 }
 
 #[test]
@@ -378,7 +380,7 @@ fn reload_returns_nonzero_when_daemon_is_not_running() {
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr.contains("no daemon running at"));
     assert!(stderr.contains(socket));
-    assert!(stderr.contains("hint: start a daemon with `zaz start`"));
+    assert!(stderr.contains("hint: start one with `zaz start`"));
 }
 
 #[test]

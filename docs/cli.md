@@ -68,29 +68,81 @@ scripted consumers can parse `zaz` output without regexing free-form prose,
 and so operators always know where the recovery suggestion lives.
 
 - **Recovery hints are structured.** Error types whose recovery prose is
-  fixed per variant — `DaemonError` in `crates/zaz-daemon/src/error.rs` and
-  `McpError` in `crates/zaz-mcp/src/error.rs` — expose a
+  fixed per variant — `DaemonError` in `crates/zaz-daemon/src/error.rs`,
+  `McpError` in `crates/zaz-mcp/src/error.rs`, and `ConfigError` in
+  `crates/zaz-config/src/error.rs` — expose a
   `pub fn hint(&self) -> Option<&'static str>` accessor. `ValidationError`
   in `crates/zaz-config/src/error.rs` carries an instance-level
   `hint: Option<String>` field instead, because the disambiguation text
   depends on construction-site context.
-- **Hints render on a separate line.** The binary's `report_error`
-  printer in `src/main.rs` walks the `anyhow` error chain, finds the first
-  variant that exposes a hint, and emits two lines: an `Error: <message>`
-  line followed by an indented `hint: <recovery>` line. ANSI coloring is
+- **A message explains only what zaz derived.** A path the operator typed
+  is echoed back with no commentary. A path zaz picked on their behalf
+  gets a labeled line saying where it came from. This rule decides which
+  lines a block carries. Two invocations of the same subcommand can print
+  different numbers of lines.
+- **Annotations and hints share a label column.** The binary's
+  `report_error` printer in `src/main.rs` walks the `anyhow` error chain
+  and emits an `Error: <message>` line, then any labeled annotation lines
+  the error carries, then a `hint: <recovery>` line when a variant in the
+  chain exposes one. Every label right-aligns to the same colon, so a
+  block with three annotations reads as one paragraph. ANSI coloring is
   gated on `std::io::stderr().is_terminal()`, so non-TTY consumers see
-  plain text and substring matchers stay stable. The same shape powers
-  `zaz check`'s validation pretty-printer.
-- **Daemon-API verbs share wording.** The four verbs that talk to a
-  running daemon (`status`, `restart`, `stop`, `reload`) route through
-  two helpers in `src/main.rs`: `connect_or_no_daemon` and
-  `handle_daemon_response`. The wording is uniform across all four:
-  `no daemon running at <socket>` (with a hint pointing at `zaz start`
-  and `--socket <PATH>`), `<verb> failed: <message>` on an API error, and
-  `<verb> returned unexpected response` on the catch-all branch. The
-  inner `Error:` prefix that earlier versions of zaz emitted is gone;
-  the top-level `report_error` printer is the only source of that
-  prefix.
+  plain text and substring matchers stay stable. `zaz check`'s validation
+  printer follows the same idea, message first and `hint:` on its own line
+  beneath, but at its own indent rather than in this column.
+- **Daemon-API verbs share wording.** All four verbs that talk to a
+  running daemon (`status`, `restart`, `stop`, `reload`) render the
+  daemon's reply through `handle_daemon_response` in `src/main.rs`. An API
+  error reads `<verb> failed: <message>`, and any other response shape
+  reads `<verb> returned unexpected response`. The inner `Error:` prefix
+  that earlier versions of zaz emitted is gone; the top-level
+  `report_error` printer is the only source of that prefix. An absent
+  daemon splits two ways: `restart` and `reload` raise it through
+  `connect_or_no_daemon`, while `status` and `stop` call `print_no_daemon`
+  themselves so the same block reaches stdout.
+
+The absent-daemon block carries the most annotation:
+
+```text
+no daemon running for /Users/ripta/projects/foo/zaz.toml
+     socket: /Users/ripta/.local/state/zaz/224a65439e7efcfa.sock
+     config: found by searching upward from the current directory
+       hint: start one with `zaz start`
+```
+
+The first line names the config, because that is the artifact the operator
+wrote and can open. The socket is a derived address, so it moves to a
+labeled line where it reads as evidence rather than as a mystery. Which
+lines appear depends on what the operator supplied:
+
+| Operator passed | First line | `socket:` | `config:` |
+|-----------------|------------|-----------|-----------|
+| `--socket <PATH>` | `no daemon running at <socket>` | omitted | omitted |
+| `--config <PATH>` | `no daemon running for <config>` | shown | omitted |
+| nothing, config in CWD | `no daemon running for <config>` | shown | omitted |
+| nothing, config found above | `no daemon running for <config>` | shown | shown |
+
+An explicit `--socket` derives nothing, so nothing is explained. A config
+sitting in the directory the operator is standing in explains itself,
+because the printed path already ends there.
+
+Where the block lands follows the exit-policy categories:
+
+- `status` and `stop` print it on stdout. An absent daemon is their
+  outcome, not their failure. `stop` also drops the `hint:` line: an
+  operator who asked to stop a daemon has no use for a suggestion to start
+  one.
+- `restart` and `reload` raise it, so it reaches stderr under the `Error:`
+  prefix with the hint intact.
+
+`DaemonError::SocketResolution` keeps the `--socket <PATH>` mention that the
+no-daemon hint drops. It fires when no config exists anywhere above the
+current directory. That is the one case where the flag genuinely is the
+recovery.
+
+A missing config file is a separate error. It reads
+`no zaz.toml or zaz.json found in <dir> or any parent directory`, with
+`hint: create one, or pass --config <PATH>`.
 
 Adding a new error variant with a recovery action means adding it to
 `hint()` (or, for context-bearing variants, attaching a `hint` at the
@@ -116,18 +168,28 @@ under [zaz (default, TUI mode)](#zaz-default-tui-mode).
 
 ## Socket and config resolution
 
-Every subcommand resolves its target socket the same way:
+Every subcommand resolves the same way, whether it loads the config or only
+addresses a daemon:
 
-1. If `--socket <PATH>` is passed, use it verbatim. Explicit always wins.
-2. Otherwise, discover the project config by walking upward from CWD until
-   `zaz.toml` or `zaz.json` is found (or the path supplied to `--config` is
-   used directly). The socket is then derived from that config's directory:
-   if the directory contains a `.zaz/` directory, the socket is
-   `<dir>/.zaz/daemon.sock`; otherwise it is derived deterministically from
-   the canonical config path via a hash (`~/.local/state/zaz/<hash>.sock`),
-   so two different project directories never share a socket by accident.
-3. If no config is found and no `--socket` is given, the command errors with
+1. If `--config <PATH>` is passed, that file is the config. If
+   `--socket <PATH>` is passed, that path is the socket verbatim. Explicit
+   always wins, and `--socket` wins over `--config` when both are given.
+2. Otherwise, discover the project config by walking upward from CWD, taking
+   the first `zaz.toml` or `zaz.json` found. `zaz.toml` wins over `zaz.json`
+   within a directory. The walk gives up at the filesystem root.
+3. The socket is derived from that config's directory: if the directory
+   contains a `.zaz/` directory, the socket is `<dir>/.zaz/daemon.sock`;
+   otherwise it is derived deterministically from the canonical config path
+   via a hash (`~/.local/state/zaz/<hash>.sock`), so two different project
+   directories never share a socket by accident.
+4. If no config is found and no `--socket` is given, the command errors with
    an actionable message rather than falling back to a global default.
+
+The upward walk is what lets a command run from anywhere inside a project and
+still reach that project. `zaz`, `zaz task`, `zaz daemon`, `zaz start`,
+`zaz check`, `zaz mcp`, and the four daemon-API verbs all share it. A recovery
+hint printed from a subdirectory therefore names a command that works from that
+same subdirectory.
 
 A workspace supervisor follows the same `.zaz/` convention one level up: it
 binds `<workspace-root>/.zaz/daemon.sock`, where the workspace root is the
@@ -222,6 +284,19 @@ The TUI is documented in [tui.md](tui.md), including styles, keyboard
 shortcuts, and filter/search semantics. `--full` and `--multi-pane` choose a
 style at launch and override any user-config preference.
 
+Before autostarting, `zaz` loads and validates the config. An invalid config
+fails the launch with the config's path and its error, and the TUI does not
+open. An
+autostarted daemon that exits before it answers also fails the launch, naming
+the daemon output log. Neither check runs when a daemon is already answering
+on the socket.
+
+Past those checks, the TUI has no connect-failure message. It opens whether
+or not a daemon answers, and connects in the background with a retry loop. An
+absent daemon surfaces only in the status bar, which holds a red `○` and
+`Connecting...` until one appears; see [Status bar](tui.md#status-bar). Run `zaz status` for
+the full no-daemon block naming the config and the socket it is waiting on.
+
 Examples:
 
 ```sh
@@ -301,6 +376,12 @@ Exits `0` whether the daemon was running and was stopped, or was already
 absent. Operational errors (socket I/O failure, API error during shutdown)
 still exit `1`.
 
+When no daemon was running, `stop` prints the no-daemon block on stdout with
+the `hint:` line omitted; see
+[Error-message contract](#error-message-contract). Naming the config and
+showing the derived socket is what tells an operator whether they stopped the
+daemon they meant to.
+
 <!-- BEGIN: zaz stop -->
 This subcommand takes no arguments or flags.
 
@@ -318,7 +399,9 @@ short summary of running groups when it is.
 | `3` | daemon not running |
 
 The `3` exit is the LSB / `systemctl` "not running" convention; scripts can
-distinguish "absent" from "broken" without parsing stderr.
+distinguish "absent" from "broken" without parsing stderr. The `3` case
+prints the full no-daemon block on stdout, hint included; see
+[Error-message contract](#error-message-contract).
 
 <!-- BEGIN: zaz status -->
 This subcommand takes no arguments or flags.
@@ -363,9 +446,9 @@ This subcommand takes no arguments or flags.
 ### zaz check
 
 Validates a project config file without starting a daemon. With no argument,
-checks the result of [Socket and config resolution](#socket-and-config-resolution)
-(typically `./zaz.toml` or `./zaz.json`). Exits `0` on success and `1` when
-validation or parsing fails.
+checks the result of [Socket and config resolution](#socket-and-config-resolution),
+which is the nearest `zaz.toml` or `zaz.json` at or above the current
+directory. Exits `0` on success and `1` when validation or parsing fails.
 
 `--json` emits a single JSON object on stdout. Schema:
 

@@ -39,11 +39,12 @@ The Complete example at the bottom converts to
 ## File discovery
 
 modd reads `./modd.conf` by default and accepts `-f path` to point
-elsewhere. zaz looks for `zaz.toml` first, then `zaz.json`, **only** in the
-current working directory. There is no walk up the tree. For a
-non-default path, pass the global `--config` flag described in
-[../cli.md](../cli.md#global-flags); the format is detected from the
-extension.
+elsewhere. zaz walks upward from the current working directory, looking for
+`zaz.toml` first and then `zaz.json`, and stops at the first directory
+holding either. So a command run from anywhere inside a project finds that
+project's config. For a non-default path, pass the global `--config` flag
+described in [../cli.md](../cli.md#global-flags); the format is detected from
+the extension.
 
 ```sh
 # modd
@@ -467,7 +468,7 @@ list.
 
 ### File discovery
 
-Already covered above, but worth reiterating: zaz only searches the
+Already covered above, but worth reiterating: zaz searches upward from the
 current working directory for `zaz.toml` / `zaz.json`. modd's
 `-c`/`--noconf` (don't watch the config file) has no zaz equivalent; zaz
 does not auto-reload on config changes. Use `zaz reload` to apply config

@@ -8,9 +8,20 @@ use thiserror::Error;
 /// Errors that can occur when loading or parsing configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// No configuration file found.
-    #[error("no configuration file found, searched: {}", format_paths(.searched))]
-    NotFound { searched: Vec<PathBuf> },
+    /// No configuration file found by the walk upward from `start_dir`.
+    ///
+    /// The walk visits every directory between `start_dir` and the filesystem
+    /// root, so listing the paths it probed would print near-identical lines to
+    /// say one thing. The message names where the walk began instead.
+    #[error(
+        "no {} found in {} or any parent directory",
+        format_filenames(.filenames),
+        .start_dir.display()
+    )]
+    NotFound {
+        start_dir: PathBuf,
+        filenames: &'static [&'static str],
+    },
 
     /// Failed to read configuration file.
     #[error("failed to read config file {path}: {source}")]
@@ -481,12 +492,8 @@ impl<'a> IntoIterator for &'a ValidationErrors {
     }
 }
 
-fn format_paths(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+fn format_filenames(filenames: &[&str]) -> String {
+    filenames.join(" or ")
 }
 
 fn format_span(span: &Option<Range<usize>>) -> String {
@@ -497,6 +504,15 @@ fn format_span(span: &Option<Range<usize>>) -> String {
 }
 
 impl ConfigError {
+    /// Recovery suggestion for variants where a concrete next step exists.
+    /// Returns `None` for terminal errors with no actionable recovery.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::NotFound { .. } => Some("create one, or pass --config <PATH>"),
+            _ => None,
+        }
+    }
+
     /// Check if this is a "not found" error.
     pub fn is_not_found(&self) -> bool {
         matches!(self, ConfigError::NotFound { .. })
@@ -515,11 +531,31 @@ mod tests {
     #[test]
     fn test_not_found_error_display() {
         let err = ConfigError::NotFound {
-            searched: vec![PathBuf::from("zaz.toml"), PathBuf::from("zaz.json")],
+            start_dir: PathBuf::from("/tmp/project/crates"),
+            filenames: &["zaz.toml", "zaz.json"],
         };
-        let msg = err.to_string();
-        assert!(msg.contains("zaz.toml"));
-        assert!(msg.contains("zaz.json"));
+
+        assert_eq!(
+            err.to_string(),
+            "no zaz.toml or zaz.json found in /tmp/project/crates or any parent directory"
+        );
+    }
+
+    #[test]
+    fn test_not_found_error_hint() {
+        let err = ConfigError::NotFound {
+            start_dir: PathBuf::from("/tmp/project/crates"),
+            filenames: &["zaz.toml", "zaz.json"],
+        };
+
+        assert_eq!(err.hint(), Some("create one, or pass --config <PATH>"));
+        assert_eq!(
+            ConfigError::UnknownFormat {
+                path: PathBuf::from("zaz.yaml")
+            }
+            .hint(),
+            None
+        );
     }
 
     #[test]
