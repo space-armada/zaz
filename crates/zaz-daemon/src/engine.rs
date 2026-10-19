@@ -1069,6 +1069,16 @@ impl Engine {
         let user_config = zaz_config::load_user_config();
         let notification_config = user_config.notifications;
 
+        // A bare filename has an empty parent, which is not a usable directory. Making the path
+        // absolute once keeps every directory derived from it valid. It avoids `canonicalize` so
+        // symlinks in the path are preserved.
+        let config_path = std::path::absolute(&config_path).map_err(|source| {
+            DaemonError::Config(zaz_config::ConfigError::Io {
+                path: config_path.clone(),
+                source,
+            })
+        })?;
+
         // Determine the config directory for variable expansion
         let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 

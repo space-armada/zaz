@@ -67,6 +67,46 @@ fn task_returns_zero_when_all_tasks_succeed() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+// Each case runs a `pwd` task so the assertion covers the default working directory and not only
+// the watcher setup.
+#[test]
+fn task_resolves_relative_config_paths_against_the_current_directory() {
+    let temp = TempDir::new().unwrap();
+    let nested = temp.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let config_path = nested.join("zaz.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[[group]]
+name = "tasks"
+
+[[group.task]]
+name = "where"
+command = "pwd"
+"#,
+    )
+    .unwrap();
+
+    let cases = [
+        ("bare filename", nested.as_path(), "zaz.toml"),
+        ("dot-relative", nested.as_path(), "./zaz.toml"),
+        ("other directory", temp.path(), "nested/zaz.toml"),
+    ];
+
+    for (name, current_dir, config) in cases {
+        let output = run_zaz(current_dir, &["--config", config, "task"]);
+        let stdout = stdout_string(&output);
+        let stderr = stderr_string(&output);
+
+        assert_eq!(output.status.code(), Some(0), "{name}: stderr: {stderr}");
+        assert!(
+            stdout.contains("/nested"),
+            "{name}: task did not run in the config directory: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn task_returns_nonzero_when_any_task_fails() {
     let temp = TempDir::new().unwrap();
