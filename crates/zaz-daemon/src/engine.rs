@@ -5,7 +5,7 @@
 use crate::api::LogLine;
 use crate::dependency::DependencyResolver;
 use crate::env::{self, GroupEnv, ProcessRef};
-use crate::evaluate::{self, EvaluatedEnv};
+use crate::evaluate::{self, EvaluatedEnv, Prepared};
 use crate::log_storage::{LogQuery, LogQueryResult, LogStorage};
 use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
@@ -979,6 +979,12 @@ pub enum ReloadResult {
     Failed(String),
 }
 
+/// The groups of a config being applied, built before any running service is stopped.
+struct StagedGroups {
+    patterns: HashMap<String, PatternSet>,
+    built: HashMap<String, ManagedGroup>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ConfigDiff {
     added: Vec<String>,
@@ -1049,29 +1055,32 @@ impl ManagedGroup {
 
 impl Engine {
     /// Create a new engine from a configuration file.
-    pub fn new(config_path: &Path) -> Result<Self, DaemonError> {
-        Self::with_mode(config_path, true, false)
-    }
-
-    /// Create a new engine from a configuration file in task-only mode.
-    pub fn new_task_only(config_path: &Path) -> Result<Self, DaemonError> {
-        Self::with_mode(config_path, true, true)
-    }
-
-    /// Create a new engine with options.
     ///
-    /// `verbose_output` controls whether process output is printed to stdout.
-    pub fn with_options(config_path: &Path, verbose_output: bool) -> Result<Self, DaemonError> {
-        Self::with_mode(config_path, verbose_output, false)
+    /// This blocks on the config's sources. The daemon builds its engine from a load that ran
+    /// elsewhere instead.
+    pub fn new(config_path: &Path) -> Result<Self, DaemonError> {
+        let config_path =
+            zaz_config::absolute_config_path(config_path).map_err(DaemonError::Config)?;
+        let prepared = evaluate::prepare(&config_path)?;
+
+        Self::from_prepared(prepared, config_path, true, false)
     }
 
-    fn with_mode(
-        config_path: &Path,
-        verbose_output: bool,
-        task_only: bool,
-    ) -> Result<Self, DaemonError> {
-        let config = zaz_config::load(config_path).map_err(DaemonError::Config)?;
-        Self::from_config_with_mode(config, config_path.to_path_buf(), verbose_output, task_only)
+    /// Create a task-only engine, awaiting the load and evaluation of its config.
+    ///
+    /// The evaluation runs on its own thread, so a source that blocks does not pin a runtime
+    /// worker. `zaz task` has no event loop, so this is the one place it waits.
+    pub async fn load_task_only(config_path: &Path) -> Result<Self, DaemonError> {
+        let config_path =
+            zaz_config::absolute_config_path(config_path).map_err(DaemonError::Config)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        evaluate::prepare_detached(config_path.clone(), move |result| {
+            let _ = tx.send(result);
+        });
+
+        let prepared = rx.await.unwrap_or(Err(DaemonError::EvaluationPanicked))?;
+
+        Self::from_prepared(prepared, config_path, true, true)
     }
 
     /// Create a new engine from a loaded configuration.
@@ -1080,26 +1089,35 @@ impl Engine {
         config_path: PathBuf,
         verbose_output: bool,
     ) -> Result<Self, DaemonError> {
-        Self::from_config_with_mode(config, config_path, verbose_output, false)
+        let config_path =
+            zaz_config::absolute_config_path(&config_path).map_err(DaemonError::Config)?;
+        let evaluated = evaluate::evaluate(&config, &config_path).map_err(DaemonError::EnvFile)?;
+
+        Self::from_prepared(
+            Prepared { config, evaluated },
+            config_path,
+            verbose_output,
+            false,
+        )
     }
 
-    fn from_config_with_mode(
-        config: Config,
+    /// Build an engine from a config that is already loaded and evaluated.
+    ///
+    /// `config_path` must be absolute. This does no source reads, so it is quick.
+    pub(crate) fn from_prepared(
+        prepared: Prepared,
         config_path: PathBuf,
         verbose_output: bool,
         task_only: bool,
     ) -> Result<Self, DaemonError> {
+        let Prepared { config, evaluated } = prepared;
+
         // Load user config for notification settings
         let user_config = zaz_config::load_user_config();
         let notification_config = user_config.notifications;
 
-        let config_path =
-            zaz_config::absolute_config_path(&config_path).map_err(DaemonError::Config)?;
-
         // Determine the config directory for variable expansion
         let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-
-        let evaluated = evaluate::evaluate(&config, &config_path).map_err(DaemonError::EnvFile)?;
 
         // Create watcher configuration
         let watcher_config = WatcherConfig {
@@ -1150,6 +1168,7 @@ impl Engine {
                 .collect(),
             watched_files: 0,
             last_change: None,
+            ..Default::default()
         };
 
         // Create broadcast channel for status updates (capacity 16)
@@ -1248,6 +1267,12 @@ impl Engine {
     /// Get current daemon state.
     pub fn state(&self) -> &DaemonState {
         &self.state
+    }
+
+    /// A refreshed copy of the daemon state, as a status request reports it.
+    pub(crate) fn status_snapshot(&mut self) -> DaemonState {
+        self.update_state();
+        self.state.clone()
     }
 
     /// Subscribe to status updates.
@@ -2363,39 +2388,89 @@ impl Engine {
         Ok(())
     }
 
-    /// Reload configuration from the file.
+    /// Reload configuration from the file, blocking on its sources.
+    ///
+    /// The daemon does not call this. It loads and evaluates on a separate thread and hands the
+    /// result to [`Engine::apply_prepared`], so a slow source never stalls its event loop. This
+    /// form is for callers that have no event loop to protect.
+    pub async fn reload_config(&mut self) -> ReloadResult {
+        tracing::info!(path = %self.config_path.display(), "reloading configuration");
+
+        match evaluate::prepare(&self.config_path) {
+            Ok(prepared) => self.apply_prepared(prepared).await,
+            Err(e) => Self::prepare_failure(&e),
+        }
+    }
+
+    /// The API answer to a reload.
+    pub(crate) fn reload_response(result: ReloadResult) -> ApiResponse {
+        match result {
+            ReloadResult::Success {
+                added,
+                removed,
+                modified,
+            } => ApiResponse::ok_with_message(format!(
+                "config reloaded: {} added, {} removed, {} modified",
+                added.len(),
+                removed.len(),
+                modified.len()
+            )),
+            ReloadResult::Failed(e) => ApiResponse::error(format!("reload failed: {}", e)),
+        }
+    }
+
+    /// The reload result for a config that failed to load or evaluate. The running config stays
+    /// in place.
+    pub(crate) fn prepare_failure(error: &DaemonError) -> ReloadResult {
+        match error {
+            DaemonError::Config(e) => {
+                tracing::error!(error = %e, "failed to parse config");
+                ReloadResult::Failed(format!("parse error: {}", e))
+            }
+            DaemonError::EnvFile(_) => {
+                tracing::error!(error = %error, "failed to evaluate config sources");
+                ReloadResult::Failed(format!("environment error: {}", error))
+            }
+            other => {
+                tracing::error!(error = %other, "failed to load config");
+                ReloadResult::Failed(format!("{}", other))
+            }
+        }
+    }
+
+    /// Apply a freshly loaded and evaluated config.
     ///
     /// This:
-    /// 1. Parses and validates the new config
+    /// 1. Works out everything that can fail, while the running config is untouched
     /// 2. Stops services in removed/modified groups
     /// 3. Updates group configurations
     /// 4. Starts services in new/modified groups
     /// 5. Broadcasts reload status
-    pub async fn reload_config(&mut self) -> ReloadResult {
-        tracing::info!(path = %self.config_path.display(), "reloading configuration");
+    pub(crate) async fn apply_prepared(&mut self, prepared: Prepared) -> ReloadResult {
+        let Prepared {
+            config: new_config,
+            evaluated: new_evaluated,
+        } = prepared;
 
-        // 1. Parse and validate new config
-        let new_config = match zaz_config::load(&self.config_path) {
-            Ok(config) => config,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to parse config");
-                return ReloadResult::Failed(format!("parse error: {}", e));
-            }
-        };
-
-        // 1b. Evaluate the sources the new config names. A failure leaves the running config in
-        // place, like a parse failure does.
-        let new_evaluated = match evaluate::evaluate(&new_config, &self.config_path) {
-            Ok(evaluated) => evaluated,
-            Err(e) => {
-                let e = DaemonError::EnvFile(e);
-                tracing::error!(error = %e, "failed to evaluate config sources");
-                return ReloadResult::Failed(format!("environment error: {}", e));
-            }
-        };
-
-        // 2. Compute changes
+        // 1. Compute changes, and build everything the new config needs. A failure here leaves
+        // the running config in place, with no service stopped.
         let diff = self.get_config_diff(&new_config, &new_evaluated);
+
+        let execution_order = match topological_sort(&new_config.groups) {
+            Ok(order) => order,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to compute execution order");
+                return ReloadResult::Failed(format!("dependency error: {}", e));
+            }
+        };
+
+        let staged = match self.stage_groups(&new_config, &new_evaluated) {
+            Ok(staged) => staged,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build groups");
+                return ReloadResult::Failed(format!("rebuild error: {}", e));
+            }
+        };
 
         // Stop hooks expand against the config being replaced, since they belong to the
         // services that config started.
@@ -2410,9 +2485,9 @@ impl Engine {
         let expander = zaz_vars::Expander::new(&var_context);
         let log_tx = self.log_store.sender();
 
-        // 3. Stop services in removed groups, then 4. in modified groups (they'll be
-        // restarted). A stop hook outlives the group it belongs to: it runs detached, so
-        // rebuilding the group below drops the service without cutting the hook short.
+        // 2. Stop services in removed groups, then in modified groups (they'll be restarted).
+        // A stop hook outlives the group it belongs to: it runs detached, so rebuilding the
+        // group below drops the service without cutting the hook short.
         let stopping: Vec<String> = diff
             .removed
             .iter()
@@ -2443,35 +2518,19 @@ impl Engine {
             }
         }
 
-        // 5. Compute new execution order
-        let execution_order = match topological_sort(&new_config.groups) {
-            Ok(order) => order,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to compute execution order");
-                return ReloadResult::Failed(format!("dependency error: {}", e));
-            }
-        };
-
-        // 6. Apply new configuration
+        // 3. Apply the new configuration. Nothing past this point can fail.
         self.config = new_config;
         self.evaluated = new_evaluated;
         self.execution_order = execution_order;
-
-        // 6b. Rebuild dependency resolver from new config
         self.dependency_resolver = DependencyResolver::from_groups(
             self.config
                 .groups
                 .iter()
                 .map(|g| (g.name.as_str(), g.depends_on.as_slice())),
         );
+        self.commit_groups(staged, &diff);
 
-        // 7. Rebuild groups
-        if let Err(e) = self.rebuild_groups(diff.clone()) {
-            tracing::error!(error = %e, "failed to rebuild groups");
-            return ReloadResult::Failed(format!("rebuild error: {}", e));
-        }
-
-        // 8. Run new/modified groups through the shared execution path.
+        // 4. Run new/modified groups through the shared execution path.
         let reload_targets: Vec<String> = self
             .execution_order
             .iter()
@@ -2485,7 +2544,7 @@ impl Engine {
         let trigger_ctx = self.reload_context(&diff);
         self.execute_groups(&reload_targets, &trigger_ctx).await;
 
-        // 9. Broadcast reload complete
+        // 5. Broadcast reload complete
         if let Err(e) = self.push_log(LogLine::daemon(
             "zaz",
             format!(
@@ -2511,48 +2570,76 @@ impl Engine {
         compute_config_diff(&self.config, &self.evaluated, new_config, new_evaluated)
     }
 
-    /// Rebuild group patterns and managed groups from current config.
-    fn rebuild_groups(&mut self, diff: ConfigDiff) -> Result<(), DaemonError> {
-        // Clear and rebuild group patterns
-        self.group_patterns.clear();
-        let mut new_groups = IndexMap::new();
-        let mut old_groups = std::mem::take(&mut self.groups);
-
-        // Get config directory for default working directory
+    /// Build the pattern set and a fresh managed group for every group of `new_config`.
+    ///
+    /// This is the part of a rebuild that can fail, and it touches nothing running. A group the
+    /// reload leaves unchanged keeps its running instance, so its fresh one goes unused.
+    fn stage_groups(
+        &self,
+        new_config: &Config,
+        new_evaluated: &EvaluatedEnv,
+    ) -> Result<StagedGroups, DaemonError> {
         let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        let mut patterns = HashMap::new();
+        let mut built = HashMap::new();
 
-        for group in &self.config.groups {
-            // Create pattern set for this group
-            let patterns =
-                PatternSet::new(&group.patterns, &group.ignore).map_err(DaemonError::Watch)?;
-            self.group_patterns.insert(group.name.clone(), patterns);
-            let managed_group = if diff.unchanged.contains(&group.name) {
-                let mut existing = old_groups
-                    .swap_remove(&group.name)
-                    .ok_or_else(|| DaemonError::GroupNotFound(group.name.clone()))?;
-                existing.config = group.clone();
-                existing
-            } else {
+        for group in &new_config.groups {
+            patterns.insert(
+                group.name.clone(),
+                PatternSet::new(&group.patterns, &group.ignore).map_err(DaemonError::Watch)?,
+            );
+            built.insert(
+                group.name.clone(),
                 build_managed_group(
                     group,
-                    self.config.settings.shell.clone(),
+                    new_config.settings.shell.clone(),
                     config_dir,
-                    group_env(&self.evaluated, &group.name)?,
-                )
-            };
-            new_groups.insert(group.name.clone(), managed_group);
+                    group_env(new_evaluated, &group.name)?,
+                ),
+            );
         }
 
+        Ok(StagedGroups { patterns, built })
+    }
+
+    /// Swap the staged groups in for the running ones, keeping the runtime state of every
+    /// unchanged group. `self.config` must already be the new config.
+    fn commit_groups(&mut self, staged: StagedGroups, diff: &ConfigDiff) {
+        let StagedGroups {
+            patterns,
+            mut built,
+        } = staged;
+        let mut old_groups = std::mem::take(&mut self.groups);
+        let mut new_groups = IndexMap::new();
+
+        for group in &self.config.groups {
+            let kept = if diff.unchanged.contains(&group.name) {
+                old_groups.swap_remove(&group.name)
+            } else {
+                None
+            };
+
+            let managed_group = match kept {
+                Some(mut existing) => {
+                    existing.config = group.clone();
+                    Some(existing)
+                }
+                None => built.remove(&group.name),
+            };
+
+            if let Some(managed_group) = managed_group {
+                new_groups.insert(group.name.clone(), managed_group);
+            }
+        }
+
+        self.group_patterns = patterns;
         self.groups = new_groups;
 
-        // Update daemon state
         self.state.groups = self
             .groups
             .iter()
             .map(|(k, v)| (k.clone(), v.state.clone()))
             .collect();
-
-        Ok(())
     }
 
     /// Restart a specific process (task or service) within a group.
@@ -2785,19 +2872,7 @@ impl Engine {
                 Ok(()) => ApiResponse::ok_with_message("restart initiated for all groups"),
                 Err(e) => ApiResponse::error(format!("failed to restart: {}", e)),
             },
-            ApiRequest::ReloadConfig => match self.reload_config().await {
-                ReloadResult::Success {
-                    added,
-                    removed,
-                    modified,
-                } => ApiResponse::ok_with_message(format!(
-                    "config reloaded: {} added, {} removed, {} modified",
-                    added.len(),
-                    removed.len(),
-                    modified.len()
-                )),
-                ReloadResult::Failed(e) => ApiResponse::error(format!("reload failed: {}", e)),
-            },
+            ApiRequest::ReloadConfig => Self::reload_response(self.reload_config().await),
             ApiRequest::Identify => {
                 let config_path = self
                     .config_path
@@ -5541,8 +5616,9 @@ mod tests {
             &engine.evaluated,
         );
 
+        let staged = engine.stage_groups(&new_config, &engine.evaluated).unwrap();
         engine.config = new_config;
-        engine.rebuild_groups(diff).unwrap();
+        engine.commit_groups(staged, &diff);
 
         let keep = engine.groups.get("keep").unwrap();
         assert!(keep.services_started);
@@ -5555,6 +5631,71 @@ mod tests {
         assert!(!change.services_started);
         assert_eq!(change.state.status, GroupStatus::Pending);
         assert!(change.pending_restarts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_an_engine_with_no_groups_polls_and_checks_services() {
+        let mut engine = create_test_engine(Vec::new());
+
+        engine.startup().await.unwrap();
+        assert!(!engine.poll().await.unwrap());
+        engine.check_services().await.unwrap();
+        engine.shutdown().await.unwrap();
+
+        assert!(engine.state().groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reload_with_a_dependency_cycle_stops_nothing() {
+        let mut engine = create_test_engine(vec![test_service_group("keep", "sleep 30")]);
+        engine.startup().await.unwrap();
+        assert!(engine.groups["keep"].services[0].is_running());
+
+        let cyclic = test_config(vec![
+            test_group_with_deps("a", &["t"], &["b"]),
+            test_group_with_deps("b", &["t"], &["a"]),
+        ]);
+        let result = engine
+            .apply_prepared(Prepared {
+                config: cyclic,
+                evaluated: EvaluatedEnv::default(),
+            })
+            .await;
+
+        match result {
+            ReloadResult::Failed(message) => assert!(message.contains("dependency error")),
+            other => panic!("expected the reload to fail, got {other:?}"),
+        }
+        assert!(engine.groups["keep"].services[0].is_running());
+        assert!(engine.groups.contains_key("keep"));
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reload_with_a_bad_pattern_stops_nothing() {
+        let mut engine = create_test_engine(vec![test_service_group("keep", "sleep 30")]);
+        engine.startup().await.unwrap();
+        assert!(engine.groups["keep"].services[0].is_running());
+
+        let mut broken = test_service_group("other", "sleep 30");
+        broken.patterns = vec!["[".to_string()];
+
+        let result = engine
+            .apply_prepared(Prepared {
+                config: test_config(vec![broken]),
+                evaluated: EvaluatedEnv::default(),
+            })
+            .await;
+
+        match result {
+            ReloadResult::Failed(message) => assert!(message.contains("rebuild error")),
+            other => panic!("expected the reload to fail, got {other:?}"),
+        }
+        assert!(engine.groups["keep"].services[0].is_running());
+        assert!(!engine.groups.contains_key("other"));
+
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]

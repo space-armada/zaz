@@ -141,7 +141,8 @@ impl StartedDaemon {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             let output = self.run(&["--socket", socket, "status"]);
-            if output.status.code() == Some(0) && stdout_string(&output).contains("Daemon Status:")
+            if output.status.code() == Some(0)
+                && stdout_string(&output).contains("Daemon Status: Running")
             {
                 return;
             }

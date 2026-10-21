@@ -12,7 +12,7 @@ use zaz_config::{
     Config, Group, LogFormat, ServiceCommand, Settings, Signal, Silence, TaskCommand,
 };
 use zaz_daemon::{
-    DaemonState, DaemonStatus, GroupState, GroupStatus, LogLine, LogSource, OutputKind,
+    DaemonState, DaemonStatus, GroupState, GroupStatus, LoadError, LogLine, LogSource, OutputKind,
     ProcessState, ProcessStatus,
 };
 
@@ -27,6 +27,33 @@ pub struct StatusReport {
     pub last_change_ms: Option<u64>,
     /// All configured groups in declaration order.
     pub groups: Vec<GroupReport>,
+    /// Why the daemon's first load failed, when it did. The daemon is `starting` with nothing
+    /// built until the config is fixed and reloaded. A later reload failure never sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<LoadErrorReport>,
+    /// Errors per workspace member, reported by a workspace supervisor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_errors: Vec<MemberErrorReport>,
+}
+
+/// A coded failure to load a config.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LoadErrorReport {
+    /// Stable machine-readable code of the first error.
+    pub code: String,
+    /// Every error, one per line, each ending in its code.
+    pub message: String,
+    /// What to do next, when the first error carries a hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// The error of one workspace member.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemberErrorReport {
+    /// The member's project token, or its config path when it has none.
+    pub member: String,
+    pub error: LoadErrorReport,
 }
 
 /// Daemon lifecycle state.
@@ -317,6 +344,25 @@ impl From<&DaemonState> for StatusReport {
             watched_files: state.watched_files,
             last_change_ms: state.last_change,
             groups: state.groups.values().map(GroupReport::from).collect(),
+            load_error: state.load_error.as_ref().map(LoadErrorReport::from),
+            member_errors: state
+                .member_errors
+                .iter()
+                .map(|m| MemberErrorReport {
+                    member: m.member.clone(),
+                    error: LoadErrorReport::from(&m.error),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<&LoadError> for LoadErrorReport {
+    fn from(error: &LoadError) -> Self {
+        Self {
+            code: error.code.clone(),
+            message: error.message.clone(),
+            hint: error.hint.clone(),
         }
     }
 }
@@ -565,6 +611,7 @@ mod tests {
     use indexmap::IndexMap;
     use std::path::PathBuf;
     use zaz_config::TaskCommand;
+    use zaz_daemon::MemberError;
 
     fn sample_state() -> DaemonState {
         let mut groups = IndexMap::new();
@@ -594,7 +641,57 @@ mod tests {
             groups,
             watched_files: 17,
             last_change: Some(1_700_000_000_000),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn status_report_carries_the_load_error_of_a_starting_daemon() {
+        let state = DaemonState {
+            status: DaemonStatus::Starting,
+            load_error: Some(
+                LoadError::new("env_file_missing", "no such file").with_hint("create it"),
+            ),
+            ..Default::default()
+        };
+
+        let report = StatusReport::from(&state);
+
+        assert!(matches!(report.daemon_status, DaemonStatusReport::Starting));
+        let error = report.load_error.expect("the load error is reported");
+        assert_eq!(error.code, "env_file_missing");
+        assert_eq!(error.hint.as_deref(), Some("create it"));
+        assert!(report.member_errors.is_empty());
+    }
+
+    #[test]
+    fn status_report_carries_member_errors() {
+        let state = DaemonState {
+            member_errors: vec![MemberError {
+                member: "/repo/web/zaz.toml".to_string(),
+                error: LoadError::new("workspace_token_collision", "taken"),
+            }],
+            ..Default::default()
+        };
+
+        let report = StatusReport::from(&state);
+
+        assert_eq!(report.member_errors.len(), 1);
+        assert_eq!(report.member_errors[0].member, "/repo/web/zaz.toml");
+        assert_eq!(
+            report.member_errors[0].error.code,
+            "workspace_token_collision"
+        );
+    }
+
+    #[test]
+    fn a_status_report_without_error_fields_still_deserializes() {
+        let older =
+            r#"{"daemon_status":"running","watched_files":0,"last_change_ms":null,"groups":[]}"#;
+
+        let report: StatusReport = serde_json::from_str(older).unwrap();
+
+        assert!(report.load_error.is_none());
     }
 
     #[test]

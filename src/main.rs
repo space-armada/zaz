@@ -6,19 +6,26 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use zaz::cli::{Cli, Commands};
 use zaz_config::{load_user_config, ConfigError, TuiStylePreference, UserConfig};
 use zaz_daemon::{
     discover_config_upward, resolve_target, resolve_workspace_socket, ApiRequest, ApiResponse,
-    Client, ConfigOrigin, DaemonError, DaemonTarget, Engine, EngineCommand, Server,
+    Client, ConfigOrigin, DaemonError, DaemonHost, DaemonState, DaemonTarget, Engine,
+    EngineCommand, Server,
 };
 use zaz_mcp::McpError;
 use zaz_process::{DaemonLauncher, LaunchHandle};
 
+mod startup;
 mod supervisor;
+
+use startup::{
+    check_daemon_availability, print_load_error, shut_down_spawned, wait_for_first_reply,
+    wait_for_startup, wait_on_existing, DaemonAvailability, Existing, FirstReply, StartupOutcome,
+    StartupWait, DAEMON_READY_ATTEMPTS, DAEMON_READY_INTERVAL,
+};
 
 /// Effective TUI options after merging CLI flags with user config.
 #[derive(Debug, Clone)]
@@ -627,10 +634,10 @@ async fn try_main() -> Result<()> {
                 _log_guard = init_tracing_stderr(cli.debug, cli.log_file.as_deref());
 
                 let check_timeout = Duration::from_secs(1);
-                if !matches!(
-                    check_daemon_availability(&socket_path, check_timeout).await,
-                    DaemonAvailability::Running
-                ) {
+                if !check_daemon_availability(&socket_path, check_timeout)
+                    .await
+                    .is_responding()
+                {
                     tracing::info!(
                         socket = %socket_path.display(),
                         daemon_output_log = %daemon_output_log.display(),
@@ -643,7 +650,10 @@ async fn try_main() -> Result<()> {
                         daemon_log_file.as_deref(),
                         &daemon_output_log,
                     )?;
-                    match wait_for_daemon_ready(
+
+                    // The daemon stays up whatever its first load reports, so a fix to the config
+                    // and a reload from the MCP tools recovers it.
+                    match wait_for_first_reply(
                         &socket_path,
                         &mut handle,
                         DAEMON_READY_ATTEMPTS,
@@ -651,13 +661,13 @@ async fn try_main() -> Result<()> {
                     )
                     .await?
                     {
-                        DaemonReadyOutcome::Ready => {}
-                        DaemonReadyOutcome::Crashed(status) => bail!(
+                        FirstReply::Replied(state) => log_first_reply(&socket_path, &state),
+                        FirstReply::Crashed(status) => bail!(
                             "daemon exited before becoming ready (status: {}); see {} for details",
                             status,
                             daemon_output_log.display()
                         ),
-                        DaemonReadyOutcome::Timeout => {
+                        FirstReply::Timeout => {
                             let _ = handle.kill();
                             bail!(
                                 "daemon did not become ready in time; see {} for details",
@@ -900,17 +910,29 @@ fn resolve_command_target(
     Ok(resolve_target(None, start_dir)?)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DaemonAvailability {
-    Running,
-    StaleSocket,
-    Unreachable,
+/// Note what the first reply from an autostarted daemon said. The daemon stays up either way.
+fn log_first_reply(socket_path: &Path, state: &DaemonState) {
+    match &state.load_error {
+        Some(error) => tracing::warn!(
+            socket = %socket_path.display(),
+            code = %error.code,
+            "auto-started daemon failed to load its configuration; fix it and run `zaz reload`"
+        ),
+        None if state.status == zaz_daemon::DaemonStatus::Starting => tracing::info!(
+            socket = %socket_path.display(),
+            "auto-started daemon is still loading its configuration"
+        ),
+        None => tracing::debug!(
+            socket = %socket_path.display(),
+            "auto-started daemon became responsive"
+        ),
+    }
 }
 
 async fn run_tasks(config_path: &Path) -> Result<()> {
     tracing::info!(config = %config_path.display(), "running task commands");
 
-    let mut engine = Engine::new_task_only(config_path)?;
+    let mut engine = Engine::load_task_only(config_path).await?;
     engine.startup().await?;
     let success = engine.wait_for_tasks().await;
 
@@ -956,7 +978,10 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
 
     tracing::info!(config = %config_path.display(), "starting daemon");
 
-    let mut engine = Engine::with_options(config_path, !quiet)?;
+    // The daemon binds knowing only its config path. The config loads and evaluates off the loop,
+    // so launchers get a `Starting` reply however long that takes, and a config that fails to load
+    // leaves the daemon up for a fix and a reload.
+    let (mut host, mut outcomes) = DaemonHost::new(config_path, !quiet)?;
     let (command_tx, mut command_rx) = mpsc::channel::<EngineCommand>(32);
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -968,10 +993,7 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
         }
     });
 
-    // Run initial startup, but don't exit on failure
-    if let Err(e) = engine.startup().await {
-        tracing::error!(error = %e, "initial startup failed, waiting for file changes to retry");
-    }
+    host.begin_first_load();
 
     tracing::info!("watching for file changes...");
     let mut shutdown_requested = false;
@@ -985,13 +1007,12 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
 
             // Handle API commands
             Some(cmd) = command_rx.recv() => {
-                // Drain log channel before handling request (ensures GetLogs returns fresh data)
-                if let Err(e) = engine.process_incoming_logs() {
-                    tracing::error!(error = %e, "log drain error");
-                }
+                host.handle_command(cmd).await;
+            }
 
-                let response = engine.handle_request(cmd.request).await;
-                let _ = cmd.response_tx.send(response);
+            // A load or reload finished evaluating
+            Some(outcome) = outcomes.recv() => {
+                host.finish_run(outcome, &mut command_rx).await;
             }
 
             // Tear down once a Shutdown response has been written to its client
@@ -1002,20 +1023,7 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
 
             // Poll for file changes and check daemons
             _ = async {
-                // Process incoming logs from PTY readers
-                if let Err(e) = engine.process_incoming_logs() {
-                    tracing::error!(error = %e, "log drain error");
-                }
-                if let Err(e) = engine.maybe_enforce_log_retention() {
-                    tracing::error!(error = %e, "log retention error");
-                }
-
-                if let Err(e) = engine.poll().await {
-                    tracing::error!(error = %e, "poll error");
-                }
-                if let Err(e) = engine.check_services().await {
-                    tracing::error!(error = %e, "service check error");
-                }
+                host.tick().await;
                 tokio::time::sleep(Duration::from_millis(50)).await;
             } => {}
         }
@@ -1023,7 +1031,7 @@ async fn run_daemon(config_path: &Path, socket_path: &Path, quiet: bool) -> Resu
 
     // Cleanup
     server_handle.abort();
-    engine.shutdown().await?;
+    host.shutdown().await?;
 
     if shutdown_requested {
         tracing::info!("shutdown complete");
@@ -1039,13 +1047,12 @@ async fn start_daemon_command(
     daemon_log_file: Option<&Path>,
     daemon_output_log: &Path,
 ) -> Result<()> {
+    let wait = StartupWait::default();
     let check_timeout = Duration::from_secs(1);
-    if matches!(
-        check_daemon_availability(socket_path, check_timeout).await,
-        DaemonAvailability::Running
-    ) {
-        println!("daemon already running (socket {})", socket_path.display());
-        return Ok(());
+    if let DaemonAvailability::Responding(state) =
+        check_daemon_availability(socket_path, check_timeout).await
+    {
+        return report_existing_daemon(socket_path, state, &wait).await;
     }
 
     tracing::info!(
@@ -1063,31 +1070,97 @@ async fn start_daemon_command(
         daemon_output_log,
     )?;
 
-    match wait_for_daemon_ready(
-        socket_path,
-        &mut handle,
-        DAEMON_READY_ATTEMPTS,
-        DAEMON_READY_INTERVAL,
-    )
-    .await?
-    {
-        DaemonReadyOutcome::Ready => {
+    // The wait has no fixed bound while the daemon answers `Starting`, so Ctrl+C is the way out.
+    let outcome = tokio::select! {
+        outcome = wait_for_startup(socket_path, Some(&mut handle), &wait) => outcome?,
+        _ = tokio::signal::ctrl_c() => {
+            shut_down_spawned(socket_path, &mut handle).await;
+            bail!("interrupted while the daemon was starting; it was shut down");
+        }
+    };
+
+    match outcome {
+        StartupOutcome::Ready(_) => {
             println!("daemon started (pid {})", handle.id());
             Ok(())
         }
-        DaemonReadyOutcome::Crashed(status) => bail!(
+        StartupOutcome::LoadFailed(error) => {
+            print_load_error(&error);
+
+            // A daemon whose first load failed has nothing useful running.
+            shut_down_spawned(socket_path, &mut handle).await;
+            bail!("daemon failed to load its configuration [{}]", error.code)
+        }
+        StartupOutcome::Crashed(status) => bail!(
             "daemon exited before becoming ready (status: {}); see {} for details",
             status,
             daemon_output_log.display()
         ),
-        DaemonReadyOutcome::Timeout => {
+        StartupOutcome::Hung => {
             let _ = handle.kill();
             bail!(
-                "daemon did not become ready in time; see {} for details",
+                "daemon did not become ready: it stopped answering for {}s; see {} for details",
+                wait.hang_after.as_secs(),
                 daemon_output_log.display()
             )
         }
     }
+}
+
+/// Report on a daemon the pre-check found already answering, waiting for it if it is starting.
+/// This never shuts down a daemon it did not spawn.
+async fn report_existing_daemon(
+    socket_path: &Path,
+    state: Box<DaemonState>,
+    wait: &StartupWait,
+) -> Result<()> {
+    match wait_on_existing(socket_path, state, wait).await? {
+        Existing::Settled(_) => {
+            println!("daemon already running (socket {})", socket_path.display());
+            Ok(())
+        }
+        Existing::LoadFailed(error) => {
+            print_load_error(&error);
+            bail!(
+                "daemon at {} failed to load its configuration [{}]; fix the config and run \
+                 `zaz reload`, or run `zaz stop`",
+                socket_path.display(),
+                error.code
+            )
+        }
+        Existing::Hung => bail!(
+            "daemon at {} stopped answering for {}s while starting",
+            socket_path.display(),
+            wait.hang_after.as_secs()
+        ),
+    }
+}
+
+/// Fail naming each workspace member that did not start. The supervisor and the healthy members
+/// stay running.
+fn report_member_errors(state: &DaemonState) -> Result<()> {
+    if state.member_errors.is_empty() {
+        return Ok(());
+    }
+
+    for member in &state.member_errors {
+        eprintln!("member {}: [{}]", member.member, member.error.code);
+        for line in member.error.message.lines() {
+            eprintln!("  {line}");
+        }
+    }
+
+    let names: Vec<&str> = state
+        .member_errors
+        .iter()
+        .map(|m| m.member.as_str())
+        .collect();
+    bail!(
+        "{} workspace member(s) failed to start: {}; the supervisor and the healthy members are \
+         still running",
+        names.len(),
+        names.join(", ")
+    )
 }
 
 /// Build the argv that launches `zaz supervisor` for the workspace working set.
@@ -1140,16 +1213,29 @@ async fn start_supervisor_command(
     daemon_log_file: Option<&Path>,
     daemon_output_log: &Path,
 ) -> Result<()> {
+    let wait = StartupWait::default();
     let check_timeout = Duration::from_secs(1);
-    if matches!(
-        check_daemon_availability(socket_path, check_timeout).await,
-        DaemonAvailability::Running
-    ) {
-        println!(
-            "workspace supervisor already running (socket {})",
-            socket_path.display()
-        );
-        return Ok(());
+    if let DaemonAvailability::Responding(state) =
+        check_daemon_availability(socket_path, check_timeout).await
+    {
+        return match wait_on_existing(socket_path, state, &wait).await? {
+            Existing::Settled(state) => {
+                println!(
+                    "workspace supervisor already running (socket {})",
+                    socket_path.display()
+                );
+                report_member_errors(&state)
+            }
+            Existing::LoadFailed(error) => {
+                print_load_error(&error);
+                bail!("workspace supervisor failed to start [{}]", error.code)
+            }
+            Existing::Hung => bail!(
+                "workspace supervisor at {} stopped answering for {}s while starting",
+                socket_path.display(),
+                wait.hang_after.as_secs()
+            ),
+        };
     }
 
     tracing::info!(
@@ -1165,28 +1251,41 @@ async fn start_supervisor_command(
     launcher.args(args);
     let mut handle = launcher.launch()?;
 
-    // The supervisor binds its control socket only after its boot attach loop
-    // brings every member up. Each member can take a full readiness window, so
-    // the supervisor budget must exceed the sum across the set.
-    let attempts = DAEMON_READY_ATTEMPTS + DAEMON_READY_ATTEMPTS * config_paths.len();
-    match wait_for_daemon_ready(socket_path, &mut handle, attempts, DAEMON_READY_INTERVAL).await? {
-        DaemonReadyOutcome::Ready => {
-            println!("workspace supervisor started (pid {})", handle.id());
-            Ok(())
+    // The supervisor binds its control socket before it attaches any member, and its aggregate
+    // status is `Starting` until every member has settled. The wait follows the same rule as
+    // `zaz start`: no fixed bound while the supervisor keeps answering `Starting`.
+    let outcome = tokio::select! {
+        outcome = wait_for_startup(socket_path, Some(&mut handle), &wait) => outcome?,
+        _ = tokio::signal::ctrl_c() => {
+            shut_down_spawned(socket_path, &mut handle).await;
+            bail!("interrupted while the workspace was starting; it was shut down");
         }
-        DaemonReadyOutcome::Crashed(status) => bail!(
+    };
+
+    match outcome {
+        StartupOutcome::Ready(state) => {
+            println!("workspace supervisor started (pid {})", handle.id());
+            report_member_errors(&state)
+        }
+        StartupOutcome::LoadFailed(error) => {
+            print_load_error(&error);
+            shut_down_spawned(socket_path, &mut handle).await;
+            bail!("workspace supervisor failed to start [{}]", error.code)
+        }
+        StartupOutcome::Crashed(status) => bail!(
             "supervisor exited before becoming ready (status: {}); see {} for details",
             status,
             daemon_output_log.display()
         ),
-        DaemonReadyOutcome::Timeout => {
+        StartupOutcome::Hung => {
             // NOTE: this stops the wedged supervisor process, but any member
             // daemons it already spawned are not reaped here. Graceful cleanup
             // would need the supervisor's own detach_all, which is unreachable
-            // once its control socket never binds.
+            // while it does not answer.
             let _ = handle.kill();
             bail!(
-                "supervisor did not become ready in time; see {} for details",
+                "supervisor did not become ready: it stopped answering for {}s; see {} for details",
+                wait.hang_after.as_secs(),
                 daemon_output_log.display()
             )
         }
@@ -1208,6 +1307,25 @@ async fn show_status(target: &DaemonTarget) -> Result<()> {
     match response {
         ApiResponse::Status { state } => {
             println!("Daemon Status: {:?}", state.status);
+            if let Some(error) = &state.load_error {
+                println!(
+                    "Load error: [{}] first load failed, nothing is built",
+                    error.code
+                );
+                for line in error.message.lines() {
+                    println!("  {line}");
+                }
+                if let Some(hint) = &error.hint {
+                    println!("  hint: {hint}");
+                }
+                println!("  fix the config and run `zaz reload`, or run `zaz stop`");
+            }
+            for member in &state.member_errors {
+                println!("Member error: {} [{}]", member.member, member.error.code);
+                for line in member.error.message.lines() {
+                    println!("  {line}");
+                }
+            }
             println!("Groups:");
             for (name, group) in &state.groups {
                 println!("  {} ({:?})", name, group.status);
@@ -1580,58 +1698,6 @@ fn generate_man(command: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn is_daemon_responsive(socket_path: &Path, timeout: Duration) -> bool {
-    matches!(
-        check_daemon_availability(socket_path, timeout).await,
-        DaemonAvailability::Running
-    )
-}
-
-pub(crate) async fn check_daemon_availability(
-    socket_path: &Path,
-    timeout: Duration,
-) -> DaemonAvailability {
-    match tokio::time::timeout(timeout, Client::connect(socket_path)).await {
-        Ok(Ok(mut client)) => {
-            match tokio::time::timeout(timeout, client.request(&ApiRequest::Status)).await {
-                Ok(Ok(_)) => DaemonAvailability::Running,
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        socket = %socket_path.display(),
-                        error = %e,
-                        "socket accepted connection but daemon status request failed"
-                    );
-                    DaemonAvailability::StaleSocket
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        socket = %socket_path.display(),
-                        timeout_ms = timeout.as_millis(),
-                        "socket accepted connection but daemon status request timed out"
-                    );
-                    DaemonAvailability::StaleSocket
-                }
-            }
-        }
-        Ok(Err(e)) => {
-            tracing::debug!(
-                socket = %socket_path.display(),
-                error = %e,
-                "failed to connect to daemon socket"
-            );
-            DaemonAvailability::Unreachable
-        }
-        Err(_) => {
-            tracing::debug!(
-                socket = %socket_path.display(),
-                timeout_ms = timeout.as_millis(),
-                "timed out connecting to daemon socket"
-            );
-            DaemonAvailability::Unreachable
-        }
-    }
-}
-
 pub(crate) fn resolve_autostart_executable() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_zaz") {
         return Ok(PathBuf::from(path));
@@ -1711,40 +1777,6 @@ pub(crate) fn start_daemon_via_launcher(
     Ok(launcher.launch()?)
 }
 
-/// Per-daemon readiness polling budget. Each attempt sleeps DAEMON_READY_INTERVAL
-/// before probing the socket, so the window is attempts * interval. Sized to
-/// tolerate slow debug-build starts under load, where a healthy daemon can take
-/// several seconds to bind its socket. Too tight a window kills or misses a
-/// legitimately-slow daemon, which surfaces as leaks and flaky startup failures.
-pub(crate) const DAEMON_READY_ATTEMPTS: usize = 100;
-pub(crate) const DAEMON_READY_INTERVAL: Duration = Duration::from_millis(100);
-
-#[derive(Debug)]
-pub(crate) enum DaemonReadyOutcome {
-    Ready,
-    Crashed(ExitStatus),
-    Timeout,
-}
-
-pub(crate) async fn wait_for_daemon_ready(
-    socket_path: &Path,
-    handle: &mut LaunchHandle,
-    attempts: usize,
-    delay: Duration,
-) -> Result<DaemonReadyOutcome> {
-    for _ in 0..attempts {
-        tokio::time::sleep(delay).await;
-        if let Some(status) = handle.try_wait()? {
-            return Ok(DaemonReadyOutcome::Crashed(status));
-        }
-        if is_daemon_responsive(socket_path, Duration::from_secs(1)).await {
-            return Ok(DaemonReadyOutcome::Ready);
-        }
-    }
-
-    Ok(DaemonReadyOutcome::Timeout)
-}
-
 async fn run_tui(
     config_path: &Path,
     socket_path: &Path,
@@ -1771,9 +1803,9 @@ async fn run_tui(
 
     let check_timeout = Duration::from_secs(1);
     let availability = check_daemon_availability(socket_path, check_timeout).await;
-    let daemon_running = availability == DaemonAvailability::Running;
+    let daemon_running = availability.is_responding();
     match availability {
-        DaemonAvailability::Running => {
+        DaemonAvailability::Responding(_) => {
             tracing::debug!(
                 socket = %socket_path.display(),
                 "reusing existing responsive daemon"
@@ -1826,26 +1858,18 @@ async fn run_tui(
                     pid = handle.id(),
                     "daemon subprocess spawned, waiting for readiness"
                 );
-                match wait_for_daemon_ready(
-                    socket_path,
-                    &mut handle,
-                    20,
-                    Duration::from_millis(100),
-                )
-                .await
+                // The TUI renders whatever the daemon reports, `Starting` and a load error
+                // included, so it returns on the first reply and leaves the daemon up.
+                match wait_for_first_reply(socket_path, &mut handle, 20, Duration::from_millis(100))
+                    .await
                 {
-                    Ok(DaemonReadyOutcome::Ready) => {
-                        tracing::debug!(
-                            socket = %socket_path.display(),
-                            "auto-started daemon became responsive"
-                        );
-                    }
-                    Ok(DaemonReadyOutcome::Crashed(status)) => {
+                    Ok(FirstReply::Replied(state)) => log_first_reply(socket_path, &state),
+                    Ok(FirstReply::Crashed(status)) => {
                         // A concurrent `zaz` or `zaz start` can win the socket, which makes ours
                         // exit as already running. Attach to the winner instead of failing.
                         let availability =
                             check_daemon_availability(socket_path, check_timeout).await;
-                        if availability != DaemonAvailability::Running {
+                        if !matches!(availability, DaemonAvailability::Responding(_)) {
                             bail!(
                                 "daemon exited before becoming ready (status: {}); see {} for \
                                  details",
@@ -1860,7 +1884,7 @@ async fn run_tui(
                             "auto-started daemon lost the socket to another daemon; attaching"
                         );
                     }
-                    Ok(DaemonReadyOutcome::Timeout) => {
+                    Ok(FirstReply::Timeout) => {
                         tracing::warn!(
                             socket = %socket_path.display(),
                             output_log = %daemon_output_log.display(),
@@ -1941,6 +1965,8 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
     use zaz_daemon::{socket_path_for_config, ApiRequest, ApiResponse, Client, DaemonError};
+
+    use crate::startup::is_daemon_responsive;
 
     fn parse_cli(args: &[&str]) -> Cli {
         Cli::parse_from(args)
@@ -2524,11 +2550,11 @@ command = "true"
         assert!(handle.id() > 0);
 
         let outcome =
-            wait_for_daemon_ready(&socket_path, &mut handle, 50, Duration::from_millis(100))
+            wait_for_first_reply(&socket_path, &mut handle, 50, Duration::from_millis(100))
                 .await
                 .unwrap();
         match outcome {
-            DaemonReadyOutcome::Ready => {}
+            FirstReply::Replied(_) => {}
             other => {
                 let log_contents = std::fs::read_to_string(&output_log).unwrap_or_default();
                 panic!(
@@ -2545,7 +2571,7 @@ command = "true"
     }
 
     #[tokio::test]
-    async fn wait_for_daemon_ready_reports_crash_when_daemon_exits_immediately() {
+    async fn wait_for_first_reply_reports_crash_when_daemon_exits_immediately() {
         let temp = TempDir::new().unwrap();
         let socket_path = temp.path().join("never-bound.sock");
         let output_log = temp.path().join("daemon-output.log");
@@ -2555,11 +2581,11 @@ command = "true"
         let mut handle = launcher.launch().unwrap();
 
         let outcome =
-            wait_for_daemon_ready(&socket_path, &mut handle, 50, Duration::from_millis(20))
+            wait_for_first_reply(&socket_path, &mut handle, 50, Duration::from_millis(20))
                 .await
                 .unwrap();
         match outcome {
-            DaemonReadyOutcome::Crashed(status) => assert!(!status.success()),
+            FirstReply::Crashed(status) => assert!(!status.success()),
             other => panic!("expected crash outcome, got {:?}", other),
         }
     }
@@ -2626,7 +2652,10 @@ command = "true"
             assert!(matches!(request, ApiRequest::Status));
 
             let response = ApiResponse::Status {
-                state: DaemonState::default(),
+                state: DaemonState {
+                    status: zaz_daemon::DaemonStatus::Running,
+                    ..Default::default()
+                },
             };
             let body = serde_json::to_string(&response).unwrap();
             writer.write_all(body.as_bytes()).await.unwrap();
@@ -2642,5 +2671,96 @@ command = "true"
         // No daemon was launched, so the output log should never have been
         // written to.
         assert!(!output_log.exists());
+    }
+
+    /// TUI autostart and MCP autostart both spawn a daemon and call `wait_for_first_reply`. The
+    /// policy is that a daemon whose first load failed still counts, and is left up for a fix and
+    /// a reload. A full TUI cannot run in a test, so this drives the policy function itself.
+    #[tokio::test]
+    async fn first_reply_policy_leaves_a_daemon_with_a_broken_config_up_for_a_reload() {
+        use zaz_daemon::DaemonStatus;
+
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("zaz.toml");
+        let socket_path = temp.path().join("daemon.sock");
+        let output_log = temp.path().join("daemon-output.log");
+        std::fs::write(&config_path, "[[group\nname = ").unwrap();
+
+        let mut handle =
+            start_daemon_via_launcher(&config_path, &socket_path, false, None, &output_log)
+                .unwrap();
+        let reply = wait_for_first_reply(&socket_path, &mut handle, 20, Duration::from_millis(100))
+            .await
+            .unwrap();
+        let FirstReply::Replied(state) = reply else {
+            panic!("expected a reply, got {reply:?}");
+        };
+        assert_eq!(state.status, DaemonStatus::Starting);
+
+        // The first reply may predate the failed load. Wait for it to be recorded.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let state = loop {
+            let found = check_daemon_availability(&socket_path, Duration::from_secs(1)).await;
+            if let DaemonAvailability::Responding(state) = found {
+                if state.load_error.is_some() {
+                    break state;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no load error reported"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(state.load_error.unwrap().code, "config_parse_error");
+        assert!(handle.try_wait().unwrap().is_none(), "the daemon stays up");
+
+        std::fs::write(
+            &config_path,
+            "[[group]]\nname = \"fixed\"\n\n[[group.task]]\nname = \"t\"\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        let mut client = Client::connect(&socket_path).await.unwrap();
+        let response = client.request(&ApiRequest::ReloadConfig).await.unwrap();
+        assert!(matches!(response, ApiResponse::Ok { .. }), "{response:?}");
+
+        let DaemonAvailability::Responding(state) =
+            check_daemon_availability(&socket_path, Duration::from_secs(1)).await
+        else {
+            panic!("the daemon should answer");
+        };
+        assert_eq!(state.status, DaemonStatus::Running);
+        assert!(state.groups.contains_key("fixed"));
+
+        let response = client.request(&ApiRequest::Shutdown).await.unwrap();
+        assert!(matches!(response, ApiResponse::Ok { .. }));
+    }
+
+    #[test]
+    fn report_member_errors_names_every_failed_member() {
+        use zaz_daemon::{LoadError, MemberError};
+
+        let state = DaemonState {
+            member_errors: vec![
+                MemberError {
+                    member: "/repo/a/zaz.toml".to_string(),
+                    error: LoadError::new("workspace_token_collision", "taken"),
+                },
+                MemberError {
+                    member: "web".to_string(),
+                    error: LoadError::new("env_file_missing", "no file"),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let err = report_member_errors(&state).unwrap_err().to_string();
+
+        assert!(err.contains("2 workspace member(s)"), "{err}");
+        assert!(err.contains("/repo/a/zaz.toml"), "{err}");
+        assert!(err.contains("web"), "{err}");
+        assert!(err.contains("still running"), "{err}");
+
+        assert!(report_member_errors(&DaemonState::default()).is_ok());
     }
 }

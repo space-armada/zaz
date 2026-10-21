@@ -1,5 +1,6 @@
 //! Error types for the daemon.
 
+use crate::state::LoadError;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -17,6 +18,14 @@ pub enum DaemonError {
     /// One or more `env_file`s could not be loaded.
     #[error("{}", format_env_file_errors(.0))]
     EnvFile(Vec<zaz_config::EnvFileError>),
+
+    /// The thread that loads and evaluates a config panicked.
+    #[error("loading the config panicked")]
+    EvaluationPanicked,
+
+    /// The thread that loads and evaluates a config could not start.
+    #[error("could not start the thread that loads the config: {0}")]
+    EvaluationThread(std::io::Error),
 
     /// Watch error.
     #[error("watch error: {0}")]
@@ -101,6 +110,37 @@ pub enum LogStorageError {
 }
 
 impl DaemonError {
+    /// A stable code for the failure. A load failure reports the code of its first error.
+    pub fn code(&self) -> &'static str {
+        use zaz_config::ConfigError;
+
+        match self {
+            Self::EnvFile(errors) => errors.first().map_or("env_file_error", |e| e.code()),
+            Self::Config(ConfigError::Validation(errors)) => {
+                errors.iter().next().map_or("config_invalid", |e| e.code())
+            }
+            Self::Config(ConfigError::Io { .. }) => "config_unreadable",
+            Self::Config(ConfigError::NotFound { .. }) => "config_not_found",
+            Self::Config(_) => "config_parse_error",
+            Self::EvaluationPanicked => "evaluation_panicked",
+            Self::EvaluationThread(_) => "evaluation_unavailable",
+            Self::CyclicDependency(_) => "dependency_cycle",
+            Self::Watch(_) => "watch_error",
+            Self::LogStorage(_) => "log_storage_error",
+            _ => "load_failed",
+        }
+    }
+
+    /// This failure in the form a daemon reports as its `load_error`.
+    pub fn to_load_error(&self) -> LoadError {
+        let error = LoadError::new(self.code(), self.to_string());
+
+        match self.hint() {
+            Some(hint) => error.with_hint(hint),
+            None => error,
+        }
+    }
+
     /// Recovery suggestion for variants where a concrete next step exists.
     /// Returns `None` for terminal errors with no actionable recovery.
     pub fn hint(&self) -> Option<&'static str> {

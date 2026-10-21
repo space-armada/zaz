@@ -435,7 +435,7 @@ impl StartedWorkspace {
                 .output()
                 .expect("run zaz status");
             if output.status.code() == Some(0)
-                && String::from_utf8_lossy(&output.stdout).contains("Daemon Status:")
+                && String::from_utf8_lossy(&output.stdout).contains("Daemon Status: Running")
             {
                 return;
             }

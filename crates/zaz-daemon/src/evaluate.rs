@@ -8,9 +8,78 @@
 //! a caller that must not block runs it on a blocking thread.
 
 use crate::env::{EnvLayer, GroupEnv};
+use crate::DaemonError;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use zaz_config::{Config, EnvFileError, EnvFileLevel};
+
+/// A config loaded from disk together with everything its sources evaluated to.
+///
+/// This is all the slow work of a load or reload. Building groups from it is quick and runs on
+/// the daemon's event loop.
+#[derive(Debug)]
+pub(crate) struct Prepared {
+    pub(crate) config: Config,
+    pub(crate) evaluated: EvaluatedEnv,
+}
+
+/// Load the config at `config_path` and evaluate the sources it names.
+///
+/// `config_path` must be absolute. This blocks on file reads.
+pub(crate) fn prepare(config_path: &Path) -> Result<Prepared, DaemonError> {
+    let config = zaz_config::load(config_path).map_err(DaemonError::Config)?;
+    let evaluated = evaluate(&config, config_path).map_err(DaemonError::EnvFile)?;
+
+    Ok(Prepared { config, evaluated })
+}
+
+/// Run [`prepare`] on its own thread and deliver the result to `done`.
+///
+/// The thread is detached, not a runtime blocking task. A read that never returns, such as one on
+/// a named pipe with no writer, would otherwise keep the runtime from shutting down. A panic
+/// becomes an error instead of a silent drop.
+pub(crate) fn prepare_detached<F>(config_path: PathBuf, done: F)
+where
+    F: FnOnce(Result<Prepared, DaemonError>) + Send + 'static,
+{
+    run_detached(move || prepare(&config_path), done);
+}
+
+/// Run `work` on its own detached thread and deliver its result to `done`.
+///
+/// `done` always runs once. A panic in `work`, or a thread that cannot start, reaches it as an
+/// error.
+pub(crate) fn run_detached<W, F>(work: W, done: F)
+where
+    W: FnOnce() -> Result<Prepared, DaemonError> + Send + 'static,
+    F: FnOnce(Result<Prepared, DaemonError>) + Send + 'static,
+{
+    // The thread owns `done` once it starts. A failed spawn drops the closure, so `done` goes
+    // through a shared slot that either side can take.
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(done)));
+    let thread_slot = std::sync::Arc::clone(&slot);
+
+    let spawned = std::thread::Builder::new()
+        .name("zaz-evaluate".to_string())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .unwrap_or(Err(DaemonError::EvaluationPanicked));
+            let done = thread_slot.lock().ok().and_then(|mut slot| slot.take());
+
+            if let Some(done) = done {
+                done(result);
+            }
+        });
+
+    if let Err(e) = spawned {
+        tracing::error!(error = %e, "failed to start the evaluation thread");
+
+        let done = slot.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(done) = done {
+            done(Err(DaemonError::EvaluationThread(e)));
+        }
+    }
+}
 
 /// The environment layers every group of a config is built from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

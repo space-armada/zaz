@@ -75,7 +75,7 @@ pub enum Commands {
         quiet: bool,
     },
 
-    /// Start the daemon in the background and exit
+    /// Start the daemon in the background, wait for it to load its configuration, and exit
     Start,
 
     /// Run a workspace supervisor in the foreground (internal; launched by `start`)

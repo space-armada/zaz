@@ -8,7 +8,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use support::{run_zaz, stderr_string, stdout_string, zaz_bin, StartedDaemon};
+use support::{
+    run_zaz, stderr_string, stdout_string, wait_for_socket_gone, zaz_bin, StartedDaemon,
+};
 use tempfile::TempDir;
 use zaz_daemon::{ApiRequest, ApiResponse};
 
@@ -145,7 +147,9 @@ fn wait_for_daemon(current_dir: &Path, socket_path: &Path) {
 
     while Instant::now() < deadline {
         let output = run_zaz(current_dir, &["--socket", socket, "status"]);
-        if output.status.code() == Some(0) && stdout_string(&output).contains("Daemon Status:") {
+        if output.status.code() == Some(0)
+            && stdout_string(&output).contains("Daemon Status: Running")
+        {
             return;
         }
         thread::sleep(Duration::from_millis(50));
@@ -610,7 +614,7 @@ fn start_then_status_reports_running() {
     let stdout = stdout_string(&output);
 
     assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
-    assert!(stdout.contains("Daemon Status:"));
+    assert!(stdout.contains("Daemon Status: Running"));
     assert!(stdout.contains("backend"));
 }
 
@@ -777,7 +781,7 @@ command = "true"
 }
 
 #[test]
-fn start_reports_crash_when_config_is_invalid() {
+fn start_prints_the_coded_error_and_stops_the_daemon_when_config_is_invalid() {
     let temp = TempDir::new().unwrap();
     let config_path = temp.path().join("zaz.toml");
     std::fs::write(
@@ -808,8 +812,12 @@ patterns = ["**/*.rs"
 
     assert!(!output.status.success());
     assert!(
-        stderr.contains("daemon exited before becoming ready"),
-        "expected crash-detection message, got: {stderr}"
+        stderr.contains("daemon failed to load its configuration [config_parse_error]"),
+        "expected the coded load error, got: {stderr}"
+    );
+    assert!(
+        wait_for_socket_gone(&socket_path, Duration::from_secs(5)),
+        "a daemon whose first load failed should be shut down"
     );
 }
 
