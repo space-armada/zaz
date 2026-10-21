@@ -5,6 +5,7 @@
 mod error;
 mod schema;
 mod toml_spanned;
+mod unknown_keys;
 pub mod user;
 mod validate;
 
@@ -53,16 +54,30 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
 
     match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => {
-            // Use spanned parser for TOML to get line/column info
-            let (config, span_info) = toml_spanned::parse_toml_with_spans(&contents)?;
-            validate::validate_with_spans(&config, &contents, Some(&span_info))?;
-            Ok(config)
+            let collected = unknown_keys::collect_toml(&contents)?;
+            let doc = toml_edit::ImDocument::parse(contents.as_str()).ok();
+            let span_info = doc.as_ref().map(toml_spanned::SpanInfo::from_document);
+
+            let mut errors =
+                unknown_keys::unknown_key_errors(&collected.ignored, doc.as_ref(), &contents);
+            validate::collect_errors(
+                &collected.config,
+                &contents,
+                span_info.as_ref(),
+                &mut errors,
+            );
+            errors.into_result()?;
+
+            Ok(collected.config)
         }
         Some("json") => {
-            let config = parse_json(&contents)?;
-            // No span info for JSON
-            validate::validate_with_spans(&config, &contents, None)?;
-            Ok(config)
+            let collected = unknown_keys::collect_json(&contents)?;
+
+            let mut errors = unknown_keys::unknown_key_errors(&collected.ignored, None, &contents);
+            validate::collect_errors(&collected.config, &contents, None, &mut errors);
+            errors.into_result()?;
+
+            Ok(collected.config)
         }
         _ => Err(ConfigError::UnknownFormat {
             path: path.to_path_buf(),
@@ -70,7 +85,10 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
     }
 }
 
-/// Load configuration without validation (for testing).
+/// Load configuration without running the semantic validation passes.
+///
+/// Unknown keys are still rejected. Duplicate names, dependency problems, and bad patterns are
+/// not checked.
 pub fn load_unvalidated<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
     let path = path.as_ref();
     let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
@@ -88,16 +106,28 @@ pub fn load_unvalidated<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> 
 }
 
 /// Parse TOML configuration.
+///
+/// Unknown keys are reported as validation errors with their line and column.
 pub fn parse_toml(contents: &str) -> Result<Config, ConfigError> {
-    toml::from_str(contents).map_err(|e| ConfigError::Toml {
-        message: e.message().to_string(),
-        span: e.span(),
-    })
+    let collected = unknown_keys::collect_toml(contents)?;
+    if collected.ignored.is_empty() {
+        return Ok(collected.config);
+    }
+
+    let doc = toml_edit::ImDocument::parse(contents).ok();
+    unknown_keys::unknown_key_errors(&collected.ignored, doc.as_ref(), contents).into_result()?;
+
+    Ok(collected.config)
 }
 
 /// Parse JSON configuration.
+///
+/// Unknown keys are reported as validation errors. JSON errors carry no location.
 pub fn parse_json(contents: &str) -> Result<Config, ConfigError> {
-    serde_json::from_str(contents).map_err(ConfigError::Json)
+    let collected = unknown_keys::collect_json(contents)?;
+    unknown_keys::unknown_key_errors(&collected.ignored, None, contents).into_result()?;
+
+    Ok(collected.config)
 }
 
 #[cfg(test)]

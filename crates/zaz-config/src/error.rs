@@ -277,6 +277,14 @@ pub enum ValidationErrorKind {
         /// Name of the service.
         service: String,
     },
+    /// A key that no config table defines.
+    UnknownKey {
+        /// The unrecognized key.
+        key: String,
+        /// The table holding the key, such as `settings` or `group[1].task[0]`. Empty for the
+        /// top level.
+        table: String,
+    },
 }
 
 impl ValidationErrorKind {
@@ -299,6 +307,7 @@ impl ValidationErrorKind {
             Self::ConflictingStopMechanism { .. } => "conflicting_stop_mechanism",
             Self::ReadyTuningWithoutCheck { .. } => "ready_tuning_without_check",
             Self::ZeroReadyPollInterval { .. } => "zero_ready_poll_interval",
+            Self::UnknownKey { .. } => "unknown_key",
         }
     }
 }
@@ -416,6 +425,12 @@ impl fmt::Display for ValidationErrorKind {
                     group, service
                 )
             }
+            Self::UnknownKey { key, table } if table.is_empty() => {
+                write!(f, "unknown key '{}' at the top level", key)
+            }
+            Self::UnknownKey { key, table } => {
+                write!(f, "unknown key '{}' in {}", key, table)
+            }
         }
     }
 }
@@ -445,6 +460,11 @@ impl ValidationErrors {
     /// Add an error to the collection.
     pub fn push(&mut self, error: ValidationError) {
         self.errors.push(error);
+    }
+
+    /// Add every error from another collection.
+    pub fn extend(&mut self, other: ValidationErrors) {
+        self.errors.extend(other.errors);
     }
 
     /// Get an iterator over the errors.

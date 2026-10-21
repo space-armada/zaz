@@ -10,7 +10,7 @@ use strsim::levenshtein;
 const MAX_SUGGESTION_DISTANCE: usize = 2;
 
 /// Suggest a similar name from a list of valid options.
-fn suggest_similar<'a>(unknown: &str, valid: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn suggest_similar<'a>(unknown: &str, valid: &[&'a str]) -> Option<&'a str> {
     valid
         .iter()
         .filter(|&&v| {
@@ -54,13 +54,22 @@ pub fn validate_with_spans(
     span_info: Option<&SpanInfo>,
 ) -> Result<(), ValidationErrors> {
     let mut errors = ValidationErrors::new();
-
-    validate_groups(config, source, span_info, &mut errors);
-    validate_dependencies(config, source, span_info, &mut errors);
-    validate_patterns(config, &mut errors);
-    validate_commands(config, &mut errors);
+    collect_errors(config, source, span_info, &mut errors);
 
     errors.into_result()
+}
+
+/// Run every validation pass, adding to errors already collected.
+pub(crate) fn collect_errors(
+    config: &Config,
+    source: &str,
+    span_info: Option<&SpanInfo>,
+    errors: &mut ValidationErrors,
+) {
+    validate_groups(config, source, span_info, errors);
+    validate_dependencies(config, source, span_info, errors);
+    validate_patterns(config, errors);
+    validate_commands(config, errors);
 }
 
 /// Validate group definitions.

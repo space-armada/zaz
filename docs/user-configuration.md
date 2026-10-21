@@ -27,8 +27,7 @@ defaults without warning.
 
 ## Parsing semantics
 
-Unlike project config, user config does not use `deny_unknown_fields`;
-unknown keys are tolerated. Parse failures fall back to defaults with a
+Unlike project config, user config tolerates unknown keys. Parse failures fall back to defaults with a
 warning logged at startup. This is an intentional contrast with project
 config, which fails closed on invalid input. The intent is that a stale
 or malformed user config should never block zaz from starting on someone

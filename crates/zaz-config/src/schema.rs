@@ -111,8 +111,12 @@ impl<'de> Deserialize<'de> for HumanDuration {
 }
 
 /// Root configuration structure.
+///
+/// The derived `Deserialize` impls accept unknown keys. Only the crate's entry points, which are
+/// `load`, `load_unvalidated`, `parse_toml`, and `parse_json`, report them. A direct
+/// `toml::from_str::<Config>` silently drops a misspelled key.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// Global settings.
     pub settings: Settings,
@@ -127,7 +131,7 @@ pub struct Config {
 
 /// Global settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Settings {
     /// Shell to use for command execution (defaults to $SHELL).
     pub shell: Option<String>,
@@ -194,7 +198,7 @@ pub enum Silence {
 
 /// A watch group that pairs file patterns with commands.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Group {
     /// Unique name for this group.
     pub name: String,
@@ -226,7 +230,6 @@ pub struct Group {
 
 /// A task command that runs to completion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TaskCommand {
     /// Display name for this command (derived from command if not set).
     #[serde(default)]
@@ -311,7 +314,6 @@ fn derive_name(command: &str) -> &str {
 
 /// A service command that runs continuously.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ServiceCommand {
     /// Display name for this service (derived from command if not set).
     #[serde(default)]

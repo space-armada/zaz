@@ -389,6 +389,50 @@ command = ""
 }
 
 #[test]
+fn check_json_reports_unknown_keys_with_line_and_column() {
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("zaz.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"[settings]
+shel = "bash"
+
+[[group]]
+name = "backend"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "build"
+comand = "cargo build"
+command = "cargo build"
+"#,
+    )
+    .unwrap();
+
+    let config = config_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["check", "--json", config]);
+    let payload: Value =
+        serde_json::from_str(&stdout_string(&output)).expect("stdout should be valid json");
+
+    assert!(!output.status.success());
+    assert_eq!(payload["valid"], false);
+
+    let errors = payload["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2);
+
+    assert_eq!(errors[0]["code"], "unknown_key");
+    assert_eq!(errors[0]["line"], 2);
+    assert_eq!(errors[0]["column"], 1);
+    assert_eq!(errors[0]["hint"], "did you mean 'shell'?");
+
+    assert_eq!(errors[1]["code"], "unknown_key");
+    assert_eq!(errors[1]["line"], 10);
+    assert_eq!(errors[1]["column"], 1);
+    assert_eq!(errors[1]["hint"], "did you mean 'command'?");
+}
+
+#[test]
 fn restart_returns_nonzero_on_unexpected_response() {
     let temp = TempDir::new().unwrap();
     let socket_path = temp.path().join("daemon.sock");

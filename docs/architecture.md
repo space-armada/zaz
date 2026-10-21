@@ -47,7 +47,7 @@ supports explicit `depends_on` declarations between groups.
 | **Built-in variables** | `${zaz:files}`, `${zaz:dirs}`, `${zaz:root}`, `${zaz:prefix}` |
 | **Stdin handling** | PTY allocation by default (`no_pty = true` to disable) |
 | **Dependencies** | Named groups with `depends_on = ["group_name"]` |
-| **Config validation** | `deny_unknown_fields` to catch typos |
+| **Config validation** | Unknown keys are collected validation errors, to catch typos |
 | **Command naming** | "task" for run-to-completion, "service" for long-running |
 
 ## Component Architecture
@@ -98,7 +98,7 @@ them, leaving the single-config path byte-for-byte unchanged.
 
 zaz follows **Cargo's approach** to config compatibility:
 
-1. **Strict validation**: Unknown fields are rejected (`deny_unknown_fields`)
+1. **Strict validation**: Unknown fields are rejected as collected validation errors
    - Catches typos immediately
    - Clear error messages
 
@@ -123,7 +123,7 @@ different purposes:
 | Cargo/ESLint | Rejected | None | Maintainer discipline required |
 | zaz | Rejected | None | Same as Cargo |
 
-Since zaz uses `deny_unknown_fields`, a version field would only help if we
+Since zaz rejects unknown fields, a version field would only help if we
 needed breaking changes. Instead, we commit to backwards-compatible evolution.
 
 **If breaking changes become necessary**, add a version field at that time:

@@ -246,8 +246,8 @@ command = "sleep 600"
     )
 }
 
-/// A config that fails validation (`deny_unknown_fields`), so attaching its
-/// member must fail.
+/// A config that fails to load because `bogus_field` is an unknown key, so attaching its member
+/// must fail.
 fn invalid_config() -> &'static str {
     r#"
 [[group]]
@@ -432,6 +432,17 @@ fn workspace_attach_failure_leaves_running_set_undisturbed() {
     let bad = ws.member("bad", invalid_config());
     let good_sock = ws.member_socket(&good);
     let bad_sock = ws.member_socket(&bad);
+
+    let check = ws.run_in(
+        bad.parent().unwrap(),
+        &[OsStr::new("check"), bad.as_os_str()],
+    );
+    assert!(!check.status.success(), "invalid member should fail check");
+    assert!(
+        String::from_utf8_lossy(&check.stderr).contains("unknown key 'bogus_field'"),
+        "invalid member should fail on its unknown key: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
 
     let out = ws.start_workspace(&[&good, &bad]);
     assert!(
