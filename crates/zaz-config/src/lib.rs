@@ -19,10 +19,29 @@ pub use user::{
 };
 pub use validate::validate;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Default configuration file names to search for.
 pub const CONFIG_FILES: &[&str] = &["zaz.toml", "zaz.json"];
+
+/// Make a config path absolute without resolving symlinks.
+///
+/// A bare filename such as `zaz.toml` has an empty parent, which is not a usable directory.
+/// Making the path absolute once keeps every directory derived from it valid. This avoids
+/// `canonicalize` so symlinks in the path are preserved.
+pub fn absolute_config_path(path: &Path) -> Result<PathBuf, ConfigError> {
+    std::path::absolute(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Resolve a relative `working_dir` against the config directory.
+///
+/// An absolute value is returned unchanged. The config directory is expected to be absolute.
+pub fn resolve_against_config_dir(config_dir: &Path, dir: &str) -> PathBuf {
+    config_dir.join(dir)
+}
 
 /// Load configuration from a file, auto-detecting format by extension.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
@@ -84,6 +103,35 @@ pub fn parse_json(contents: &str) -> Result<Config, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_absolute_config_path_makes_relative_paths_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+
+        for given in ["zaz.toml", "./zaz.toml"] {
+            let absolute = absolute_config_path(Path::new(given)).unwrap();
+
+            assert!(absolute.is_absolute(), "{given} -> {}", absolute.display());
+            assert_eq!(absolute.parent(), Some(cwd.as_path()), "{given}");
+        }
+
+        let already = absolute_config_path(Path::new("/etc/zaz.toml")).unwrap();
+        assert_eq!(already, Path::new("/etc/zaz.toml"));
+    }
+
+    #[test]
+    fn test_resolve_against_config_dir() {
+        let dir = Path::new("/project");
+
+        assert_eq!(
+            resolve_against_config_dir(dir, "sub/dir"),
+            Path::new("/project/sub/dir")
+        );
+        assert_eq!(
+            resolve_against_config_dir(dir, "/elsewhere"),
+            Path::new("/elsewhere")
+        );
+    }
 
     #[test]
     fn test_parse_minimal_toml() {

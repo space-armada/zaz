@@ -4,6 +4,7 @@
 
 use crate::api::LogLine;
 use crate::dependency::DependencyResolver;
+use crate::env;
 use crate::log_storage::{LogQuery, LogQueryResult, LogStorage};
 use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
@@ -999,6 +1000,9 @@ struct ManagedGroup {
     /// Group configuration.
     config: Group,
 
+    /// Directory that relative `working_dir` values resolve against.
+    config_dir: PathBuf,
+
     /// Task executor.
     executor: Executor,
 
@@ -1069,15 +1073,8 @@ impl Engine {
         let user_config = zaz_config::load_user_config();
         let notification_config = user_config.notifications;
 
-        // A bare filename has an empty parent, which is not a usable directory. Making the path
-        // absolute once keeps every directory derived from it valid. It avoids `canonicalize` so
-        // symlinks in the path are preserved.
-        let config_path = std::path::absolute(&config_path).map_err(|source| {
-            DaemonError::Config(zaz_config::ConfigError::Io {
-                path: config_path.clone(),
-                source,
-            })
-        })?;
+        let config_path =
+            zaz_config::absolute_config_path(&config_path).map_err(DaemonError::Config)?;
 
         // Determine the config directory for variable expansion
         let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -1484,13 +1481,18 @@ impl Engine {
         );
 
         // Get group configuration
-        let (tasks, executor) = {
+        let (tasks, executor, config_dir, group_env) = {
             let Some(group) = self.groups.get_mut(group_name) else {
                 tracing::warn!(group = %group_name, "group not found");
                 return;
             };
             group.state.status = GroupStatus::Running;
-            (group.config.tasks.clone(), group.executor.clone())
+            (
+                group.config.tasks.clone(),
+                group.executor.clone(),
+                group.config_dir.clone(),
+                group.config.env.clone(),
+            )
         };
 
         // Spawn each task independently (parallel execution)
@@ -1511,14 +1513,13 @@ impl Engine {
                 }
             };
 
-            // Use task-specific working_dir and env if set
-            let mut task_executor = executor.clone();
-            if let Some(ref dir) = task.working_dir {
-                task_executor = task_executor.with_working_dir(dir.clone());
-            }
-            if !task.env.is_empty() {
-                task_executor = task_executor.extend_env(task.env.clone());
-            }
+            let task_executor = env::process_executor(
+                &executor,
+                &config_dir,
+                task.working_dir.as_deref(),
+                &group_env,
+                &task.env,
+            );
 
             self.spawn_task(
                 group_name,
@@ -1739,14 +1740,13 @@ impl Engine {
                                 );
                             let expander = zaz_vars::Expander::new(&context);
                             if let Ok(command) = expander.expand(&task.command) {
-                                // Use task-specific working_dir and env if set
-                                let mut task_executor = group.executor.clone();
-                                if let Some(ref dir) = task.working_dir {
-                                    task_executor = task_executor.with_working_dir(dir.clone());
-                                }
-                                if !task.env.is_empty() {
-                                    task_executor = task_executor.extend_env(task.env.clone());
-                                }
+                                let task_executor = env::process_executor(
+                                    &group.executor,
+                                    &group.config_dir,
+                                    task.working_dir.as_deref(),
+                                    &group.config.env,
+                                    &task.env,
+                                );
                                 self.spawn_task(
                                     group_name,
                                     task_name,
@@ -2560,14 +2560,13 @@ impl Engine {
                 .expand(&task_config.command)
                 .map_err(|e| DaemonError::VarExpansion(e.to_string()))?;
 
-            // Use task-specific working_dir and env if set
-            let mut executor = group.executor.clone();
-            if let Some(ref dir) = task_config.working_dir {
-                executor = executor.with_working_dir(dir.clone());
-            }
-            if !task_config.env.is_empty() {
-                executor = executor.extend_env(task_config.env.clone());
-            }
+            let executor = env::process_executor(
+                &group.executor,
+                &group.config_dir,
+                task_config.working_dir.as_deref(),
+                &group.config.env,
+                &task_config.env,
+            );
             let silence = task_config.silence;
 
             // Spawn task in background (same as restart_group) for proper log streaming
@@ -3279,30 +3278,19 @@ fn build_group_state(group: &Group) -> GroupState {
 }
 
 fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) -> ManagedGroup {
-    // Create executor with shell, working directory, and group env
-    // Default to config directory if no explicit working_dir is set
-    let mut executor = Executor::new(shell);
-    let working_dir = group
-        .working_dir
-        .clone()
-        .unwrap_or_else(|| config_dir.to_string_lossy().to_string());
-    executor = executor.with_working_dir(working_dir);
-    if !group.env.is_empty() {
-        executor = executor.with_env(group.env.clone());
-    }
+    let executor = env::group_executor(shell, config_dir, group.working_dir.as_deref(), &group.env);
 
-    // Create services with per-service working_dir and env overrides
     let services: Vec<Service> = group
         .services
         .iter()
         .map(|d| {
-            let mut service_executor = executor.clone();
-            if let Some(ref dir) = d.working_dir {
-                service_executor = service_executor.with_working_dir(dir.clone());
-            }
-            if !d.env.is_empty() {
-                service_executor = service_executor.extend_env(d.env.clone());
-            }
+            let service_executor = env::process_executor(
+                &executor,
+                config_dir,
+                d.working_dir.as_deref(),
+                &group.env,
+                &d.env,
+            );
             Service::new(d.clone(), service_executor)
         })
         .collect();
@@ -3310,6 +3298,7 @@ fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) 
     let service_count = services.len();
     ManagedGroup {
         config: group.clone(),
+        config_dir: config_dir.to_path_buf(),
         executor,
         services,
         state: build_group_state(group),

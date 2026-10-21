@@ -1314,6 +1314,7 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
         anyhow::bail!(message.to_string())
     }
 
+    let config_path = &zaz_config::absolute_config_path(config_path)?;
     let result = zaz_config::load(config_path);
     match result {
         Ok(_config) => {

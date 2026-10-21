@@ -1026,6 +1026,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_run_cleanup_omits_variables_absent_from_the_service_env() {
+        std::env::set_var("ZAZ_TEST_HOOK_ABSENT", "inherited");
+
+        let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        env.remove("ZAZ_TEST_HOOK_ABSENT");
+        let executor = Executor::new(Some("/bin/sh".to_string())).with_env(env);
+        let service = Service::new(service_with_cleanup("sleep 30", None), executor);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let output = service
+            .run_cleanup("printf '%s' \"${ZAZ_TEST_HOOK_ABSENT-unset}\"", tx)
+            .await
+            .unwrap();
+
+        assert_eq!(output.stdout, vec!["unset".to_string()]);
+    }
+
     #[test]
     fn test_unset_stop_timeout_falls_back_to_the_default() {
         let service = stubborn_service(None);

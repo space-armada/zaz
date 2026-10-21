@@ -47,8 +47,18 @@ impl Executor {
         Self {
             shell,
             working_dir: None,
-            env: HashMap::new(),
+            env: std::env::vars().collect(),
         }
+    }
+
+    /// The working directory commands run in, when one is set.
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
+    }
+
+    /// The complete environment commands run with.
+    pub fn env(&self) -> &HashMap<String, String> {
+        &self.env
     }
 
     /// Set the working directory for commands.
@@ -57,17 +67,13 @@ impl Executor {
         self
     }
 
-    /// Set environment variables for commands.
-    /// These are added to the inherited process environment.
+    /// Set the complete environment commands run with.
+    ///
+    /// The map replaces the executor's environment whole. Spawning clears the inherited environment first, so
+    /// a variable absent from the map is absent from the command. A new executor starts from the
+    /// daemon's own environment.
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
         self.env = env;
-        self
-    }
-
-    /// Extend the environment variables for commands.
-    /// New vars override existing ones with the same key.
-    pub fn extend_env(mut self, env: HashMap<String, String>) -> Self {
-        self.env.extend(env);
         self
     }
 
@@ -102,10 +108,8 @@ impl Executor {
             cmd.current_dir(dir);
         }
 
-        // Add environment variables (extend inherited env)
-        for (key, value) in &self.env {
-            cmd.env(key, value);
-        }
+        cmd.env_clear();
+        cmd.envs(&self.env);
 
         // Create new process group
         unsafe {
@@ -335,5 +339,78 @@ pub enum OutputLine {
 impl Default for Executor {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROBE: &str = "printf '%s' \"${ZAZ_TEST_ABSENT-unset}\"";
+
+    fn complete_env_without_probe() -> HashMap<String, String> {
+        std::env::set_var("ZAZ_TEST_ABSENT", "inherited");
+
+        let mut env: HashMap<String, String> = std::env::vars().collect();
+        env.remove("ZAZ_TEST_ABSENT");
+        env
+    }
+
+    #[test]
+    fn new_executor_starts_from_the_inherited_environment() {
+        std::env::set_var("ZAZ_TEST_SEEDED", "seeded");
+
+        let executor = Executor::new(Some("/bin/sh".to_string()));
+
+        assert_eq!(executor.env().get("ZAZ_TEST_SEEDED").unwrap(), "seeded");
+    }
+
+    #[tokio::test]
+    async fn variable_absent_from_the_map_is_absent_from_the_command() {
+        let executor =
+            Executor::new(Some("/bin/sh".to_string())).with_env(complete_env_without_probe());
+
+        let output = executor.run(PROBE).await.unwrap();
+
+        assert_eq!(output.stdout, vec!["unset".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn variable_present_in_the_map_reaches_the_command() {
+        let mut env = complete_env_without_probe();
+        env.insert("ZAZ_TEST_ABSENT".to_string(), "mapped".to_string());
+        let executor = Executor::new(Some("/bin/sh".to_string())).with_env(env);
+
+        let output = executor.run(PROBE).await.unwrap();
+
+        assert_eq!(output.stdout, vec!["mapped".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn variable_absent_from_the_map_is_absent_in_a_pty() {
+        let pty_system = portable_pty::native_pty_system();
+        let available = pty_system
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .is_ok();
+        if !available {
+            eprintln!("PTY not available in this environment, skipping test");
+            return;
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let out = temp.path().join("probe.txt");
+        let executor =
+            Executor::new(Some("/bin/sh".to_string())).with_env(complete_env_without_probe());
+
+        let command = format!("{PROBE} > '{}'", out.display());
+        let mut child = executor.spawn(&command, true).unwrap();
+        child.wait().await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "unset");
     }
 }

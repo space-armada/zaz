@@ -31,10 +31,13 @@ impl ManagedChild {
         command: &str,
         working_dir: Option<&str>,
     ) -> Result<Self, ProcessError> {
-        Self::spawn_pty_with_env(shell, command, working_dir, &HashMap::new())
+        let env: HashMap<String, String> = std::env::vars().collect();
+        Self::spawn_pty_with_env(shell, command, working_dir, &env)
     }
 
-    /// Spawn a command in a PTY with custom environment variables.
+    /// Spawn a command in a PTY with exactly the given environment.
+    ///
+    /// The daemon's own environment is not inherited.
     pub fn spawn_pty_with_env(
         shell: &str,
         command: &str,
@@ -62,7 +65,8 @@ impl ManagedChild {
             cmd.cwd(dir);
         }
 
-        // Add environment variables
+        // CommandBuilder starts from the daemon's environment, so clear it to make `env` complete.
+        cmd.env_clear();
         for (key, value) in env {
             cmd.env(key, value);
         }
