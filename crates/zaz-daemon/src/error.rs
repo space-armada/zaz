@@ -14,6 +14,10 @@ pub enum DaemonError {
     #[error("configuration error: {0}")]
     Config(#[from] zaz_config::ConfigError),
 
+    /// One or more `env_file`s could not be loaded.
+    #[error("{}", format_env_file_errors(.0))]
+    EnvFile(Vec<zaz_config::EnvFileError>),
+
     /// Watch error.
     #[error("watch error: {0}")]
     Watch(#[from] zaz_watch::WatchError),
@@ -55,6 +59,15 @@ pub enum DaemonError {
     LogStorage(#[from] LogStorageError),
 }
 
+/// One line per error, each ending in its code.
+fn format_env_file_errors(errors: &[zaz_config::EnvFileError]) -> String {
+    errors
+        .iter()
+        .map(|e| format!("{e} [{}]", e.code()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Errors that can occur in a log storage backend.
 ///
 /// The in-memory backend currently never returns these, but every variant maps
@@ -92,6 +105,7 @@ impl DaemonError {
     /// Returns `None` for terminal errors with no actionable recovery.
     pub fn hint(&self) -> Option<&'static str> {
         match self {
+            Self::EnvFile(errors) => errors.first().and_then(|e| e.hint()),
             Self::SocketResolution { .. } => {
                 Some("run this command from a zaz project directory or pass --socket <PATH>")
             }

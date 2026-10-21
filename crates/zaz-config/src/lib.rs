@@ -2,6 +2,7 @@
 //!
 //! Supports both TOML and JSON formats, auto-detected by file extension.
 
+mod env_file;
 mod error;
 mod schema;
 mod toml_spanned;
@@ -9,6 +10,10 @@ mod unknown_keys;
 pub mod user;
 mod validate;
 
+pub use env_file::{
+    env_file_sources, parse_env_file, read_env_file, EnvFileError, EnvFileErrorKind, EnvFileLevel,
+    EnvFileSource, ParseProblem,
+};
 pub use error::{ConfigError, Span, ValidationError, ValidationErrorKind, ValidationErrors};
 pub use schema::{
     Config, Group, HumanDuration, LogFormat, ServiceCommand, Settings, Signal, Silence, TaskCommand,
@@ -993,5 +998,107 @@ command = "./srv"
         assert!(config.groups[0].env.is_empty());
         assert!(config.groups[0].tasks[0].env.is_empty());
         assert!(config.groups[0].services[0].env.is_empty());
+    }
+
+    #[test]
+    fn test_env_file_parses_at_every_level_in_toml() {
+        let toml = r#"
+[settings]
+env_file = "root.env"
+
+[[group]]
+name = "api"
+patterns = ["*.rs"]
+env_file = "group.env"
+
+[[group.task]]
+name = "build"
+command = "make"
+env_file = "task.env"
+
+[[group.service]]
+name = "web"
+command = "run"
+env_file = "service.env"
+"#;
+        let config = parse_toml(toml).unwrap();
+
+        assert_eq!(config.settings.env_file.as_deref(), Some("root.env"));
+        assert_eq!(config.groups[0].env_file.as_deref(), Some("group.env"));
+        assert_eq!(
+            config.groups[0].tasks[0].env_file.as_deref(),
+            Some("task.env")
+        );
+        assert_eq!(
+            config.groups[0].services[0].env_file.as_deref(),
+            Some("service.env")
+        );
+    }
+
+    #[test]
+    fn test_env_file_parses_at_every_level_in_json() {
+        let json = r#"{
+            "settings": { "env_file": "root.env" },
+            "groups": [{
+                "name": "api",
+                "patterns": ["*.rs"],
+                "env_file": "group.env",
+                "tasks": [{ "command": "make", "env_file": "task.env" }],
+                "services": [{ "command": "run", "env_file": "service.env" }]
+            }]
+        }"#;
+        let config = parse_json(json).unwrap();
+
+        assert_eq!(config.settings.env_file.as_deref(), Some("root.env"));
+        assert_eq!(config.groups[0].env_file.as_deref(), Some("group.env"));
+        assert_eq!(
+            config.groups[0].tasks[0].env_file.as_deref(),
+            Some("task.env")
+        );
+        assert_eq!(
+            config.groups[0].services[0].env_file.as_deref(),
+            Some("service.env")
+        );
+    }
+
+    #[test]
+    fn test_env_file_unset_is_not_serialized() {
+        let config = parse_toml("[[group]]\nname = \"a\"\npatterns = [\"*\"]\n").unwrap();
+
+        let toml = toml::to_string(&config).unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(!toml.contains("env_file"), "{toml}");
+        assert!(!json.contains("env_file"), "{json}");
+    }
+
+    #[test]
+    fn test_misspelled_group_env_file_in_toml_is_reported_with_a_hint() {
+        let toml = "[[group]]\nname = \"api\"\npatterns = [\"*\"]\nenv_flie = \".env\"\n";
+
+        let Err(ConfigError::Validation(errors)) = parse_toml(toml) else {
+            panic!("expected a validation error");
+        };
+
+        let error = errors.iter().next().unwrap();
+        assert_eq!(error.code(), "unknown_key");
+        assert_eq!(error.span.map(|s| s.line), Some(4));
+        assert_eq!(error.hint.as_deref(), Some("did you mean 'env_file'?"));
+    }
+
+    #[test]
+    fn test_misspelled_env_file_is_reported_at_every_other_level() {
+        for toml in [
+            "[settings]\nenv_flie = \".env\"\n",
+            "[[group]]\nname = \"a\"\npatterns = [\"*\"]\n[[group.task]]\ncommand = \"x\"\nenv_flie = \".env\"\n",
+            "[[group]]\nname = \"a\"\npatterns = [\"*\"]\n[[group.service]]\ncommand = \"x\"\nenv_flie = \".env\"\n",
+        ] {
+            let Err(ConfigError::Validation(errors)) = parse_toml(toml) else {
+                panic!("expected a validation error for {toml}");
+            };
+
+            let hint = errors.iter().next().unwrap().hint.clone();
+            assert_eq!(hint.as_deref(), Some("did you mean 'env_file'?"), "{toml}");
+        }
     }
 }

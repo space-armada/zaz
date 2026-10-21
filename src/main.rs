@@ -1282,6 +1282,21 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
         valid: bool,
         path: String,
         errors: Vec<CheckError>,
+        /// Sources check did not evaluate. They are never errors.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        not_evaluated: Option<NotEvaluated>,
+    }
+
+    #[derive(Serialize)]
+    struct NotEvaluated {
+        /// `env_file`s that do not exist, which check cannot tell from a mistyped path.
+        missing: Vec<MissingSource>,
+    }
+
+    #[derive(Serialize)]
+    struct MissingSource {
+        field: String,
+        path: String,
     }
 
     #[derive(Serialize)]
@@ -1317,21 +1332,89 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
     let config_path = &zaz_config::absolute_config_path(config_path)?;
     let result = zaz_config::load(config_path);
     match result {
-        Ok(_config) => {
+        Ok(config) => {
+            use yansi::Paint;
+
+            let env_files = check_env_files(&config, config_path);
+            let valid = env_files.errors.is_empty();
+
             if json_output {
                 let result = CheckResult {
-                    valid: true,
+                    valid,
                     path: config_path.display().to_string(),
-                    errors: vec![],
+                    errors: env_files
+                        .errors
+                        .iter()
+                        .map(|e| CheckError {
+                            line: None,
+                            column: None,
+                            message: e.to_string(),
+                            hint: e.hint().map(str::to_string),
+                            code: e.code().to_string(),
+                        })
+                        .collect(),
+                    not_evaluated: Some(NotEvaluated {
+                        missing: env_files
+                            .missing
+                            .iter()
+                            .map(|s| MissingSource {
+                                field: s.field.clone(),
+                                path: s.path.display().to_string(),
+                            })
+                            .collect(),
+                    }),
                 };
 
                 println!("{}", serde_json::to_string(&result)?);
-                return Ok(());
+                return if valid {
+                    Ok(())
+                } else {
+                    check_failed("configuration validation failed")
+                };
             }
 
-            use yansi::Paint;
-            println!("{}: {}", config_path.display(), "OK".green().bold());
-            Ok(())
+            if valid {
+                println!("{}: {}", config_path.display(), "OK".green().bold());
+            } else {
+                for error in &env_files.errors {
+                    eprintln!(
+                        "{}: {}: {}",
+                        config_path.display().bold(),
+                        "error".red().bold(),
+                        error.message()
+                    );
+
+                    if let Some(hint) = error.hint() {
+                        eprintln!("               {}: {}", "hint".cyan().bold(), hint);
+                    }
+                    eprintln!();
+                }
+
+                let count = env_files.errors.len();
+                let plural = if count == 1 { "error" } else { "errors" };
+                eprintln!(
+                    "{} {} {} in {}",
+                    "Found".red().bold(),
+                    count.red().bold(),
+                    plural.red().bold(),
+                    config_path.display().bold()
+                );
+            }
+
+            if !env_files.missing.is_empty() {
+                let missing: Vec<String> = env_files
+                    .missing
+                    .iter()
+                    .map(|s| format!("{} {}", s.field, s.path.display()))
+                    .collect();
+                eprintln!("note: not evaluated, file missing: {}", missing.join(", "));
+            }
+
+            if valid {
+                Ok(())
+            } else {
+                check_failed("configuration validation failed")
+            }
         }
 
         Err(ConfigError::Validation(ref validation_errors)) => {
@@ -1344,6 +1427,7 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                     valid: false,
                     path: config_path.display().to_string(),
                     errors: validation_errors_to_check_errors(validation_errors),
+                    not_evaluated: None,
                 };
 
                 println!("{}", serde_json::to_string(&result)?);
@@ -1397,6 +1481,7 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                         hint: None,
                         code: "parse_error".to_string(),
                     }],
+                    not_evaluated: None,
                 };
 
                 println!("{}", serde_json::to_string(&result)?);
@@ -1417,6 +1502,42 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
             check_failed("configuration parse failed")
         }
     }
+}
+
+/// What `zaz check` found in the `env_file`s a config declares.
+struct EnvFileCheck {
+    /// Files that exist and failed to load, with the same codes the daemon reports.
+    errors: Vec<zaz_config::EnvFileError>,
+    /// Files that do not exist. Check cannot tell a gitignored `.env` from a mistyped path.
+    missing: Vec<zaz_config::EnvFileSource>,
+}
+
+/// Parse every `env_file` of a config that exists, with the parser the daemon uses.
+///
+/// `config_path` must be absolute, as it is for the daemon.
+fn check_env_files(config: &zaz_config::Config, config_path: &Path) -> EnvFileCheck {
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let mut check = EnvFileCheck {
+        errors: Vec::new(),
+        missing: Vec::new(),
+    };
+
+    for source in zaz_config::env_file_sources(config, config_dir) {
+        match zaz_config::read_env_file(config_path, &source) {
+            Ok(_) => {}
+            Err(found)
+                if matches!(
+                    found.as_slice(),
+                    [e] if matches!(e.kind, zaz_config::EnvFileErrorKind::Missing)
+                ) =>
+            {
+                check.missing.push(source);
+            }
+            Err(found) => check.errors.extend(found),
+        }
+    }
+
+    check
 }
 
 fn show_ignores() -> Result<()> {

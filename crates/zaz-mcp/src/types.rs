@@ -227,6 +227,8 @@ pub struct ConfigSettings {
     pub shell: Option<String>,
     pub debounce_ms: u64,
     pub log_format: LogFormatReport,
+    /// The `env_file` path as written. Loaded values are never shown.
+    pub env_file: Option<String>,
 }
 
 /// Log output format.
@@ -246,6 +248,7 @@ pub struct ConfigGroup {
     pub ignore: Vec<String>,
     pub depends_on: Vec<String>,
     pub working_dir: Option<String>,
+    pub env_file: Option<String>,
     pub env: BTreeMap<String, String>,
     pub tasks: Vec<ConfigTask>,
     pub services: Vec<ConfigService>,
@@ -259,6 +262,7 @@ pub struct ConfigTask {
     pub on_change_only: bool,
     pub silence: SilenceReport,
     pub working_dir: Option<String>,
+    pub env_file: Option<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -279,6 +283,7 @@ pub struct ConfigService {
     pub stop_timeout_ms: Option<u64>,
     pub ready_poll_interval_ms: Option<u64>,
     pub ready_timeout_ms: Option<u64>,
+    pub env_file: Option<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -461,6 +466,7 @@ impl From<&Settings> for ConfigSettings {
             shell: s.shell.clone(),
             debounce_ms: s.debounce_ms(),
             log_format: s.log_format.into(),
+            env_file: s.env_file.clone(),
         }
     }
 }
@@ -483,6 +489,7 @@ impl From<&Group> for ConfigGroup {
             ignore: g.ignore.clone(),
             depends_on: g.depends_on.clone(),
             working_dir: g.working_dir.clone(),
+            env_file: g.env_file.clone(),
             env: g.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             tasks: g.tasks.iter().map(ConfigTask::from).collect(),
             services: g.services.iter().map(ConfigService::from).collect(),
@@ -498,6 +505,7 @@ impl From<&TaskCommand> for ConfigTask {
             on_change_only: t.on_change_only,
             silence: t.silence.into(),
             working_dir: t.working_dir.clone(),
+            env_file: t.env_file.clone(),
             env: t.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
@@ -516,6 +524,7 @@ impl From<&ServiceCommand> for ConfigService {
             no_pty: d.no_pty,
             silence: d.silence.into(),
             working_dir: d.working_dir.clone(),
+            env_file: d.env_file.clone(),
             delay_ms: d.delay_ms(),
             stop_timeout_ms: d.stop_timeout_ms(),
             ready_poll_interval_ms: d.ready_poll_interval_ms(),
@@ -642,6 +651,44 @@ mod tests {
         assert_eq!(report.groups[0].tasks.len(), 1);
         assert_eq!(report.groups[0].tasks[0].name, "typecheck");
         assert_eq!(report.groups[0].tasks[0].command, "tsc --noEmit");
+    }
+
+    #[test]
+    fn config_report_shows_env_file_as_written_and_never_its_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("secrets.env");
+        std::fs::write(&env_path, "TOKEN=hunter2\n").unwrap();
+
+        let mut task = TaskCommand::new("build", "make");
+        task.env_file = Some("task.env".to_string());
+        let mut service = ServiceCommand::new("web", "run");
+        service.env_file = Some("svc.env".to_string());
+
+        let mut config = Config::default();
+        config.settings.env_file = Some("secrets.env".to_string());
+        config.groups.push(Group {
+            name: "api".to_string(),
+            env_file: Some("group.env".to_string()),
+            tasks: vec![task],
+            services: vec![service],
+            ..Default::default()
+        });
+
+        let report = ConfigReport::from_config(&dir.path().join("zaz.toml"), &config);
+
+        assert_eq!(report.settings.env_file.as_deref(), Some("secrets.env"));
+        assert_eq!(report.groups[0].env_file.as_deref(), Some("group.env"));
+        assert_eq!(
+            report.groups[0].tasks[0].env_file.as_deref(),
+            Some("task.env")
+        );
+        assert_eq!(
+            report.groups[0].services[0].env_file.as_deref(),
+            Some("svc.env")
+        );
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
     }
 
     #[test]

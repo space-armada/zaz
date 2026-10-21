@@ -7,6 +7,7 @@ mod dependency;
 mod engine;
 mod env;
 mod error;
+mod evaluate;
 mod log_layer;
 mod log_storage;
 mod log_storage_sqlite;

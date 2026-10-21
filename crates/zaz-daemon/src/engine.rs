@@ -4,7 +4,8 @@
 
 use crate::api::LogLine;
 use crate::dependency::DependencyResolver;
-use crate::env;
+use crate::env::{self, GroupEnv, ProcessRef};
+use crate::evaluate::{self, EvaluatedEnv};
 use crate::log_storage::{LogQuery, LogQueryResult, LogStorage};
 use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
@@ -915,6 +916,9 @@ pub struct Engine {
     /// Path to the configuration file.
     config_path: PathBuf,
 
+    /// Environment layers evaluated from the sources `config` names.
+    evaluated: EvaluatedEnv,
+
     /// File system watcher.
     watcher: Watcher,
 
@@ -1003,6 +1007,9 @@ struct ManagedGroup {
     /// Directory that relative `working_dir` values resolve against.
     config_dir: PathBuf,
 
+    /// Evaluated environment layers every process of the group is built from.
+    env: GroupEnv,
+
     /// Task executor.
     executor: Executor,
 
@@ -1025,6 +1032,19 @@ struct ManagedGroup {
     /// while a crashed service respawns and checks again, the same way it stays `Ready` while
     /// a crashed service sits in backoff.
     pending_ready: Option<PendingReady>,
+}
+
+impl ManagedGroup {
+    /// The executor for the task at `index` of the group's config.
+    fn task_executor(&self, index: usize) -> Executor {
+        env::process_executor(
+            &self.executor,
+            &self.config_dir,
+            self.config.tasks[index].working_dir.as_deref(),
+            &self.env,
+            ProcessRef::Task(index),
+        )
+    }
 }
 
 impl Engine {
@@ -1079,6 +1099,8 @@ impl Engine {
         // Determine the config directory for variable expansion
         let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
+        let evaluated = evaluate::evaluate(&config, &config_path).map_err(DaemonError::EnvFile)?;
+
         // Create watcher configuration
         let watcher_config = WatcherConfig {
             root: config_dir.clone(),
@@ -1100,7 +1122,12 @@ impl Engine {
             group_patterns.insert(group.name.clone(), patterns);
             groups.insert(
                 group.name.clone(),
-                build_managed_group(group, config.settings.shell.clone(), &config_dir),
+                build_managed_group(
+                    group,
+                    config.settings.shell.clone(),
+                    &config_dir,
+                    group_env(&evaluated, &group.name)?,
+                ),
             );
         }
 
@@ -1173,6 +1200,7 @@ impl Engine {
         Ok(Self {
             config,
             config_path,
+            evaluated,
             watcher,
             group_patterns,
             groups,
@@ -1481,18 +1509,16 @@ impl Engine {
         );
 
         // Get group configuration
-        let (tasks, executor, config_dir, group_env) = {
+        let (tasks, executors) = {
             let Some(group) = self.groups.get_mut(group_name) else {
                 tracing::warn!(group = %group_name, "group not found");
                 return;
             };
             group.state.status = GroupStatus::Running;
-            (
-                group.config.tasks.clone(),
-                group.executor.clone(),
-                group.config_dir.clone(),
-                group.config.env.clone(),
-            )
+            let executors: Vec<Executor> = (0..group.config.tasks.len())
+                .map(|idx| group.task_executor(idx))
+                .collect();
+            (group.config.tasks.clone(), executors)
         };
 
         // Spawn each task independently (parallel execution)
@@ -1513,20 +1539,12 @@ impl Engine {
                 }
             };
 
-            let task_executor = env::process_executor(
-                &executor,
-                &config_dir,
-                task.working_dir.as_deref(),
-                &group_env,
-                &task.env,
-            );
-
             self.spawn_task(
                 group_name,
                 task.name(),
                 idx,
                 command,
-                task_executor,
+                executors[idx].clone(),
                 task.silence,
             );
         }
@@ -1726,8 +1744,12 @@ impl Engine {
                 if let Some((group_name, task_name)) = completion.task_id.split_once(':') {
                     // Get executor and command for re-run
                     if let Some(group) = self.groups.get(group_name) {
-                        if let Some(task) =
-                            group.config.tasks.iter().find(|t| t.name() == task_name)
+                        if let Some((task_idx, task)) = group
+                            .config
+                            .tasks
+                            .iter()
+                            .enumerate()
+                            .find(|(_, t)| t.name() == task_name)
                         {
                             // For re-run, we use empty context (no specific changed files)
                             let context = Context::new()
@@ -1740,13 +1762,7 @@ impl Engine {
                                 );
                             let expander = zaz_vars::Expander::new(&context);
                             if let Ok(command) = expander.expand(&task.command) {
-                                let task_executor = env::process_executor(
-                                    &group.executor,
-                                    &group.config_dir,
-                                    task.working_dir.as_deref(),
-                                    &group.config.env,
-                                    &task.env,
-                                );
+                                let task_executor = group.task_executor(task_idx);
                                 self.spawn_task(
                                     group_name,
                                     task_name,
@@ -2367,8 +2383,19 @@ impl Engine {
             }
         };
 
+        // 1b. Evaluate the sources the new config names. A failure leaves the running config in
+        // place, like a parse failure does.
+        let new_evaluated = match evaluate::evaluate(&new_config, &self.config_path) {
+            Ok(evaluated) => evaluated,
+            Err(e) => {
+                let e = DaemonError::EnvFile(e);
+                tracing::error!(error = %e, "failed to evaluate config sources");
+                return ReloadResult::Failed(format!("environment error: {}", e));
+            }
+        };
+
         // 2. Compute changes
-        let diff = self.get_config_diff(&new_config);
+        let diff = self.get_config_diff(&new_config, &new_evaluated);
 
         // Stop hooks expand against the config being replaced, since they belong to the
         // services that config started.
@@ -2427,6 +2454,7 @@ impl Engine {
 
         // 6. Apply new configuration
         self.config = new_config;
+        self.evaluated = new_evaluated;
         self.execution_order = execution_order;
 
         // 6b. Rebuild dependency resolver from new config
@@ -2479,8 +2507,8 @@ impl Engine {
     }
 
     /// Compute changes between current config and new config.
-    fn get_config_diff(&self, new_config: &Config) -> ConfigDiff {
-        compute_config_diff(&self.config, new_config)
+    fn get_config_diff(&self, new_config: &Config, new_evaluated: &EvaluatedEnv) -> ConfigDiff {
+        compute_config_diff(&self.config, &self.evaluated, new_config, new_evaluated)
     }
 
     /// Rebuild group patterns and managed groups from current config.
@@ -2505,7 +2533,12 @@ impl Engine {
                 existing.config = group.clone();
                 existing
             } else {
-                build_managed_group(group, self.config.settings.shell.clone(), config_dir)
+                build_managed_group(
+                    group,
+                    self.config.settings.shell.clone(),
+                    config_dir,
+                    group_env(&self.evaluated, &group.name)?,
+                )
             };
             new_groups.insert(group.name.clone(), managed_group);
         }
@@ -2560,13 +2593,7 @@ impl Engine {
                 .expand(&task_config.command)
                 .map_err(|e| DaemonError::VarExpansion(e.to_string()))?;
 
-            let executor = env::process_executor(
-                &group.executor,
-                &group.config_dir,
-                task_config.working_dir.as_deref(),
-                &group.config.env,
-                &task_config.env,
-            );
+            let executor = group.task_executor(task_idx);
             let silence = task_config.silence;
 
             // Spawn task in background (same as restart_group) for proper log streaming
@@ -3277,19 +3304,33 @@ fn build_group_state(group: &Group) -> GroupState {
     }
 }
 
-fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) -> ManagedGroup {
-    let executor = env::group_executor(shell, config_dir, group.working_dir.as_deref(), &group.env);
+/// The evaluated layers of a group, which every group build requires.
+fn group_env(evaluated: &EvaluatedEnv, name: &str) -> Result<GroupEnv, DaemonError> {
+    evaluated
+        .group(name)
+        .cloned()
+        .ok_or_else(|| DaemonError::GroupNotFound(name.to_string()))
+}
+
+fn build_managed_group(
+    group: &Group,
+    shell: Option<String>,
+    config_dir: &Path,
+    group_env: GroupEnv,
+) -> ManagedGroup {
+    let executor = env::group_executor(shell, config_dir, group.working_dir.as_deref(), &group_env);
 
     let services: Vec<Service> = group
         .services
         .iter()
-        .map(|d| {
+        .enumerate()
+        .map(|(idx, d)| {
             let service_executor = env::process_executor(
                 &executor,
                 config_dir,
                 d.working_dir.as_deref(),
-                &group.env,
-                &d.env,
+                &group_env,
+                ProcessRef::Service(idx),
             );
             Service::new(d.clone(), service_executor)
         })
@@ -3299,6 +3340,7 @@ fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) 
     ManagedGroup {
         config: group.clone(),
         config_dir: config_dir.to_path_buf(),
+        env: group_env,
         executor,
         services,
         state: build_group_state(group),
@@ -3354,7 +3396,16 @@ fn calculate_group_status_from_tasks(
 }
 
 /// Compute changes between the current and new configurations.
-fn compute_config_diff(old_config: &Config, new_config: &Config) -> ConfigDiff {
+///
+/// A group is modified when its config changed, when any setting changed, or when the values
+/// evaluated from its sources changed. The unchanged groups keep their executors, so an edited
+/// `env_file` must mark its groups modified or they would keep stale values.
+fn compute_config_diff(
+    old_config: &Config,
+    old_evaluated: &EvaluatedEnv,
+    new_config: &Config,
+    new_evaluated: &EvaluatedEnv,
+) -> ConfigDiff {
     use std::collections::HashSet;
 
     let old_groups = &old_config.groups;
@@ -3377,7 +3428,10 @@ fn compute_config_diff(old_config: &Config, new_config: &Config) -> ConfigDiff {
 
     for new_group in new_groups {
         if let Some(old_group) = old_groups.iter().find(|g| g.name == new_group.name) {
-            if all_groups_modified || old_group != new_group {
+            let env_changed =
+                old_evaluated.group(&new_group.name) != new_evaluated.group(&new_group.name);
+
+            if all_groups_modified || old_group != new_group || env_changed {
                 modified.push(new_group.name.clone());
             } else {
                 unchanged.push(new_group.name.clone());
@@ -4298,7 +4352,12 @@ mod tests {
             },
         ];
 
-        let diff = compute_config_diff(&test_config(groups.clone()), &test_config(groups));
+        let diff = compute_config_diff(
+            &test_config(groups.clone()),
+            &EvaluatedEnv::default(),
+            &test_config(groups),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         assert!(diff.modified.is_empty());
@@ -4322,7 +4381,12 @@ mod tests {
             },
         ];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert_eq!(diff.added, vec!["b"]);
         assert!(diff.removed.is_empty());
         assert!(diff.modified.is_empty());
@@ -4346,7 +4410,12 @@ mod tests {
             ..Default::default()
         }];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert_eq!(diff.removed, vec!["b"]);
         assert!(diff.modified.is_empty());
@@ -4366,7 +4435,12 @@ mod tests {
             ..Default::default()
         }];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         assert_eq!(diff.modified, vec!["a"]);
@@ -4386,7 +4460,12 @@ mod tests {
             ..Default::default()
         }];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         assert_eq!(diff.modified, vec!["a"]);
@@ -4426,7 +4505,12 @@ mod tests {
             },
         ];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert_eq!(diff.added, vec!["add"]);
         assert_eq!(diff.removed, vec!["remove"]);
         assert_eq!(diff.modified, vec!["modify"]);
@@ -4447,7 +4531,12 @@ mod tests {
             },
         ];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert_eq!(diff.added.len(), 2);
         assert!(diff.added.contains(&"a".to_string()));
         assert!(diff.added.contains(&"b".to_string()));
@@ -4470,7 +4559,12 @@ mod tests {
         ];
         let new: Vec<Group> = vec![];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert_eq!(diff.removed.len(), 2);
         assert!(diff.removed.contains(&"a".to_string()));
@@ -4490,7 +4584,12 @@ mod tests {
         old_config.settings.shell = Some("bash".to_string());
         new_config.settings.shell = Some("zsh".to_string());
 
-        let diff = compute_config_diff(&old_config, &new_config);
+        let diff = compute_config_diff(
+            &old_config,
+            &EvaluatedEnv::default(),
+            &new_config,
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         assert_eq!(diff.modified, vec!["a"]);
@@ -4510,7 +4609,12 @@ mod tests {
             ..Default::default()
         }];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert_eq!(diff.modified, vec!["a"]);
         assert!(diff.unchanged.is_empty());
     }
@@ -5430,7 +5534,12 @@ mod tests {
         let mut updated_modified = modified.clone();
         updated_modified.patterns = vec!["*.rs".to_string()];
         let new_config = test_config(vec![unchanged, updated_modified]);
-        let diff = compute_config_diff(&engine.config, &new_config);
+        let diff = compute_config_diff(
+            &engine.config,
+            &engine.evaluated,
+            &new_config,
+            &engine.evaluated,
+        );
 
         engine.config = new_config;
         engine.rebuild_groups(diff).unwrap();
@@ -7031,5 +7140,220 @@ command = "touch '{marker}'"
             "only the first transition is gated; a group already Ready keeps it while a \
              respawned service checks again, the same as it does through a backoff"
         );
+    }
+
+    // =========================================================================
+    // env_file tests
+    // =========================================================================
+
+    fn write_env_file_config(dir: &Path, task_out: &Path, hook_out: &Path) -> PathBuf {
+        let config_path = dir.join("zaz.toml");
+        let config = format!(
+            r#"
+[settings]
+env_file = "settings.env"
+
+[[group]]
+name = "api"
+patterns = ["never.txt"]
+env_file = "group.env"
+env = {{ C = "group-inline" }}
+
+[[group.task]]
+name = "show"
+command = "printf '%s' \"$A $B $C $D $E\" > '{task_out}'"
+env_file = "task.env"
+env = {{ E = "task-inline" }}
+
+[[group.service]]
+name = "svc"
+command = "sleep 30"
+cleanup_command = "printf '%s' \"$A $B $C $F\" > '{hook_out}'"
+env_file = "service.env"
+
+[[group]]
+name = "other"
+patterns = ["never.txt"]
+
+[[group.task]]
+name = "quiet"
+command = "true"
+"#,
+            task_out = task_out.display(),
+            hook_out = hook_out.display(),
+        );
+        std::fs::write(&config_path, config).unwrap();
+        std::fs::write(
+            dir.join("settings.env"),
+            "A=settings\nB=settings\nC=settings\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("group.env"),
+            "B=group-file\nC=group-file\nD=group-file\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("task.env"), "D=task-file\nE=task-file\n").unwrap();
+        std::fs::write(dir.join("service.env"), "F=service-file\n").unwrap();
+
+        config_path
+    }
+
+    #[tokio::test]
+    async fn test_env_file_values_reach_tasks_services_and_hooks_in_precedence_order() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_out = temp_dir.path().join("task.out");
+        let hook_out = temp_dir.path().join("hook.out");
+        let config_path = write_env_file_config(temp_dir.path(), &task_out, &hook_out);
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        assert_eq!(
+            std::fs::read_to_string(&task_out).unwrap(),
+            "settings group-file group-inline task-file task-inline"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hook_out).unwrap(),
+            "settings group-file group-inline service-file"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reload_after_env_file_edit_rebuilds_only_the_affected_group() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_out = temp_dir.path().join("task.out");
+        let hook_out = temp_dir.path().join("hook.out");
+        let config_path = write_env_file_config(temp_dir.path(), &task_out, &hook_out);
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        match engine.reload_config().await {
+            ReloadResult::Success { modified, .. } => assert!(modified.is_empty(), "{modified:?}"),
+            other => panic!("expected reload success, got {:?}", other),
+        }
+
+        std::fs::write(temp_dir.path().join("task.env"), "D=edited\nE=task-file\n").unwrap();
+
+        match engine.reload_config().await {
+            ReloadResult::Success { modified, .. } => assert_eq!(modified, vec!["api"]),
+            other => panic!("expected reload success, got {:?}", other),
+        }
+        assert!(engine.wait_for_tasks().await);
+
+        assert_eq!(
+            std::fs::read_to_string(&task_out).unwrap(),
+            "settings group-file group-inline edited task-inline"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reload_after_settings_env_file_edit_rebuilds_every_group() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_out = temp_dir.path().join("task.out");
+        let hook_out = temp_dir.path().join("hook.out");
+        let config_path = write_env_file_config(temp_dir.path(), &task_out, &hook_out);
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        std::fs::write(
+            temp_dir.path().join("settings.env"),
+            "A=edited\nB=settings\nC=settings\n",
+        )
+        .unwrap();
+
+        match engine.reload_config().await {
+            ReloadResult::Success { mut modified, .. } => {
+                modified.sort();
+                assert_eq!(modified, vec!["api", "other"]);
+            }
+            other => panic!("expected reload success, got {:?}", other),
+        }
+        assert!(engine.wait_for_tasks().await);
+
+        assert!(std::fs::read_to_string(&task_out)
+            .unwrap()
+            .starts_with("edited "));
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reload_with_a_missing_env_file_fails_and_keeps_the_running_config() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_out = temp_dir.path().join("task.out");
+        let hook_out = temp_dir.path().join("hook.out");
+        let config_path = write_env_file_config(temp_dir.path(), &task_out, &hook_out);
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        let before = engine.evaluated.clone();
+
+        let removed = temp_dir.path().join("group.env");
+        std::fs::remove_file(&removed).unwrap();
+
+        match engine.reload_config().await {
+            ReloadResult::Failed(message) => {
+                assert!(message.contains("env_file_missing"), "{message}");
+                assert!(
+                    message.contains(&removed.display().to_string()),
+                    "{message}"
+                );
+                assert!(message.contains("group 'api' env_file"), "{message}");
+                assert!(
+                    message.contains(&config_path.display().to_string()),
+                    "{message}"
+                );
+            }
+            other => panic!("expected reload failure, got {:?}", other),
+        }
+
+        assert_eq!(engine.evaluated, before);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn test_engine_start_with_a_malformed_env_file_is_a_coded_error() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        std::fs::write(
+            &config_path,
+            "[[group]]\nname = \"a\"\nenv_file = \"bad.env\"\n\n[[group.task]]\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        std::fs::write(temp_dir.path().join("bad.env"), "TOKEN=a b\n").unwrap();
+
+        let Err(err) = Engine::new(&config_path) else {
+            panic!("expected the engine to refuse a malformed env_file");
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("env_file_unquoted_whitespace"),
+            "{message}"
+        );
+        assert!(message.contains("line 1"), "{message}");
+        assert!(!message.contains("TOKEN"), "{message}");
     }
 }
