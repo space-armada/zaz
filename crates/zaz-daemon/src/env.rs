@@ -8,6 +8,7 @@
 //! a different starting environment needs the whole chain rebuilt from the raw layers.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use zaz_process::Executor;
 
@@ -27,11 +28,11 @@ impl EnvLayer {
         )
     }
 
-    fn apply(&self, env: &mut HashMap<String, String>) {
+    fn apply(&self, env: &mut EnvMap) {
         for (key, value) in &self.0 {
             match value {
-                Some(value) => env.insert(key.clone(), value.clone()),
-                None => env.remove(key),
+                Some(value) => env.insert(OsString::from(key), OsString::from(value)),
+                None => env.remove(OsStr::new(key)),
             };
         }
     }
@@ -78,18 +79,24 @@ pub(crate) enum ProcessRef {
     Service(usize),
 }
 
+/// A complete process environment.
+///
+/// Names and values are `OsString` because the daemon's own environment need not be UTF-8. Config
+/// and `env_file` values are always UTF-8 and convert in.
+pub(crate) type EnvMap = HashMap<OsString, OsString>;
+
 /// The daemon's own environment.
-pub(crate) fn inherited_env() -> HashMap<String, String> {
-    std::env::vars().collect()
+pub(crate) fn inherited_env() -> EnvMap {
+    std::env::vars_os().collect()
 }
 
 /// Build a complete environment from a starting environment and ordered layers.
 ///
 /// Layers apply in order, so a later layer wins, and an unset removes the key at that point.
 pub(crate) fn build_env<'a>(
-    start: HashMap<String, String>,
+    start: EnvMap,
     layers: impl IntoIterator<Item = &'a EnvLayer>,
-) -> HashMap<String, String> {
+) -> EnvMap {
     let mut env = start;
 
     for layer in layers {
@@ -159,6 +166,17 @@ mod tests {
             .collect()
     }
 
+    fn start(pairs: &[(&str, &str)]) -> EnvMap {
+        pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect()
+    }
+
+    fn get<'a>(env: &'a EnvMap, key: &str) -> Option<&'a str> {
+        env.get(OsStr::new(key)).and_then(|v| v.to_str())
+    }
+
     fn file(pairs: &[(&str, &str)]) -> EnvLayer {
         EnvLayer::from_vars(&map(pairs))
     }
@@ -169,26 +187,64 @@ mod tests {
 
     #[test]
     fn later_layers_win() {
-        let start = map(&[("A", "start"), ("B", "start"), ("C", "start")]);
+        let base = start(&[("A", "start"), ("B", "start"), ("C", "start")]);
         let group = EnvLayer::from_vars(&map(&[("B", "group"), ("C", "group")]));
         let process = EnvLayer::from_vars(&map(&[("C", "process")]));
 
-        let env = build_env(start, &[group, process]);
+        let env = build_env(base, &[group, process]);
 
-        assert_eq!(env["A"], "start");
-        assert_eq!(env["B"], "group");
-        assert_eq!(env["C"], "process");
+        assert_eq!(get(&env, "A"), Some("start"));
+        assert_eq!(get(&env, "B"), Some("group"));
+        assert_eq!(get(&env, "C"), Some("process"));
     }
 
     #[test]
     fn unset_removes_the_key_and_a_later_set_restores_it() {
-        let start = map(&[("A", "start"), ("B", "start")]);
+        let base = start(&[("A", "start"), ("B", "start")]);
         let reset = EnvLayer::from_vars(&map(&[("B", "again")]));
 
-        let env = build_env(start, &[unset(&["A", "B"]), reset]);
+        let env = build_env(base, &[unset(&["A", "B"]), reset]);
 
-        assert!(!env.contains_key("A"));
-        assert_eq!(env["B"], "again");
+        assert_eq!(get(&env, "A"), None);
+        assert_eq!(get(&env, "B"), Some("again"));
+    }
+
+    #[test]
+    fn a_non_utf8_start_entry_survives_the_merge_unchanged() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut base = start(&[("A", "start")]);
+        base.insert(
+            OsString::from("RAW"),
+            OsString::from_vec(vec![0xff, 0xfe, b'x']),
+        );
+
+        let env = build_env(base, &[file(&[("A", "layer")])]);
+
+        assert_eq!(get(&env, "A"), Some("layer"));
+        assert_eq!(
+            env.get(OsStr::new("RAW")).unwrap(),
+            &OsString::from_vec(vec![0xff, 0xfe, b'x'])
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_inherited_value_does_not_panic_the_group_build() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = OsString::from_vec(vec![b'v', 0xff]);
+        std::env::set_var("ZAZ_TEST_NON_UTF8_INHERITED", &raw);
+
+        let env = GroupEnv::default();
+        let group = group_executor(None, Path::new("/cfg"), None, &env);
+        let task = process_executor(&group, Path::new("/cfg"), None, &env, ProcessRef::Task(0));
+
+        assert_eq!(
+            task.env().get(OsStr::new("ZAZ_TEST_NON_UTF8_INHERITED")),
+            Some(&raw)
+        );
+
+        std::env::remove_var("ZAZ_TEST_NON_UTF8_INHERITED");
     }
 
     #[test]
@@ -211,10 +267,13 @@ mod tests {
         let group = group_executor(None, Path::new("/cfg"), None, &env);
         let task = process_executor(&group, Path::new("/cfg"), None, &env, ProcessRef::Task(0));
 
-        assert_eq!(task.env()["ZAZ_TEST_MERGE_INHERITED"], "inherited");
-        assert_eq!(task.env()["ZAZ_TEST_MERGE_SHADOWED"], "group");
-        assert_eq!(task.env()["ZAZ_TEST_MERGE_OVERRIDDEN"], "task");
-        assert_eq!(group.env()["ZAZ_TEST_MERGE_OVERRIDDEN"], "group");
+        assert_eq!(
+            get(task.env(), "ZAZ_TEST_MERGE_INHERITED"),
+            Some("inherited")
+        );
+        assert_eq!(get(task.env(), "ZAZ_TEST_MERGE_SHADOWED"), Some("group"));
+        assert_eq!(get(task.env(), "ZAZ_TEST_MERGE_OVERRIDDEN"), Some("task"));
+        assert_eq!(get(group.env(), "ZAZ_TEST_MERGE_OVERRIDDEN"), Some("group"));
     }
 
     #[test]
@@ -243,15 +302,15 @@ mod tests {
         let group = group_executor(None, Path::new("/cfg"), None, &env);
         let task = process_executor(&group, Path::new("/cfg"), None, &env, ProcessRef::Task(0));
 
-        assert_eq!(group.env()["A"], "settings-file");
-        assert_eq!(group.env()["B"], "group-file");
-        assert_eq!(group.env()["C"], "group-inline");
-        assert_eq!(group.env()["D"], "group-file");
-        assert!(!group.env().contains_key("E"));
+        assert_eq!(get(group.env(), "A"), Some("settings-file"));
+        assert_eq!(get(group.env(), "B"), Some("group-file"));
+        assert_eq!(get(group.env(), "C"), Some("group-inline"));
+        assert_eq!(get(group.env(), "D"), Some("group-file"));
+        assert_eq!(get(group.env(), "E"), None);
 
-        assert_eq!(task.env()["C"], "group-inline");
-        assert_eq!(task.env()["D"], "task-file");
-        assert_eq!(task.env()["E"], "task-inline");
+        assert_eq!(get(task.env(), "C"), Some("group-inline"));
+        assert_eq!(get(task.env(), "D"), Some("task-file"));
+        assert_eq!(get(task.env(), "E"), Some("task-inline"));
     }
 
     #[test]
@@ -272,10 +331,10 @@ mod tests {
             ProcessRef::Service(0),
         );
 
-        assert_eq!(task1.env()["T"], "1");
-        assert!(!task1.env().contains_key("S"));
-        assert_eq!(service0.env()["S"], "0");
-        assert!(!service0.env().contains_key("T"));
+        assert_eq!(get(task1.env(), "T"), Some("1"));
+        assert_eq!(get(task1.env(), "S"), None);
+        assert_eq!(get(service0.env(), "S"), Some("0"));
+        assert_eq!(get(service0.env(), "T"), None);
     }
 
     #[test]

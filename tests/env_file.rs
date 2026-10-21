@@ -70,6 +70,7 @@ fn check_parses_an_existing_env_file_and_reports_the_same_code_as_load() {
         "{message}"
     );
     assert!(!message.contains("hunter2"), "{message}");
+    assert!(!message.contains("zaz.toml"), "{message}");
 
     let Err(load_error) = zaz_daemon::Engine::new(&dir.join("zaz.toml")) else {
         panic!("load should refuse the malformed file");
@@ -97,6 +98,33 @@ fn check_reports_an_unreadable_directory_as_an_error_not_as_missing() {
         result["not_evaluated"]["missing"].as_array().unwrap().len(),
         0
     );
+}
+
+#[test]
+fn check_does_not_open_a_named_pipe_and_lists_it_as_not_read() {
+    let temp = project(None);
+    let dir = temp.path().canonicalize().unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.join(".env"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "mkfifo is required for this test");
+
+    let output = run_zaz(&dir, &["check", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_string(&output));
+
+    let result: Value = serde_json::from_str(&stdout_string(&output)).unwrap();
+    assert_eq!(result["valid"], true);
+
+    let not_read = result["not_evaluated"]["not_read"].as_array().unwrap();
+    assert_eq!(not_read.len(), 1);
+    assert_eq!(not_read[0]["field"], "group 'app' env_file");
+    assert_eq!(not_read[0]["path"], dir.join(".env").to_str().unwrap());
+    assert_eq!(not_read[0]["reason"], "not a regular file");
+
+    let output = run_zaz(&dir, &["check"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr_string(&output).contains("not evaluated, not read"));
 }
 
 #[test]

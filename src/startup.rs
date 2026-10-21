@@ -440,7 +440,7 @@ mod tests {
     async fn a_pre_check_that_finds_a_load_error_does_not_wait() {
         let temp = TempDir::new().unwrap();
         let socket = temp.path().join("never-bound.sock");
-        let error = LoadError::new("config_parse_error", "bad toml");
+        let error = LoadError::new("parse_error", "bad toml");
         let state = Box::new(DaemonState {
             load_error: Some(error.clone()),
             ..Default::default()

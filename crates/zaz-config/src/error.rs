@@ -134,6 +134,24 @@ impl ValidationError {
     }
 }
 
+impl ValidationError {
+    /// The error as one line that ends in its code, with the hint on the line after.
+    pub fn display_with_code(&self) -> String {
+        let mut out = String::new();
+
+        if let Some(span) = &self.span {
+            out.push_str(&format!("{span}: "));
+        }
+        out.push_str(&format!("{} [{}]", self.kind, self.code()));
+
+        if let Some(hint) = &self.hint {
+            out.push_str(&format!("\n               hint: {hint}"));
+        }
+
+        out
+    }
+}
+
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Location prefix
@@ -472,6 +490,18 @@ impl ValidationErrors {
         self.errors.iter()
     }
 
+    /// A header, then each error through [`ValidationError::display_with_code`].
+    pub fn display_with_codes(&self) -> String {
+        let mut out = String::from("configuration validation failed:");
+
+        for error in &self.errors {
+            out.push('\n');
+            out.push_str(&error.display_with_code());
+        }
+
+        out
+    }
+
     /// Convert to a Result, returning Ok if empty.
     pub fn into_result(self) -> Result<(), Self> {
         if self.is_empty() {
@@ -530,6 +560,24 @@ impl ConfigError {
         match self {
             Self::NotFound { .. } => Some("create one, or pass --config <PATH>"),
             _ => None,
+        }
+    }
+
+    /// A stable code for a failure that is not a single validation error.
+    ///
+    /// `zaz check --json` and the daemon's `load_error` both report this code. Every read, format,
+    /// and parse failure is `parse_error`. A validation failure reports the code of its first
+    /// error, since each of its errors carries its own.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound { .. } => "config_not_found",
+            Self::Io { .. } | Self::UnknownFormat { .. } | Self::Toml { .. } | Self::Json(_) => {
+                "parse_error"
+            }
+            Self::Validation(errors) => errors
+                .iter()
+                .next()
+                .map_or("config_invalid", ValidationError::code),
         }
     }
 

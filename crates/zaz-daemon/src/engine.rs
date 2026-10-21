@@ -6,7 +6,7 @@ use crate::api::LogLine;
 use crate::dependency::DependencyResolver;
 use crate::env::{self, GroupEnv, ProcessRef};
 use crate::evaluate::{self, EvaluatedEnv, Prepared};
-use crate::log_storage::{LogQuery, LogQueryResult, LogStorage};
+use crate::log_storage::{LogQuery, LogQueryResult};
 use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
 };
@@ -938,7 +938,7 @@ pub struct Engine {
     status_tx: broadcast::Sender<ApiResponse>,
 
     /// Log storage with channel-based ingestion from spawned tasks.
-    log_store: crate::log_store::LogStore,
+    log_store: crate::log_store::SharedLogStore,
 
     /// Currently running tasks (by "group:task" id). All tasks can run in parallel.
     running_tasks: std::collections::HashSet<String>,
@@ -1040,6 +1040,84 @@ struct ManagedGroup {
     pending_ready: Option<PendingReady>,
 }
 
+/// Answer a `GetLogs` or `SubscribeLogs` request from a log store.
+///
+/// The engine and the daemon host share this, so logs read the same whether or not the engine is
+/// busy applying a config. The caller drains the store first when it needs fresh lines.
+pub(crate) fn answer_log_request(
+    store: &crate::log_store::SharedLogStore,
+    request: crate::ApiRequest,
+) -> crate::ApiResponse {
+    use crate::{ApiRequest, ApiResponse};
+
+    match request {
+        ApiRequest::GetLogs {
+            name,
+            lines,
+            offset,
+            limit,
+            search,
+            ..
+        } => {
+            let use_pagination = offset.is_some() || limit.is_some() || search.is_some();
+
+            if use_pagination {
+                let mut query = if name == "*" {
+                    LogQuery::all()
+                } else {
+                    LogQuery::process(&name)
+                };
+
+                if let Some(off) = offset {
+                    query = query.with_offset(off);
+                }
+                if let Some(lim) = limit {
+                    query = query.with_limit(lim);
+                } else if let Some(lines_limit) = lines {
+                    query = query.with_limit(lines_limit);
+                }
+                if let Some(ref pattern) = search {
+                    query = query.with_search(pattern);
+                }
+
+                match store.query(query) {
+                    Ok(result) => ApiResponse::Logs {
+                        name,
+                        lines: result.logs,
+                        total_count: Some(result.total_count),
+                        has_more: Some(result.has_more),
+                        offset: Some(result.offset),
+                    },
+                    Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
+                }
+            } else {
+                match store.get(&name, lines) {
+                    Ok(logs) => ApiResponse::Logs {
+                        name,
+                        lines: logs,
+                        total_count: None,
+                        has_more: None,
+                        offset: None,
+                    },
+                    Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
+                }
+            }
+        }
+        // The caller streams from `subscribe_logs`. This returns the lines so far.
+        ApiRequest::SubscribeLogs { name } => match store.get(&name, Some(100)) {
+            Ok(logs) => ApiResponse::Logs {
+                name,
+                lines: logs,
+                total_count: None,
+                has_more: None,
+                offset: None,
+            },
+            Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
+        },
+        _ => ApiResponse::error("not a log request"),
+    }
+}
+
 impl ManagedGroup {
     /// The executor for the task at `index` of the group's config.
     fn task_executor(&self, index: usize) -> Executor {
@@ -1074,9 +1152,13 @@ impl Engine {
         let config_path =
             zaz_config::absolute_config_path(config_path).map_err(DaemonError::Config)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        evaluate::prepare_detached(config_path.clone(), move |result| {
-            let _ = tx.send(result);
-        });
+        evaluate::prepare_detached(
+            config_path.clone(),
+            evaluate::LOAD_DEADLINE,
+            move |result| {
+                let _ = tx.send(result);
+            },
+        );
 
         let prepared = rx.await.unwrap_or(Err(DaemonError::EvaluationPanicked))?;
 
@@ -1210,7 +1292,7 @@ impl Engine {
                 }
             }
 
-            store
+            crate::log_store::SharedLogStore::new(store)
         };
 
         // Create mpsc channel for task completion signals
@@ -1283,6 +1365,11 @@ impl Engine {
     /// Subscribe to log stream.
     pub fn subscribe_logs(&self) -> broadcast::Receiver<LogLine> {
         self.log_store.subscribe()
+    }
+
+    /// A handle to the log store that outlives a borrow of the engine.
+    pub(crate) fn log_handle(&self) -> crate::log_store::SharedLogStore {
+        self.log_store.clone()
     }
 
     /// Get a sender for submitting logs (for spawned tasks).
@@ -2388,20 +2475,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Reload configuration from the file, blocking on its sources.
-    ///
-    /// The daemon does not call this. It loads and evaluates on a separate thread and hands the
-    /// result to [`Engine::apply_prepared`], so a slow source never stalls its event loop. This
-    /// form is for callers that have no event loop to protect.
-    pub async fn reload_config(&mut self) -> ReloadResult {
-        tracing::info!(path = %self.config_path.display(), "reloading configuration");
-
-        match evaluate::prepare(&self.config_path) {
-            Ok(prepared) => self.apply_prepared(prepared).await,
-            Err(e) => Self::prepare_failure(&e),
-        }
-    }
-
     /// The API answer to a reload.
     pub(crate) fn reload_response(result: ReloadResult) -> ApiResponse {
         match result {
@@ -2421,20 +2494,22 @@ impl Engine {
 
     /// The reload result for a config that failed to load or evaluate. The running config stays
     /// in place.
+    ///
+    /// The message is the error's own, so a validation failure and an `env_file` failure both list
+    /// one error per line with its code.
     pub(crate) fn prepare_failure(error: &DaemonError) -> ReloadResult {
-        match error {
-            DaemonError::Config(e) => {
-                tracing::error!(error = %e, "failed to parse config");
-                ReloadResult::Failed(format!("parse error: {}", e))
-            }
-            DaemonError::EnvFile(_) => {
-                tracing::error!(error = %error, "failed to evaluate config sources");
-                ReloadResult::Failed(format!("environment error: {}", error))
-            }
-            other => {
-                tracing::error!(error = %other, "failed to load config");
-                ReloadResult::Failed(format!("{}", other))
-            }
+        tracing::error!(error = %error, "failed to load config");
+
+        ReloadResult::Failed(error.to_string())
+    }
+
+    /// Reload from disk and apply, blocking on the sources. The daemon loads on a separate thread
+    /// instead, so only tests that have no event loop to protect call this.
+    #[cfg(test)]
+    async fn reload_config(&mut self) -> ReloadResult {
+        match evaluate::prepare(&self.config_path) {
+            Ok(prepared) => self.apply_prepared(prepared).await,
+            Err(e) => Self::prepare_failure(&e),
         }
     }
 
@@ -2784,74 +2859,8 @@ impl Engine {
                     state: self.state.clone(),
                 }
             }
-            ApiRequest::GetLogs {
-                name,
-                lines,
-                offset,
-                limit,
-                search,
-                ..
-            } => {
-                // Use new pagination if any pagination param is set, otherwise use legacy
-                let use_pagination = offset.is_some() || limit.is_some() || search.is_some();
-
-                if use_pagination {
-                    // Build query from request parameters
-                    let mut query = if name == "*" {
-                        LogQuery::all()
-                    } else {
-                        LogQuery::process(&name)
-                    };
-
-                    if let Some(off) = offset {
-                        query = query.with_offset(off);
-                    }
-                    if let Some(lim) = limit {
-                        query = query.with_limit(lim);
-                    } else if let Some(lines_limit) = lines {
-                        // Fall back to legacy `lines` parameter
-                        query = query.with_limit(lines_limit);
-                    }
-                    if let Some(ref pattern) = search {
-                        query = query.with_search(pattern);
-                    }
-
-                    match self.query_logs(query) {
-                        Ok(result) => ApiResponse::Logs {
-                            name,
-                            lines: result.logs,
-                            total_count: Some(result.total_count),
-                            has_more: Some(result.has_more),
-                            offset: Some(result.offset),
-                        },
-                        Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
-                    }
-                } else {
-                    // Legacy behavior: just return logs with optional limit
-                    match self.get_logs(&name, lines) {
-                        Ok(logs) => ApiResponse::Logs {
-                            name,
-                            lines: logs,
-                            total_count: None,
-                            has_more: None,
-                            offset: None,
-                        },
-                        Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
-                    }
-                }
-            }
-            ApiRequest::SubscribeLogs { name } => {
-                // Return current logs; caller should use subscribe_logs() for streaming
-                match self.get_logs(&name, Some(100)) {
-                    Ok(logs) => ApiResponse::Logs {
-                        name,
-                        lines: logs,
-                        total_count: None,
-                        has_more: None,
-                        offset: None,
-                    },
-                    Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
-                }
+            request @ (ApiRequest::GetLogs { .. } | ApiRequest::SubscribeLogs { .. }) => {
+                answer_log_request(&self.log_store, request)
             }
             ApiRequest::RestartGroup { name, .. } => match self.restart_group(&name).await {
                 Ok(()) => {
@@ -2872,7 +2881,10 @@ impl Engine {
                 Ok(()) => ApiResponse::ok_with_message("restart initiated for all groups"),
                 Err(e) => ApiResponse::error(format!("failed to restart: {}", e)),
             },
-            ApiRequest::ReloadConfig => Self::reload_response(self.reload_config().await),
+            ApiRequest::ReloadConfig => ApiResponse::error(
+                "the engine does not reload itself [reload_not_supported]: reloads go through the \
+                 daemon host, which loads sources off the event loop",
+            ),
             ApiRequest::Identify => {
                 let config_path = self
                     .config_path

@@ -82,7 +82,8 @@ regardless of mode:
 
 To cover several configs in one session, a workspace supervisor spawns one
 ordinary single-config daemon per member and routes project-qualified names to
-them, leaving the single-config path byte-for-byte unchanged.
+them. The single-config path keeps its behavior, except that a daemon now binds
+its socket before it loads its config and answers requests while it loads.
 
 ### Key Components
 

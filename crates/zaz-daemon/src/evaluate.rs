@@ -11,7 +11,10 @@ use crate::env::{EnvLayer, GroupEnv};
 use crate::DaemonError;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use zaz_config::{Config, EnvFileError, EnvFileLevel};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use zaz_config::{Config, EnvFileError, EnvFileLevel, SpecialFiles};
 
 /// A config loaded from disk together with everything its sources evaluated to.
 ///
@@ -33,40 +36,52 @@ pub(crate) fn prepare(config_path: &Path) -> Result<Prepared, DaemonError> {
     Ok(Prepared { config, evaluated })
 }
 
+/// How long one load and evaluation may run before the run is abandoned.
+///
+/// A source that never finishes, such as a named pipe with no writer, would otherwise hold the
+/// run in flight for good, and every later reload would queue behind it.
+pub(crate) const LOAD_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Run [`prepare`] on its own thread and deliver the result to `done`.
 ///
-/// The thread is detached, not a runtime blocking task. A read that never returns, such as one on
-/// a named pipe with no writer, would otherwise keep the runtime from shutting down. A panic
-/// becomes an error instead of a silent drop.
-pub(crate) fn prepare_detached<F>(config_path: PathBuf, done: F)
+/// See [`run_detached`] for the thread, the deadline, and the panic handling.
+pub(crate) fn prepare_detached<F>(config_path: PathBuf, deadline: Duration, done: F)
 where
     F: FnOnce(Result<Prepared, DaemonError>) + Send + 'static,
 {
-    run_detached(move || prepare(&config_path), done);
+    run_detached(deadline, move || prepare(&config_path), done);
 }
 
 /// Run `work` on its own detached thread and deliver its result to `done`.
 ///
-/// `done` always runs once. A panic in `work`, or a thread that cannot start, reaches it as an
+/// The thread is detached, not a runtime blocking task. A read that never returns would otherwise
+/// keep the runtime from shutting down. A thread blocked in a read cannot be killed, so a run that
+/// outlasts `deadline` is abandoned instead. `done` then gets [`DaemonError::LoadTimeout`], and the
+/// thread's own result, if it ever comes, is dropped.
+///
+/// `done` runs exactly once. A panic in `work`, or a thread that cannot start, reaches it as an
 /// error.
-pub(crate) fn run_detached<W, F>(work: W, done: F)
+pub(crate) fn run_detached<W, F>(deadline: Duration, work: W, done: F)
 where
     W: FnOnce() -> Result<Prepared, DaemonError> + Send + 'static,
     F: FnOnce(Result<Prepared, DaemonError>) + Send + 'static,
 {
-    // The thread owns `done` once it starts. A failed spawn drops the closure, so `done` goes
-    // through a shared slot that either side can take.
-    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(done)));
-    let thread_slot = std::sync::Arc::clone(&slot);
+    // Whichever of the worker, the watchdog, or a failed spawn takes `done` from the slot first
+    // delivers the result. The others find it empty.
+    let slot = Arc::new(Mutex::new(Some(done)));
+    let worker_slot = Arc::clone(&slot);
+
+    // Dropping this sender, however the worker ends, tells the watchdog to stand down.
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel::<()>();
 
     let spawned = std::thread::Builder::new()
         .name("zaz-evaluate".to_string())
         .spawn(move || {
+            let _finished = finished_tx;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                 .unwrap_or(Err(DaemonError::EvaluationPanicked));
-            let done = thread_slot.lock().ok().and_then(|mut slot| slot.take());
 
-            if let Some(done) = done {
+            if let Some(done) = take_done(&worker_slot) {
                 done(result);
             }
         });
@@ -74,11 +89,32 @@ where
     if let Err(e) = spawned {
         tracing::error!(error = %e, "failed to start the evaluation thread");
 
-        let done = slot.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(done) = done {
+        if let Some(done) = take_done(&slot) {
             done(Err(DaemonError::EvaluationThread(e)));
         }
+        return;
     }
+
+    let watchdog = std::thread::Builder::new()
+        .name("zaz-evaluate-deadline".to_string())
+        .spawn(move || {
+            if finished_rx.recv_timeout(deadline) != Err(RecvTimeoutError::Timeout) {
+                return;
+            }
+
+            if let Some(done) = take_done(&slot) {
+                tracing::error!(limit = ?deadline, "abandoning a load that did not finish");
+                done(Err(DaemonError::LoadTimeout { limit: deadline }));
+            }
+        });
+
+    if let Err(e) = watchdog {
+        tracing::error!(error = %e, "failed to start the load deadline thread, so the load has no deadline");
+    }
+}
+
+fn take_done<F>(slot: &Mutex<Option<F>>) -> Option<F> {
+    slot.lock().ok().and_then(|mut slot| slot.take())
 }
 
 /// The environment layers every group of a config is built from.
@@ -103,40 +139,26 @@ pub(crate) fn evaluate(
     config: &Config,
     config_path: &Path,
 ) -> Result<EvaluatedEnv, Vec<EnvFileError>> {
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let reads =
+        zaz_config::read_env_files(config, config_path, SpecialFiles::Read, |field, path| {
+            tracing::info!(
+                config = %config_path.display(),
+                field = %field,
+                path = %path.display(),
+                "loading env_file"
+            );
+        });
 
-    let mut errors = Vec::new();
-    let mut read: HashMap<PathBuf, EnvLayer> = HashMap::new();
-    let mut levels: HashMap<EnvFileLevel, EnvLayer> = HashMap::new();
-
-    for source in zaz_config::env_file_sources(config, config_dir) {
-        tracing::info!(
-            config = %config_path.display(),
-            field = %source.field,
-            path = %source.path.display(),
-            "loading env_file"
-        );
-
-        let layer = match read.get(&source.path) {
-            Some(layer) => layer.clone(),
-            None => match zaz_config::read_env_file(config_path, &source) {
-                Ok(vars) => {
-                    let layer = EnvLayer::from_vars(&vars);
-                    read.insert(source.path.clone(), layer.clone());
-                    layer
-                }
-                Err(found) => {
-                    errors.extend(found);
-                    continue;
-                }
-            },
-        };
-
-        levels.insert(source.level, layer);
+    if !reads.errors.is_empty() {
+        return Err(reads.errors);
     }
 
-    if !errors.is_empty() {
-        return Err(errors);
+    let mut levels: HashMap<EnvFileLevel, EnvLayer> = HashMap::new();
+
+    for source in reads.sources() {
+        if let Some(vars) = reads.vars(source) {
+            levels.insert(source.level, EnvLayer::from_vars(vars));
+        }
     }
 
     let mut groups = HashMap::new();

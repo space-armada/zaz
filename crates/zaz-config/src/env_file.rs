@@ -8,8 +8,8 @@
 //! An error names the line where its entry started. It never quotes a line or a value, since an
 //! env file often holds secrets.
 //!
-//! The daemon's evaluation step and `zaz check` both read files through [`read_env_file`], so a
-//! file fails with the same code in both.
+//! The daemon's evaluation step and `zaz check` both read files through [`read_env_files`], so a
+//! file fails with the same code in both, and is read once per load.
 
 use crate::resolve_against_config_dir;
 use crate::schema::Config;
@@ -375,6 +375,128 @@ pub fn read_env_file(
             .map(|(line, problem)| fail(EnvFileErrorKind::Parse { line, problem }))
             .collect()
     })
+}
+
+/// Whether reading may open a file that is not a regular file.
+///
+/// Opening a named pipe blocks until a writer appears. Reading a one-shot pipe, such as a secret
+/// manager's mounted `.env`, uses up its content. The daemon reads these files because its job is
+/// to load the environment. `zaz check` must have no side effects, so it skips them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialFiles {
+    Read,
+    Skip,
+}
+
+/// An `env_file` that a read left alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvFileNotRead {
+    /// The declaring fields, joined when several declare the same file.
+    pub field: String,
+    /// The resolved path.
+    pub path: PathBuf,
+    /// Why the file was not opened.
+    pub reason: &'static str,
+}
+
+/// What reading every `env_file` of a config produced.
+///
+/// Each distinct path is read once, so every field that names it sees the same bytes. A failing
+/// file is reported once, and its error names every field that declares it.
+#[derive(Debug, Default)]
+pub struct EnvFileReads {
+    values: HashMap<PathBuf, BTreeMap<String, String>>,
+    sources: Vec<EnvFileSource>,
+    /// Every failure, in the order the files were first declared.
+    pub errors: Vec<EnvFileError>,
+    /// Files left unopened under [`SpecialFiles::Skip`].
+    pub not_read: Vec<EnvFileNotRead>,
+}
+
+impl EnvFileReads {
+    /// Every declared `env_file`, in settings, group, task, then service order.
+    pub fn sources(&self) -> &[EnvFileSource] {
+        &self.sources
+    }
+
+    /// The entries of a source's file, when the file read cleanly.
+    pub fn vars(&self, source: &EnvFileSource) -> Option<&BTreeMap<String, String>> {
+        self.values.get(&source.path)
+    }
+}
+
+/// Read every `env_file` a config declares.
+///
+/// `config_path` must be absolute. It names the config in errors, and its directory resolves a
+/// relative `env_file`. Every file is read even after one fails, so all errors are reported.
+///
+/// `before_read` runs once per declaring field, with the field and the path, just before the
+/// file is read. A caller can log which file a stuck read is on.
+pub fn read_env_files(
+    config: &Config,
+    config_path: &Path,
+    special: SpecialFiles,
+    mut before_read: impl FnMut(&str, &Path),
+) -> EnvFileReads {
+    let config_dir = config_path.parent().unwrap_or(Path::new("."));
+    let sources = env_file_sources(config, config_dir);
+
+    let mut by_path: Vec<(PathBuf, Vec<&str>)> = Vec::new();
+    for source in &sources {
+        match by_path.iter_mut().find(|(path, _)| *path == source.path) {
+            Some((_, fields)) => fields.push(&source.field),
+            None => by_path.push((source.path.clone(), vec![&source.field])),
+        }
+    }
+
+    let mut reads = EnvFileReads::default();
+
+    for (path, fields) in by_path {
+        let declared = EnvFileSource {
+            level: EnvFileLevel::Settings,
+            field: fields.join(", "),
+            configured: String::new(),
+            path: path.clone(),
+        };
+
+        if special == SpecialFiles::Skip {
+            if let Some(reason) = special_file_reason(&path) {
+                reads.not_read.push(EnvFileNotRead {
+                    field: declared.field,
+                    path,
+                    reason,
+                });
+                continue;
+            }
+        }
+
+        for field in &fields {
+            before_read(field, &path);
+        }
+
+        match read_env_file(config_path, &declared) {
+            Ok(vars) => {
+                reads.values.insert(path, vars);
+            }
+            Err(found) => reads.errors.extend(found),
+        }
+    }
+
+    reads.sources = sources;
+
+    reads
+}
+
+/// Why `path` must not be opened, when it names something other than a regular file or a
+/// directory. A path that cannot be examined is left for the read to report.
+fn special_file_reason(path: &Path) -> Option<&'static str> {
+    let file_type = std::fs::metadata(path).ok()?.file_type();
+
+    if file_type.is_file() || file_type.is_dir() {
+        None
+    } else {
+        Some("not a regular file")
+    }
 }
 
 fn is_blank(c: char) -> bool {
@@ -1108,5 +1230,87 @@ env_file = "svc.env"
         );
         assert_eq!(sources[2].field, "group 'api' task 'build' env_file");
         assert_eq!(sources[3].field, "group 'api' service 'web' env_file");
+    }
+
+    fn shared_file_config(dir: &Path) -> (Config, PathBuf) {
+        let path = dir.join("zaz.toml");
+        std::fs::write(
+            &path,
+            "[settings]\nenv_file = \"shared.env\"\n\n\
+             [[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_file = \"shared.env\"\n",
+        )
+        .unwrap();
+
+        (crate::load(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn a_failing_file_is_reported_once_and_names_every_field_that_declares_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, path) = shared_file_config(dir.path());
+
+        let reads = read_env_files(&config, &path, SpecialFiles::Read, |_, _| {});
+
+        assert_eq!(reads.errors.len(), 1);
+        assert_eq!(reads.errors[0].code(), "env_file_missing");
+        assert_eq!(
+            reads.errors[0].field,
+            "settings env_file, group 'a' env_file"
+        );
+        assert_eq!(reads.errors[0].path, dir.path().join("shared.env"));
+    }
+
+    #[test]
+    fn a_file_two_fields_declare_is_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, path) = shared_file_config(dir.path());
+        std::fs::write(dir.path().join("shared.env"), "A=1\n").unwrap();
+
+        let reads = read_env_files(&config, &path, SpecialFiles::Read, |_, _| {});
+
+        assert!(reads.errors.is_empty());
+        assert_eq!(reads.sources().len(), 2);
+        for source in reads.sources() {
+            assert_eq!(reads.vars(source).unwrap()["A"], "1");
+        }
+    }
+
+    #[test]
+    fn skipping_special_files_leaves_a_named_pipe_unopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, path) = shared_file_config(dir.path());
+        let fifo = dir.path().join("shared.env");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo is required for this test");
+
+        let reads = read_env_files(&config, &path, SpecialFiles::Skip, |_, _| {});
+
+        assert!(reads.errors.is_empty());
+        assert_eq!(reads.not_read.len(), 1);
+        assert_eq!(reads.not_read[0].reason, "not a regular file");
+        assert_eq!(reads.not_read[0].path, fifo);
+        assert_eq!(
+            reads.not_read[0].field,
+            "settings env_file, group 'a' env_file"
+        );
+    }
+
+    #[test]
+    fn skipping_special_files_still_reads_regular_files_and_reports_missing_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, path) = shared_file_config(dir.path());
+
+        let missing = read_env_files(&config, &path, SpecialFiles::Skip, |_, _| {});
+        assert_eq!(missing.errors[0].code(), "env_file_missing");
+        assert!(missing.not_read.is_empty());
+
+        std::fs::write(dir.path().join("shared.env"), "A=1\n").unwrap();
+        let present = read_env_files(&config, &path, SpecialFiles::Skip, |_, _| {});
+        assert!(present.errors.is_empty());
+        assert!(present.not_read.is_empty());
+        assert!(present.vars(&present.sources()[0]).is_some());
     }
 }

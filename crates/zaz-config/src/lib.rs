@@ -11,8 +11,9 @@ pub mod user;
 mod validate;
 
 pub use env_file::{
-    env_file_sources, parse_env_file, read_env_file, EnvFileError, EnvFileErrorKind, EnvFileLevel,
-    EnvFileSource, ParseProblem,
+    env_file_sources, parse_env_file, read_env_file, read_env_files, EnvFileError,
+    EnvFileErrorKind, EnvFileLevel, EnvFileNotRead, EnvFileReads, EnvFileSource, ParseProblem,
+    SpecialFiles,
 };
 pub use error::{ConfigError, Span, ValidationError, ValidationErrorKind, ValidationErrors};
 pub use schema::{

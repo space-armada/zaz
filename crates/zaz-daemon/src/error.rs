@@ -12,12 +12,21 @@ pub enum DaemonError {
     Bind(#[from] std::io::Error),
 
     /// Configuration error.
-    #[error("configuration error: {0}")]
+    #[error("configuration error: {}", format_config_error(.0))]
     Config(#[from] zaz_config::ConfigError),
 
     /// One or more `env_file`s could not be loaded.
     #[error("{}", format_env_file_errors(.0))]
     EnvFile(Vec<zaz_config::EnvFileError>),
+
+    /// The config and the sources it names did not finish loading within the limit.
+    ///
+    /// The thread doing the read cannot be stopped, so it is abandoned.
+    #[error(
+        "a source did not finish reading within {:?}, so the load was abandoned [env_load_timeout]",
+        .limit
+    )]
+    LoadTimeout { limit: std::time::Duration },
 
     /// The thread that loads and evaluates a config panicked.
     #[error("loading the config panicked")]
@@ -68,6 +77,15 @@ pub enum DaemonError {
     LogStorage(#[from] LogStorageError),
 }
 
+/// A validation failure with one line per error, each ending in its code. Any other config error
+/// keeps its own message.
+fn format_config_error(error: &zaz_config::ConfigError) -> String {
+    match error {
+        zaz_config::ConfigError::Validation(errors) => errors.display_with_codes(),
+        other => other.to_string(),
+    }
+}
+
 /// One line per error, each ending in its code.
 fn format_env_file_errors(errors: &[zaz_config::EnvFileError]) -> String {
     errors
@@ -112,16 +130,10 @@ pub enum LogStorageError {
 impl DaemonError {
     /// A stable code for the failure. A load failure reports the code of its first error.
     pub fn code(&self) -> &'static str {
-        use zaz_config::ConfigError;
-
         match self {
             Self::EnvFile(errors) => errors.first().map_or("env_file_error", |e| e.code()),
-            Self::Config(ConfigError::Validation(errors)) => {
-                errors.iter().next().map_or("config_invalid", |e| e.code())
-            }
-            Self::Config(ConfigError::Io { .. }) => "config_unreadable",
-            Self::Config(ConfigError::NotFound { .. }) => "config_not_found",
-            Self::Config(_) => "config_parse_error",
+            Self::Config(error) => error.code(),
+            Self::LoadTimeout { .. } => "env_load_timeout",
             Self::EvaluationPanicked => "evaluation_panicked",
             Self::EvaluationThread(_) => "evaluation_unavailable",
             Self::CyclicDependency(_) => "dependency_cycle",
@@ -143,15 +155,24 @@ impl DaemonError {
 
     /// Recovery suggestion for variants where a concrete next step exists.
     /// Returns `None` for terminal errors with no actionable recovery.
-    pub fn hint(&self) -> Option<&'static str> {
+    pub fn hint(&self) -> Option<String> {
         match self {
-            Self::EnvFile(errors) => errors.first().and_then(|e| e.hint()),
-            Self::SocketResolution { .. } => {
-                Some("run this command from a zaz project directory or pass --socket <PATH>")
+            Self::EnvFile(errors) => errors.first().and_then(|e| e.hint()).map(str::to_string),
+            Self::Config(zaz_config::ConfigError::Validation(errors)) => {
+                errors.iter().next().and_then(|e| e.hint.clone())
             }
-            Self::WorkspaceSocketResolution { .. } => {
-                Some("create a .zaz/ workspace root above your configs or pass --socket <PATH>")
-            }
+            Self::LoadTimeout { .. } => Some(
+                "a named pipe or other special file in an env_file may have no writer, so \
+                 point env_file at a regular file"
+                    .to_string(),
+            ),
+            Self::SocketResolution { .. } => Some(
+                "run this command from a zaz project directory or pass --socket <PATH>".to_string(),
+            ),
+            Self::WorkspaceSocketResolution { .. } => Some(
+                "create a .zaz/ workspace root above your configs or pass --socket <PATH>"
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -179,7 +200,7 @@ mod tests {
             start_dir: PathBuf::from("/tmp/outside"),
         };
         assert_eq!(
-            err.hint(),
+            err.hint().as_deref(),
             Some("run this command from a zaz project directory or pass --socket <PATH>")
         );
     }
@@ -202,9 +223,45 @@ mod tests {
             start_dir: PathBuf::from("/tmp/outside"),
         };
         assert_eq!(
-            err.hint(),
+            err.hint().as_deref(),
             Some("create a .zaz/ workspace root above your configs or pass --socket <PATH>")
         );
+    }
+
+    #[test]
+    fn a_validation_failure_carries_a_code_on_every_line_and_the_first_hint() {
+        let toml =
+            "[[group]]\nname = \"api\"\npatterns = [\"*\"]\nenv_flie = \".env\"\nbogus = 1\n";
+        let error = DaemonError::from(zaz_config::parse_toml(toml).unwrap_err());
+
+        let message = error.to_string();
+        assert_eq!(message.matches("[unknown_key]").count(), 2, "{message}");
+        assert_eq!(error.code(), "unknown_key");
+        assert_eq!(error.hint().as_deref(), Some("did you mean 'env_file'?"));
+        assert_eq!(
+            error.to_load_error().hint.as_deref(),
+            Some("did you mean 'env_file'?")
+        );
+    }
+
+    #[test]
+    fn a_non_validation_config_failure_uses_the_shared_code() {
+        let error = DaemonError::from(zaz_config::parse_toml("invalid = [").unwrap_err());
+
+        assert_eq!(error.code(), "parse_error");
+    }
+
+    #[test]
+    fn a_load_timeout_has_its_own_code_and_says_what_stalled() {
+        let error = DaemonError::LoadTimeout {
+            limit: std::time::Duration::from_secs(120),
+        };
+
+        assert_eq!(error.code(), "env_load_timeout");
+        assert!(error
+            .to_string()
+            .contains("did not finish reading within 120s"));
+        assert!(error.hint().is_some());
     }
 
     #[test]

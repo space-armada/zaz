@@ -8,13 +8,19 @@
 //! At most one load is in flight and at most one is pending. A reload that arrives while one is
 //! in flight joins the pending run. Each waiter gets the result of the run it joined, and runs
 //! apply in the order they started. Nothing is cancelled except by shutdown.
+//!
+//! A run that outlasts its deadline is abandoned. The thread stuck in a read cannot be killed, so
+//! it is left behind and its result is dropped. The run fails with its own error, and the pending
+//! run, if there is one, starts.
 
 use crate::api::{ApiRequest, ApiResponse, EngineCommand};
-use crate::engine::Engine;
+use crate::engine::{answer_log_request, Engine};
 use crate::evaluate::{self, Prepared};
+use crate::log_store::SharedLogStore;
 use crate::state::{DaemonState, DaemonStatus, LoadError};
 use crate::DaemonError;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 type Waiter = oneshot::Sender<ApiResponse>;
@@ -62,6 +68,7 @@ pub struct DaemonHost {
     pending: Option<Pending>,
     next_run: u64,
     outcomes_tx: mpsc::UnboundedSender<RunOutcome>,
+    load_deadline: Duration,
     shutting_down: bool,
 }
 
@@ -87,10 +94,18 @@ impl DaemonHost {
             pending: None,
             next_run: 0,
             outcomes_tx,
+            load_deadline: evaluate::LOAD_DEADLINE,
             shutting_down: false,
         };
 
         Ok((host, outcomes_rx))
+    }
+
+    /// Shorten the load deadline so a test does not wait out the real one.
+    #[cfg(test)]
+    fn with_load_deadline(mut self, deadline: Duration) -> Self {
+        self.load_deadline = deadline;
+        self
     }
 
     /// Start the first load. The first load is the first run, so a reload that arrives before it
@@ -247,9 +262,13 @@ impl DaemonHost {
         self.in_flight = Some(InFlight { id, waiters });
 
         let outcomes_tx = self.outcomes_tx.clone();
-        evaluate::prepare_detached(self.config_path.clone(), move |result| {
-            let _ = outcomes_tx.send(RunOutcome { id, result });
-        });
+        evaluate::prepare_detached(
+            self.config_path.clone(),
+            self.load_deadline,
+            move |result| {
+                let _ = outcomes_tx.send(RunOutcome { id, result });
+            },
+        );
     }
 
     /// Answer every waiter with a shutting-down result, and drop the load in flight.
@@ -277,8 +296,9 @@ impl DaemonHost {
         ) {
             (Slot::Loaded(mut engine), Ok(prepared)) => {
                 let snapshot = engine.status_snapshot();
+                let logs = engine.log_handle();
                 let applied = self
-                    .while_answering(engine.apply_prepared(prepared), &snapshot, commands)
+                    .while_answering(engine.apply_prepared(prepared), &snapshot, &logs, commands)
                     .await;
                 self.slot = Slot::Loaded(engine);
 
@@ -306,13 +326,15 @@ impl DaemonHost {
 
     /// Drive `work` to the end while the loop's `commands` keep being answered.
     ///
-    /// `work` holds the engine, so requests are answered from `snapshot` rather than from it. A
-    /// shutdown request ends the wait early. `work` is then dropped where it stands, and the
-    /// engine's own shutdown stops whatever it had started. Returns `None` in that case.
+    /// `work` holds the engine, so requests are answered from `snapshot` and from the `logs`
+    /// handle rather than from it. A shutdown request ends the wait early. `work` is then dropped
+    /// where it stands, and the engine's own shutdown stops whatever it had started. Returns
+    /// `None` in that case.
     async fn while_answering<T>(
         &mut self,
         work: impl std::future::Future<Output = T>,
         snapshot: &DaemonState,
+        logs: &SharedLogStore,
         commands: &mut mpsc::Receiver<EngineCommand>,
     ) -> Option<T> {
         tokio::pin!(work);
@@ -321,7 +343,7 @@ impl DaemonHost {
             tokio::select! {
                 output = &mut work => return Some(output),
                 Some(command) = commands.recv() => {
-                    self.answer_busy(command, snapshot);
+                    self.answer_busy(command, snapshot, logs);
 
                     if self.shutting_down {
                         return None;
@@ -336,7 +358,15 @@ impl DaemonHost {
     /// The state reads `Running` from the moment the groups are built, which is what the readiness
     /// contract promises. Service starts that wait out a `delay` finish later, and show in the
     /// group states as they do.
-    fn answer_busy(&mut self, command: EngineCommand, snapshot: &DaemonState) {
+    ///
+    /// Log requests read the shared log store, so they answer in full during an apply. Restarts
+    /// are refused, since the engine that would run them is busy.
+    fn answer_busy(
+        &mut self,
+        command: EngineCommand,
+        snapshot: &DaemonState,
+        logs: &SharedLogStore,
+    ) {
         let EngineCommand {
             request,
             response_tx,
@@ -355,6 +385,13 @@ impl DaemonHost {
             | ApiRequest::RestartAll => ApiResponse::error(
                 "daemon busy [daemon_busy]: it is still starting or reloading its services",
             ),
+            request @ (ApiRequest::GetLogs { .. } | ApiRequest::SubscribeLogs { .. }) => {
+                if let Err(e) = logs.drain() {
+                    tracing::error!(error = %e, "log drain error");
+                }
+
+                answer_log_request(logs, request)
+            }
             other => answer_unloaded(other, None, &self.config_path),
         };
 
@@ -393,8 +430,9 @@ impl DaemonHost {
         let groups = snapshot.groups.len();
 
         // A failed startup keeps the daemon up, as it always has.
+        let logs = engine.log_handle();
         let started = self
-            .while_answering(engine.startup(), &snapshot, commands)
+            .while_answering(engine.startup(), &snapshot, &logs, commands)
             .await;
         if let Some(Err(e)) = &started {
             tracing::error!(error = %e, "initial startup failed, waiting for file changes to retry");
@@ -523,6 +561,11 @@ mod tests {
                 outcomes,
                 commands,
             }
+        }
+
+        fn with_deadline(mut self, deadline: Duration) -> Self {
+            self.host = self.host.with_load_deadline(deadline);
+            self
         }
 
         /// Let the load that is blocked on the pipe read `text`.
@@ -705,7 +748,7 @@ mod tests {
             panic!("expected a status");
         };
         let error = state.load_error.expect("a parse failure is a load error");
-        assert_eq!(error.code, "config_parse_error");
+        assert_eq!(error.code, "parse_error");
 
         std::fs::write(
             fixture.dir.path().join("zaz.toml"),
@@ -985,6 +1028,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_first_load_that_outlasts_the_deadline_is_a_load_error_and_frees_the_queue() {
+        let mut fixture = Fixture::with_fifo().with_deadline(Duration::from_millis(300));
+        fixture.host.begin_first_load();
+        let pending = fixture.reload().await;
+
+        // Once the first run's thread is blocked on the pipe, swap in a regular file for the run
+        // that follows. The blocked thread stays behind on the old pipe.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let env_path = fixture.dir.path().join("slow.env");
+        std::fs::remove_file(&env_path).unwrap();
+        std::fs::write(&env_path, "A=1\n").unwrap();
+
+        fixture.next_outcome().await;
+
+        let state = fixture.host.state();
+        assert_eq!(state.status, DaemonStatus::Starting);
+        let error = state.load_error.expect("a timeout is a load error");
+        assert_eq!(error.code, "env_load_timeout");
+        assert!(
+            error.message.contains("did not finish reading"),
+            "{error:?}"
+        );
+        assert!(error.hint.is_some());
+
+        // The pending reload started when the stuck run was abandoned.
+        assert!(fixture.host.in_flight.is_some());
+        assert!(fixture.host.pending.is_none());
+
+        fixture.next_outcome().await;
+
+        let response = pending.await.unwrap();
+        assert!(
+            message(&response).starts_with("config reloaded"),
+            "{response:?}"
+        );
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_outlasts_the_deadline_keeps_the_running_config() {
+        let mut fixture = Fixture::with_fifo().with_deadline(Duration::from_millis(400));
+        fixture.host.begin_first_load();
+        fixture.feed("A=1\n");
+        fixture.next_outcome().await;
+        assert!(fixture.host.is_loaded());
+
+        let waiter = fixture.reload().await;
+        fixture.next_outcome().await;
+
+        let response = waiter.await.unwrap();
+        assert!(matches!(response, ApiResponse::Error { .. }));
+        assert!(
+            message(&response).contains("env_load_timeout"),
+            "{response:?}"
+        );
+
+        let state = fixture.host.state();
+        assert_eq!(state.status, DaemonStatus::Running);
+        assert!(state.load_error.is_none());
+        assert!(state.groups.contains_key("app"));
+        assert!(fixture.host.in_flight.is_none());
+
+        fixture.feed("A=1\n");
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    const LOGGING_CONFIG: &str = "[[group]]\nname = \"chatty\"\n\n\
+                                  [[group.task]]\nname = \"say\"\ncommand = \"echo hello-from-task\"\n\n\
+                                  [[group]]\nname = \"svc\"\n\n\
+                                  [[group.service]]\nname = \"s\"\ncommand = \"sleep 30\"\ndelay = \"3s\"\n";
+
+    #[tokio::test]
+    async fn logs_answer_in_full_while_the_first_startup_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zaz.toml"), LOGGING_CONFIG).unwrap();
+        let mut fixture = Fixture::at(dir);
+        fixture.host.begin_first_load();
+        let outcome = fixture.outcomes.recv().await.unwrap();
+
+        let (commands_tx, mut commands) = mpsc::channel(8);
+        let poll = async {
+            for _ in 0..20 {
+                let (_, reply) = probe(
+                    &commands_tx,
+                    Duration::from_millis(100),
+                    ApiRequest::GetLogs {
+                        name: "*".to_string(),
+                        project: None,
+                        lines: None,
+                        offset: None,
+                        limit: None,
+                        search: None,
+                    },
+                )
+                .await;
+
+                if let ApiResponse::Logs { lines, .. } = reply {
+                    if lines.iter().any(|l| l.content.contains("hello-from-task")) {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        };
+        let ((), seen) = tokio::join!(fixture.host.finish_run(outcome, &mut commands), poll);
+
+        assert!(
+            seen,
+            "the task's output should be readable during the apply"
+        );
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_panic_during_evaluation_is_a_load_error() {
         let mut fixture = Fixture::with_fifo();
         fixture.host.begin_first_load();
@@ -992,6 +1152,7 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         evaluate::run_detached(
+            evaluate::LOAD_DEADLINE,
             || panic!("evaluation exploded"),
             move |result| {
                 let _ = tx.send(result);

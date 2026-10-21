@@ -1409,12 +1409,21 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
     struct NotEvaluated {
         /// `env_file`s that do not exist, which check cannot tell from a mistyped path.
         missing: Vec<MissingSource>,
+        /// `env_file`s that check leaves unopened, since opening them has side effects.
+        not_read: Vec<NotReadSource>,
     }
 
     #[derive(Serialize)]
     struct MissingSource {
         field: String,
         path: String,
+    }
+
+    #[derive(Serialize)]
+    struct NotReadSource {
+        field: String,
+        path: String,
+        reason: String,
     }
 
     #[derive(Serialize)]
@@ -1466,7 +1475,7 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                         .map(|e| CheckError {
                             line: None,
                             column: None,
-                            message: e.to_string(),
+                            message: e.message(),
                             hint: e.hint().map(str::to_string),
                             code: e.code().to_string(),
                         })
@@ -1475,9 +1484,18 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                         missing: env_files
                             .missing
                             .iter()
-                            .map(|s| MissingSource {
-                                field: s.field.clone(),
-                                path: s.path.display().to_string(),
+                            .map(|e| MissingSource {
+                                field: e.field.clone(),
+                                path: e.path.display().to_string(),
+                            })
+                            .collect(),
+                        not_read: env_files
+                            .not_read
+                            .iter()
+                            .map(|n| NotReadSource {
+                                field: n.field.clone(),
+                                path: n.path.display().to_string(),
+                                reason: n.reason.to_string(),
                             })
                             .collect(),
                     }),
@@ -1523,9 +1541,18 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                 let missing: Vec<String> = env_files
                     .missing
                     .iter()
-                    .map(|s| format!("{} {}", s.field, s.path.display()))
+                    .map(|e| format!("{} {}", e.field, e.path.display()))
                     .collect();
                 eprintln!("note: not evaluated, file missing: {}", missing.join(", "));
+            }
+
+            if !env_files.not_read.is_empty() {
+                let not_read: Vec<String> = env_files
+                    .not_read
+                    .iter()
+                    .map(|n| format!("{} {} ({})", n.field, n.path.display(), n.reason))
+                    .collect();
+                eprintln!("note: not evaluated, not read: {}", not_read.join(", "));
             }
 
             if valid {
@@ -1597,7 +1624,7 @@ fn check_config(config_path: &Path, json_output: bool) -> Result<()> {
                         column: None,
                         message: e.to_string(),
                         hint: None,
-                        code: "parse_error".to_string(),
+                        code: e.code().to_string(),
                     }],
                     not_evaluated: None,
                 };
@@ -1627,35 +1654,34 @@ struct EnvFileCheck {
     /// Files that exist and failed to load, with the same codes the daemon reports.
     errors: Vec<zaz_config::EnvFileError>,
     /// Files that do not exist. Check cannot tell a gitignored `.env` from a mistyped path.
-    missing: Vec<zaz_config::EnvFileSource>,
+    missing: Vec<zaz_config::EnvFileError>,
+    /// Files check left unopened. Opening a named pipe blocks, and draining a one-shot pipe uses
+    /// up what the daemon needs.
+    not_read: Vec<zaz_config::EnvFileNotRead>,
 }
 
-/// Parse every `env_file` of a config that exists, with the parser the daemon uses.
+/// Parse every `env_file` of a config that exists, with the reader the daemon uses.
 ///
+/// Check has no side effects, so a file that is not a regular file is never opened.
 /// `config_path` must be absolute, as it is for the daemon.
 fn check_env_files(config: &zaz_config::Config, config_path: &Path) -> EnvFileCheck {
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    let mut check = EnvFileCheck {
-        errors: Vec::new(),
-        missing: Vec::new(),
-    };
+    let reads = zaz_config::read_env_files(
+        config,
+        config_path,
+        zaz_config::SpecialFiles::Skip,
+        |_, _| {},
+    );
 
-    for source in zaz_config::env_file_sources(config, config_dir) {
-        match zaz_config::read_env_file(config_path, &source) {
-            Ok(_) => {}
-            Err(found)
-                if matches!(
-                    found.as_slice(),
-                    [e] if matches!(e.kind, zaz_config::EnvFileErrorKind::Missing)
-                ) =>
-            {
-                check.missing.push(source);
-            }
-            Err(found) => check.errors.extend(found),
-        }
+    let (missing, errors) = reads
+        .errors
+        .into_iter()
+        .partition(|e| matches!(e.kind, zaz_config::EnvFileErrorKind::Missing));
+
+    EnvFileCheck {
+        errors,
+        missing,
+        not_read: reads.not_read,
     }
-
-    check
 }
 
 fn show_ignores() -> Result<()> {
@@ -2455,7 +2481,7 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("could not resolve daemon socket from"));
         assert_eq!(
-            daemon_err.hint(),
+            daemon_err.hint().as_deref(),
             Some("run this command from a zaz project directory or pass --socket <PATH>")
         );
         Ok(())
@@ -2712,7 +2738,7 @@ command = "true"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        assert_eq!(state.load_error.unwrap().code, "config_parse_error");
+        assert_eq!(state.load_error.unwrap().code, "parse_error");
         assert!(handle.try_wait().unwrap().is_none(), "the daemon stays up");
 
         std::fs::write(

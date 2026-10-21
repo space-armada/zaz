@@ -3,6 +3,7 @@
 use crate::pty::ManagedChild;
 use crate::ProcessError;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -31,7 +32,7 @@ pub struct CommandOutput {
 pub struct Executor {
     shell: String,
     working_dir: Option<String>,
-    env: HashMap<String, String>,
+    env: HashMap<OsString, OsString>,
 }
 
 const SHELL_ENV_VAR: &str = "SHELL";
@@ -47,7 +48,7 @@ impl Executor {
         Self {
             shell,
             working_dir: None,
-            env: std::env::vars().collect(),
+            env: std::env::vars_os().collect(),
         }
     }
 
@@ -57,7 +58,7 @@ impl Executor {
     }
 
     /// The complete environment commands run with.
-    pub fn env(&self) -> &HashMap<String, String> {
+    pub fn env(&self) -> &HashMap<OsString, OsString> {
         &self.env
     }
 
@@ -69,10 +70,12 @@ impl Executor {
 
     /// Set the complete environment commands run with.
     ///
-    /// The map replaces the executor's environment whole. Spawning clears the inherited environment first, so
-    /// a variable absent from the map is absent from the command. A new executor starts from the
-    /// daemon's own environment.
-    pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
+    /// The map replaces the executor's environment whole. Spawning clears the inherited
+    /// environment first, so a variable absent from the map is absent from the command.
+    ///
+    /// A new executor starts from the daemon's own environment. Names and values are `OsString`
+    /// because the daemon's environment need not be UTF-8.
+    pub fn with_env(mut self, env: HashMap<OsString, OsString>) -> Self {
         self.env = env;
         self
     }
@@ -348,11 +351,11 @@ mod tests {
 
     const PROBE: &str = "printf '%s' \"${ZAZ_TEST_ABSENT-unset}\"";
 
-    fn complete_env_without_probe() -> HashMap<String, String> {
+    fn complete_env_without_probe() -> HashMap<OsString, OsString> {
         std::env::set_var("ZAZ_TEST_ABSENT", "inherited");
 
-        let mut env: HashMap<String, String> = std::env::vars().collect();
-        env.remove("ZAZ_TEST_ABSENT");
+        let mut env: HashMap<OsString, OsString> = std::env::vars_os().collect();
+        env.remove(std::ffi::OsStr::new("ZAZ_TEST_ABSENT"));
         env
     }
 
@@ -362,7 +365,50 @@ mod tests {
 
         let executor = Executor::new(Some("/bin/sh".to_string()));
 
-        assert_eq!(executor.env().get("ZAZ_TEST_SEEDED").unwrap(), "seeded");
+        assert_eq!(
+            executor
+                .env()
+                .get(std::ffi::OsStr::new("ZAZ_TEST_SEEDED"))
+                .unwrap(),
+            "seeded"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_inherited_value_does_not_panic_and_survives_into_the_map() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let value = OsString::from_vec(vec![b'o', b'k', 0xff, 0xfe]);
+        std::env::set_var("ZAZ_TEST_NON_UTF8", &value);
+
+        let executor = Executor::new(Some("/bin/sh".to_string()));
+
+        let held = executor
+            .env()
+            .get(std::ffi::OsStr::new("ZAZ_TEST_NON_UTF8"))
+            .unwrap();
+        assert_eq!(held.as_bytes(), value.as_bytes());
+
+        std::env::remove_var("ZAZ_TEST_NON_UTF8");
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_value_reaches_the_command_unchanged() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut env = complete_env_without_probe();
+        env.insert(
+            OsString::from("ZAZ_TEST_BYTES"),
+            OsString::from_vec(vec![0xff, b'a', 0xfe]),
+        );
+        let executor = Executor::new(Some("/bin/sh".to_string())).with_env(env);
+
+        let output = executor
+            .run("printf '%s' \"$ZAZ_TEST_BYTES\" | od -An -tx1 | tr -d ' \\n'")
+            .await
+            .unwrap();
+
+        assert_eq!(output.stdout, vec!["ff61fe".to_string()]);
     }
 
     #[tokio::test]
@@ -378,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn variable_present_in_the_map_reaches_the_command() {
         let mut env = complete_env_without_probe();
-        env.insert("ZAZ_TEST_ABSENT".to_string(), "mapped".to_string());
+        env.insert(OsString::from("ZAZ_TEST_ABSENT"), OsString::from("mapped"));
         let executor = Executor::new(Some("/bin/sh".to_string())).with_env(env);
 
         let output = executor.run(PROBE).await.unwrap();

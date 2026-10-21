@@ -1008,7 +1008,7 @@ mod tests {
         let executor = Executor::new(Some("/bin/sh".to_string()))
             .with_working_dir(canonical.display().to_string())
             .with_env(
-                [("ZAZ_CLEANUP_MARKER".to_string(), "marked".to_string())]
+                [("ZAZ_CLEANUP_MARKER".into(), "marked".into())]
                     .into_iter()
                     .collect(),
             );
@@ -1030,8 +1030,9 @@ mod tests {
     async fn test_run_cleanup_omits_variables_absent_from_the_service_env() {
         std::env::set_var("ZAZ_TEST_HOOK_ABSENT", "inherited");
 
-        let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
-        env.remove("ZAZ_TEST_HOOK_ABSENT");
+        let mut env: std::collections::HashMap<std::ffi::OsString, std::ffi::OsString> =
+            std::env::vars_os().collect();
+        env.remove(std::ffi::OsStr::new("ZAZ_TEST_HOOK_ABSENT"));
         let executor = Executor::new(Some("/bin/sh".to_string())).with_env(env);
         let service = Service::new(service_with_cleanup("sleep 30", None), executor);
 

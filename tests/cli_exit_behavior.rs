@@ -812,7 +812,7 @@ patterns = ["**/*.rs"
 
     assert!(!output.status.success());
     assert!(
-        stderr.contains("daemon failed to load its configuration [config_parse_error]"),
+        stderr.contains("daemon failed to load its configuration [parse_error]"),
         "expected the coded load error, got: {stderr}"
     );
     assert!(

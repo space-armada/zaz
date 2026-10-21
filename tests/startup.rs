@@ -283,7 +283,7 @@ fn a_zaz_toml_typo_leaves_the_daemon_up_and_a_fix_plus_reload_recovers_it() {
     let mut daemon = project.spawn(&["daemon", "--quiet"]);
 
     let status = project.wait_status("Load error:", Duration::from_secs(10));
-    assert!(status.contains("config_parse_error"), "{status}");
+    assert!(status.contains("parse_error"), "{status}");
 
     let restart = project.run(&["restart"]);
     assert_ne!(restart.status.code(), Some(0));
@@ -482,7 +482,7 @@ fn mcp_autostart_survives_a_zaz_toml_typo_and_a_fix_plus_reload_recovers() {
         !response["result"]["isError"].as_bool().unwrap_or(false),
         "{serialized}"
     );
-    assert!(serialized.contains("config_parse_error"), "{serialized}");
+    assert!(serialized.contains("parse_error"), "{serialized}");
     assert!(serialized.contains("starting"), "{serialized}");
 
     // The daemon the MCP session started is still up for a fix and a reload.

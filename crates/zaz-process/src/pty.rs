@@ -3,6 +3,7 @@
 use crate::ProcessError;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -31,18 +32,19 @@ impl ManagedChild {
         command: &str,
         working_dir: Option<&str>,
     ) -> Result<Self, ProcessError> {
-        let env: HashMap<String, String> = std::env::vars().collect();
+        let env: HashMap<OsString, OsString> = std::env::vars_os().collect();
         Self::spawn_pty_with_env(shell, command, working_dir, &env)
     }
 
     /// Spawn a command in a PTY with exactly the given environment.
     ///
-    /// The daemon's own environment is not inherited.
+    /// The daemon's own environment is not inherited. Names and values are bytes on Unix, so a
+    /// value that is not UTF-8 reaches the command unchanged.
     pub fn spawn_pty_with_env(
         shell: &str,
         command: &str,
         working_dir: Option<&str>,
-        env: &HashMap<String, String>,
+        env: &HashMap<OsString, OsString>,
     ) -> Result<Self, ProcessError> {
         let pty_system = native_pty_system();
 
