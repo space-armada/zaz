@@ -68,7 +68,7 @@ pub struct DaemonHost {
     pending: Option<Pending>,
     next_run: u64,
     outcomes_tx: mpsc::UnboundedSender<RunOutcome>,
-    load_deadline: Duration,
+    read_deadline: Duration,
     shutting_down: bool,
 }
 
@@ -94,17 +94,17 @@ impl DaemonHost {
             pending: None,
             next_run: 0,
             outcomes_tx,
-            load_deadline: evaluate::LOAD_DEADLINE,
+            read_deadline: evaluate::ENV_FILE_READ_DEADLINE,
             shutting_down: false,
         };
 
         Ok((host, outcomes_rx))
     }
 
-    /// Shorten the load deadline so a test does not wait out the real one.
+    /// Shorten the per-read deadline so a test does not wait out the real one.
     #[cfg(test)]
-    fn with_load_deadline(mut self, deadline: Duration) -> Self {
-        self.load_deadline = deadline;
+    fn with_read_deadline(mut self, deadline: Duration) -> Self {
+        self.read_deadline = deadline;
         self
     }
 
@@ -264,7 +264,7 @@ impl DaemonHost {
         let outcomes_tx = self.outcomes_tx.clone();
         evaluate::prepare_detached(
             self.config_path.clone(),
-            self.load_deadline,
+            self.read_deadline,
             move |result| {
                 let _ = outcomes_tx.send(RunOutcome { id, result });
             },
@@ -564,7 +564,7 @@ mod tests {
         }
 
         fn with_deadline(mut self, deadline: Duration) -> Self {
-            self.host = self.host.with_load_deadline(deadline);
+            self.host = self.host.with_read_deadline(deadline);
             self
         }
 
@@ -1033,26 +1033,19 @@ mod tests {
         fixture.host.begin_first_load();
         let pending = fixture.reload().await;
 
-        // Once the first run's thread is blocked on the pipe, swap in a regular file for the run
-        // that follows. The blocked thread stays behind on the old pipe.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let env_path = fixture.dir.path().join("slow.env");
-        std::fs::remove_file(&env_path).unwrap();
-        std::fs::write(&env_path, "A=1\n").unwrap();
-
         fixture.next_outcome().await;
 
         let state = fixture.host.state();
         assert_eq!(state.status, DaemonStatus::Starting);
         let error = state.load_error.expect("a timeout is a load error");
-        assert_eq!(error.code, "env_load_timeout");
-        assert!(
-            error.message.contains("did not finish reading"),
-            "{error:?}"
-        );
-        assert!(error.hint.is_some());
+        assert_eq!(error.code, "env_file_read_timeout");
+        assert!(error.message.contains("group 'app' env_file"), "{error:?}");
+        assert!(error.message.contains("slow.env"), "{error:?}");
+        assert!(error.message.contains("did not finish within"), "{error:?}");
+        assert!(error.hint.unwrap().contains("named pipe"));
 
-        // The pending reload started when the stuck run was abandoned.
+        // The pending reload started when the stuck read was abandoned. It reads the same pipe, so
+        // it times out too and answers its waiter.
         assert!(fixture.host.in_flight.is_some());
         assert!(fixture.host.pending.is_none());
 
@@ -1060,9 +1053,30 @@ mod tests {
 
         let response = pending.await.unwrap();
         assert!(
+            matches!(response, ApiResponse::Error { .. }),
+            "{response:?}"
+        );
+        assert!(
+            message(&response).contains("env_file_read_timeout"),
+            "{response:?}"
+        );
+        assert!(fixture.host.in_flight.is_none());
+
+        // Both timeouts are observed, so the swap cannot race a read opening the pipe. The
+        // abandoned threads stay behind on the old pipe.
+        let env_path = fixture.dir.path().join("slow.env");
+        std::fs::remove_file(&env_path).unwrap();
+        std::fs::write(&env_path, "A=1\n").unwrap();
+
+        let recovered = fixture.reload().await;
+        fixture.next_outcome().await;
+
+        let response = recovered.await.unwrap();
+        assert!(
             message(&response).starts_with("config reloaded"),
             "{response:?}"
         );
+        assert!(fixture.host.is_loaded());
 
         fixture.host.shutdown().await.unwrap();
     }
@@ -1081,7 +1095,7 @@ mod tests {
         let response = waiter.await.unwrap();
         assert!(matches!(response, ApiResponse::Error { .. }));
         assert!(
-            message(&response).contains("env_load_timeout"),
+            message(&response).contains("env_file_read_timeout"),
             "{response:?}"
         );
 
@@ -1152,7 +1166,6 @@ mod tests {
 
         let (tx, rx) = oneshot::channel();
         evaluate::run_detached(
-            evaluate::LOAD_DEADLINE,
             || panic!("evaluation exploded"),
             move |result| {
                 let _ = tx.send(result);

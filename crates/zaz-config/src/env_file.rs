@@ -17,6 +17,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 /// Where in the config an `env_file` was declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -109,6 +111,8 @@ pub enum EnvFileErrorKind {
     IsDirectory,
     /// Any other I/O failure.
     Io(std::io::Error),
+    /// The read did not finish within the limit, as with a named pipe that has no writer.
+    Timeout { limit: Duration },
     /// The file is larger than [`ENV_FILE_MAX_BYTES`].
     TooLarge { limit: u64 },
     /// The file starts with a UTF-8 byte order mark.
@@ -234,6 +238,7 @@ impl EnvFileError {
             EnvFileErrorKind::PermissionDenied => "env_file_permission_denied",
             EnvFileErrorKind::IsDirectory => "env_file_is_directory",
             EnvFileErrorKind::Io(_) => "env_file_io",
+            EnvFileErrorKind::Timeout { .. } => "env_file_read_timeout",
             EnvFileErrorKind::TooLarge { .. } => "env_file_too_large",
             EnvFileErrorKind::ByteOrderMark => "env_file_byte_order_mark",
             EnvFileErrorKind::InvalidUtf8 { .. } => "env_file_invalid_utf8",
@@ -251,6 +256,10 @@ impl EnvFileError {
             EnvFileErrorKind::PermissionDenied => Some("make the file readable by the daemon"),
             EnvFileErrorKind::IsDirectory => Some("point env_file at a file, not a directory"),
             EnvFileErrorKind::Io(_) => None,
+            EnvFileErrorKind::Timeout { .. } => Some(
+                "a named pipe in an env_file may have no writer, so start its writer or point \
+                 env_file at a regular file",
+            ),
             EnvFileErrorKind::TooLarge { .. } => {
                 Some("an env_file holds KEY=VALUE lines, so point it at a smaller file")
             }
@@ -285,6 +294,9 @@ impl EnvFileError {
             EnvFileErrorKind::PermissionDenied => "permission denied".to_string(),
             EnvFileErrorKind::IsDirectory => "path is a directory".to_string(),
             EnvFileErrorKind::Io(source) => format!("cannot read file: {source}"),
+            EnvFileErrorKind::Timeout { limit } => {
+                format!("read did not finish within {limit:?}, so it was abandoned")
+            }
             EnvFileErrorKind::TooLarge { limit } => {
                 format!("file is larger than the {limit} byte limit")
             }
@@ -430,12 +442,17 @@ impl EnvFileReads {
 /// `config_path` must be absolute. It names the config in errors, and its directory resolves a
 /// relative `env_file`. Every file is read even after one fails, so all errors are reported.
 ///
+/// `deadline` bounds each read on its own. A read that outlasts it fails with a timeout error,
+/// and its thread is abandoned, since a thread blocked in a read cannot be stopped. `None` reads
+/// on the calling thread with no bound.
+///
 /// `before_read` runs once per declaring field, with the field and the path, just before the
 /// file is read. A caller can log which file a stuck read is on.
 pub fn read_env_files(
     config: &Config,
     config_path: &Path,
     special: SpecialFiles,
+    deadline: Option<Duration>,
     mut before_read: impl FnMut(&str, &Path),
 ) -> EnvFileReads {
     let config_dir = config_path.parent().unwrap_or(Path::new("."));
@@ -474,7 +491,7 @@ pub fn read_env_files(
             before_read(field, &path);
         }
 
-        match read_env_file(config_path, &declared) {
+        match read_bounded(config_path, &declared, deadline) {
             Ok(vars) => {
                 reads.values.insert(path, vars);
             }
@@ -485,6 +502,47 @@ pub fn read_env_files(
     reads.sources = sources;
 
     reads
+}
+
+/// Read one file, giving up on it after `deadline` when there is one.
+fn read_bounded(
+    config: &Path,
+    source: &EnvFileSource,
+    deadline: Option<Duration>,
+) -> Result<BTreeMap<String, String>, Vec<EnvFileError>> {
+    let Some(limit) = deadline else {
+        return read_env_file(config, source);
+    };
+
+    let fail = |kind: EnvFileErrorKind| {
+        vec![EnvFileError {
+            config: config.to_path_buf(),
+            field: source.field.clone(),
+            path: source.path.clone(),
+            kind,
+        }]
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let (owned_config, owned_source) = (config.to_path_buf(), source.clone());
+
+    let spawned = std::thread::Builder::new()
+        .name("zaz-env-file-read".to_string())
+        .spawn(move || {
+            let _ = tx.send(read_env_file(&owned_config, &owned_source));
+        });
+
+    if let Err(e) = spawned {
+        return Err(fail(EnvFileErrorKind::Io(e)));
+    }
+
+    match rx.recv_timeout(limit) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(fail(EnvFileErrorKind::Timeout { limit })),
+        Err(RecvTimeoutError::Disconnected) => Err(fail(EnvFileErrorKind::Io(
+            std::io::Error::other("the read thread ended without a result"),
+        ))),
+    }
 }
 
 /// Why `path` must not be opened, when it names something other than a regular file or a
@@ -1249,7 +1307,7 @@ env_file = "svc.env"
         let dir = tempfile::tempdir().unwrap();
         let (config, path) = shared_file_config(dir.path());
 
-        let reads = read_env_files(&config, &path, SpecialFiles::Read, |_, _| {});
+        let reads = read_env_files(&config, &path, SpecialFiles::Read, None, |_, _| {});
 
         assert_eq!(reads.errors.len(), 1);
         assert_eq!(reads.errors[0].code(), "env_file_missing");
@@ -1266,7 +1324,7 @@ env_file = "svc.env"
         let (config, path) = shared_file_config(dir.path());
         std::fs::write(dir.path().join("shared.env"), "A=1\n").unwrap();
 
-        let reads = read_env_files(&config, &path, SpecialFiles::Read, |_, _| {});
+        let reads = read_env_files(&config, &path, SpecialFiles::Read, None, |_, _| {});
 
         assert!(reads.errors.is_empty());
         assert_eq!(reads.sources().len(), 2);
@@ -1286,7 +1344,7 @@ env_file = "svc.env"
             .unwrap();
         assert!(status.success(), "mkfifo is required for this test");
 
-        let reads = read_env_files(&config, &path, SpecialFiles::Skip, |_, _| {});
+        let reads = read_env_files(&config, &path, SpecialFiles::Skip, None, |_, _| {});
 
         assert!(reads.errors.is_empty());
         assert_eq!(reads.not_read.len(), 1);
@@ -1303,12 +1361,12 @@ env_file = "svc.env"
         let dir = tempfile::tempdir().unwrap();
         let (config, path) = shared_file_config(dir.path());
 
-        let missing = read_env_files(&config, &path, SpecialFiles::Skip, |_, _| {});
+        let missing = read_env_files(&config, &path, SpecialFiles::Skip, None, |_, _| {});
         assert_eq!(missing.errors[0].code(), "env_file_missing");
         assert!(missing.not_read.is_empty());
 
         std::fs::write(dir.path().join("shared.env"), "A=1\n").unwrap();
-        let present = read_env_files(&config, &path, SpecialFiles::Skip, |_, _| {});
+        let present = read_env_files(&config, &path, SpecialFiles::Skip, None, |_, _| {});
         assert!(present.errors.is_empty());
         assert!(present.not_read.is_empty());
         assert!(present.vars(&present.sources()[0]).is_some());

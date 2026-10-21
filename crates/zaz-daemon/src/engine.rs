@@ -1139,7 +1139,7 @@ impl Engine {
     pub fn new(config_path: &Path) -> Result<Self, DaemonError> {
         let config_path =
             zaz_config::absolute_config_path(config_path).map_err(DaemonError::Config)?;
-        let prepared = evaluate::prepare(&config_path)?;
+        let prepared = evaluate::prepare(&config_path, evaluate::ENV_FILE_READ_DEADLINE)?;
 
         Self::from_prepared(prepared, config_path, true, false)
     }
@@ -1154,7 +1154,7 @@ impl Engine {
         let (tx, rx) = tokio::sync::oneshot::channel();
         evaluate::prepare_detached(
             config_path.clone(),
-            evaluate::LOAD_DEADLINE,
+            evaluate::ENV_FILE_READ_DEADLINE,
             move |result| {
                 let _ = tx.send(result);
             },
@@ -1173,7 +1173,8 @@ impl Engine {
     ) -> Result<Self, DaemonError> {
         let config_path =
             zaz_config::absolute_config_path(&config_path).map_err(DaemonError::Config)?;
-        let evaluated = evaluate::evaluate(&config, &config_path).map_err(DaemonError::EnvFile)?;
+        let evaluated = evaluate::evaluate(&config, &config_path, evaluate::ENV_FILE_READ_DEADLINE)
+            .map_err(DaemonError::EnvFile)?;
 
         Self::from_prepared(
             Prepared { config, evaluated },
@@ -2507,7 +2508,7 @@ impl Engine {
     /// instead, so only tests that have no event loop to protect call this.
     #[cfg(test)]
     async fn reload_config(&mut self) -> ReloadResult {
-        match evaluate::prepare(&self.config_path) {
+        match evaluate::prepare(&self.config_path, evaluate::ENV_FILE_READ_DEADLINE) {
             Ok(prepared) => self.apply_prepared(prepared).await,
             Err(e) => Self::prepare_failure(&e),
         }

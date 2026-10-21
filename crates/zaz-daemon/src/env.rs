@@ -228,12 +228,29 @@ mod tests {
         );
     }
 
+    /// Removes a process variable when dropped, so a failed assertion cannot leak it into other
+    /// tests.
+    struct InheritedVarGuard(&'static str);
+
+    impl InheritedVarGuard {
+        fn set(key: &'static str, value: &OsStr) -> Self {
+            std::env::set_var(key, value);
+            Self(key)
+        }
+    }
+
+    impl Drop for InheritedVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
     #[test]
     fn a_non_utf8_inherited_value_does_not_panic_the_group_build() {
         use std::os::unix::ffi::OsStringExt;
 
         let raw = OsString::from_vec(vec![b'v', 0xff]);
-        std::env::set_var("ZAZ_TEST_NON_UTF8_INHERITED", &raw);
+        let _guard = InheritedVarGuard::set("ZAZ_TEST_NON_UTF8_INHERITED", &raw);
 
         let env = GroupEnv::default();
         let group = group_executor(None, Path::new("/cfg"), None, &env);
@@ -243,8 +260,6 @@ mod tests {
             task.env().get(OsStr::new("ZAZ_TEST_NON_UTF8_INHERITED")),
             Some(&raw)
         );
-
-        std::env::remove_var("ZAZ_TEST_NON_UTF8_INHERITED");
     }
 
     #[test]

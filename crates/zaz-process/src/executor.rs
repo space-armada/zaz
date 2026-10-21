@@ -351,6 +351,34 @@ mod tests {
 
     const PROBE: &str = "printf '%s' \"${ZAZ_TEST_ABSENT-unset}\"";
 
+    /// Removes a process variable when dropped, so a failed assertion cannot leak it into other
+    /// tests.
+    struct EnvVarGuard(&'static str);
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            std::env::set_var(key, value);
+            Self(key)
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    fn pty_available() -> bool {
+        portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .is_ok()
+    }
+
     fn complete_env_without_probe() -> HashMap<OsString, OsString> {
         std::env::set_var("ZAZ_TEST_ABSENT", "inherited");
 
@@ -379,7 +407,7 @@ mod tests {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
         let value = OsString::from_vec(vec![b'o', b'k', 0xff, 0xfe]);
-        std::env::set_var("ZAZ_TEST_NON_UTF8", &value);
+        let _guard = EnvVarGuard::set("ZAZ_TEST_NON_UTF8", &value);
 
         let executor = Executor::new(Some("/bin/sh".to_string()));
 
@@ -388,8 +416,6 @@ mod tests {
             .get(std::ffi::OsStr::new("ZAZ_TEST_NON_UTF8"))
             .unwrap();
         assert_eq!(held.as_bytes(), value.as_bytes());
-
-        std::env::remove_var("ZAZ_TEST_NON_UTF8");
     }
 
     #[tokio::test]
@@ -434,16 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn variable_absent_from_the_map_is_absent_in_a_pty() {
-        let pty_system = portable_pty::native_pty_system();
-        let available = pty_system
-            .openpty(portable_pty::PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .is_ok();
-        if !available {
+        if !pty_available() {
             eprintln!("PTY not available in this environment, skipping test");
             return;
         }
@@ -458,5 +475,33 @@ mod tests {
         child.wait().await.unwrap();
 
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "unset");
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_value_reaches_the_command_unchanged_in_a_pty() {
+        use std::os::unix::ffi::OsStringExt;
+
+        if !pty_available() {
+            eprintln!("PTY not available in this environment, skipping test");
+            return;
+        }
+
+        let mut env = complete_env_without_probe();
+        env.insert(
+            OsString::from("ZAZ_TEST_BYTES"),
+            OsString::from_vec(vec![0xff, b'a', 0xfe]),
+        );
+        let executor = Executor::new(Some("/bin/sh".to_string())).with_env(env);
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let out = temp.path().join("bytes.txt");
+        let command = format!(
+            "printf '%s' \"$ZAZ_TEST_BYTES\" | od -An -tx1 | tr -d ' \\n' > '{}'",
+            out.display()
+        );
+        let mut child = executor.spawn(&command, true).unwrap();
+        child.wait().await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "ff61fe");
     }
 }

@@ -1669,6 +1669,7 @@ fn check_env_files(config: &zaz_config::Config, config_path: &Path) -> EnvFileCh
         config,
         config_path,
         zaz_config::SpecialFiles::Skip,
+        None,
         |_, _| {},
     );
 

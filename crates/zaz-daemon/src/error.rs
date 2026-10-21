@@ -19,15 +19,6 @@ pub enum DaemonError {
     #[error("{}", format_env_file_errors(.0))]
     EnvFile(Vec<zaz_config::EnvFileError>),
 
-    /// The config and the sources it names did not finish loading within the limit.
-    ///
-    /// The thread doing the read cannot be stopped, so it is abandoned.
-    #[error(
-        "a source did not finish reading within {:?}, so the load was abandoned [env_load_timeout]",
-        .limit
-    )]
-    LoadTimeout { limit: std::time::Duration },
-
     /// The thread that loads and evaluates a config panicked.
     #[error("loading the config panicked")]
     EvaluationPanicked,
@@ -133,7 +124,6 @@ impl DaemonError {
         match self {
             Self::EnvFile(errors) => errors.first().map_or("env_file_error", |e| e.code()),
             Self::Config(error) => error.code(),
-            Self::LoadTimeout { .. } => "env_load_timeout",
             Self::EvaluationPanicked => "evaluation_panicked",
             Self::EvaluationThread(_) => "evaluation_unavailable",
             Self::CyclicDependency(_) => "dependency_cycle",
@@ -161,11 +151,6 @@ impl DaemonError {
             Self::Config(zaz_config::ConfigError::Validation(errors)) => {
                 errors.iter().next().and_then(|e| e.hint.clone())
             }
-            Self::LoadTimeout { .. } => Some(
-                "a named pipe or other special file in an env_file may have no writer, so \
-                 point env_file at a regular file"
-                    .to_string(),
-            ),
             Self::SocketResolution { .. } => Some(
                 "run this command from a zaz project directory or pass --socket <PATH>".to_string(),
             ),
@@ -252,16 +237,23 @@ mod tests {
     }
 
     #[test]
-    fn a_load_timeout_has_its_own_code_and_says_what_stalled() {
-        let error = DaemonError::LoadTimeout {
-            limit: std::time::Duration::from_secs(120),
-        };
+    fn an_env_file_read_timeout_names_the_field_and_path_and_hints_at_pipes() {
+        let error = DaemonError::EnvFile(vec![zaz_config::EnvFileError {
+            config: PathBuf::from("/p/zaz.toml"),
+            field: "settings env_file".to_string(),
+            path: PathBuf::from("/p/slow.env"),
+            kind: zaz_config::EnvFileErrorKind::Timeout {
+                limit: std::time::Duration::from_secs(120),
+            },
+        }]);
 
-        assert_eq!(error.code(), "env_load_timeout");
-        assert!(error
-            .to_string()
-            .contains("did not finish reading within 120s"));
-        assert!(error.hint().is_some());
+        assert_eq!(error.code(), "env_file_read_timeout");
+
+        let text = error.to_string();
+        assert!(text.contains("settings env_file"), "{text}");
+        assert!(text.contains("/p/slow.env"), "{text}");
+        assert!(text.contains("did not finish within 120s"), "{text}");
+        assert!(error.hint().unwrap().contains("named pipe"));
     }
 
     #[test]
