@@ -256,6 +256,12 @@ pub struct ConfigSettings {
     pub log_format: LogFormatReport,
     /// The `env_file` path as written. Loaded values are never shown.
     pub env_file: Option<String>,
+    /// The `env_command` as written. Its output is never shown.
+    pub env_command: Option<String>,
+    /// Extra variable names, or `PREFIX_*` patterns, kept from the daemon's environment.
+    pub env_passthrough: Vec<String>,
+    /// The `env_command_timeout` in milliseconds, when set.
+    pub env_command_timeout_ms: Option<u64>,
 }
 
 /// Log output format.
@@ -276,6 +282,7 @@ pub struct ConfigGroup {
     pub depends_on: Vec<String>,
     pub working_dir: Option<String>,
     pub env_file: Option<String>,
+    pub env_command: Option<String>,
     pub env: BTreeMap<String, String>,
     pub tasks: Vec<ConfigTask>,
     pub services: Vec<ConfigService>,
@@ -290,6 +297,7 @@ pub struct ConfigTask {
     pub silence: SilenceReport,
     pub working_dir: Option<String>,
     pub env_file: Option<String>,
+    pub env_command: Option<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -311,6 +319,7 @@ pub struct ConfigService {
     pub ready_poll_interval_ms: Option<u64>,
     pub ready_timeout_ms: Option<u64>,
     pub env_file: Option<String>,
+    pub env_command: Option<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -513,6 +522,9 @@ impl From<&Settings> for ConfigSettings {
             debounce_ms: s.debounce_ms(),
             log_format: s.log_format.into(),
             env_file: s.env_file.clone(),
+            env_command: s.env_command.clone(),
+            env_passthrough: s.env_passthrough.clone(),
+            env_command_timeout_ms: s.env_command_timeout.map(|t| t.as_millis()),
         }
     }
 }
@@ -536,6 +548,7 @@ impl From<&Group> for ConfigGroup {
             depends_on: g.depends_on.clone(),
             working_dir: g.working_dir.clone(),
             env_file: g.env_file.clone(),
+            env_command: g.env_command.clone(),
             env: g.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             tasks: g.tasks.iter().map(ConfigTask::from).collect(),
             services: g.services.iter().map(ConfigService::from).collect(),
@@ -552,6 +565,7 @@ impl From<&TaskCommand> for ConfigTask {
             silence: t.silence.into(),
             working_dir: t.working_dir.clone(),
             env_file: t.env_file.clone(),
+            env_command: t.env_command.clone(),
             env: t.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
@@ -571,6 +585,7 @@ impl From<&ServiceCommand> for ConfigService {
             silence: d.silence.into(),
             working_dir: d.working_dir.clone(),
             env_file: d.env_file.clone(),
+            env_command: d.env_command.clone(),
             delay_ms: d.delay_ms(),
             stop_timeout_ms: d.stop_timeout_ms(),
             ready_poll_interval_ms: d.ready_poll_interval_ms(),
@@ -758,14 +773,20 @@ mod tests {
 
         let mut task = TaskCommand::new("build", "make");
         task.env_file = Some("task.env".to_string());
+        task.env_command = Some("mise env --json".to_string());
         let mut service = ServiceCommand::new("web", "run");
         service.env_file = Some("svc.env".to_string());
+        service.env_command = Some("dotenvx get --format json".to_string());
 
         let mut config = Config::default();
         config.settings.env_file = Some("secrets.env".to_string());
+        config.settings.env_command = Some("direnv export json".to_string());
+        config.settings.env_passthrough = vec!["OP_*".to_string()];
+        config.settings.env_command_timeout = Some(zaz_config::HumanDuration::from_millis(30_000));
         config.groups.push(Group {
             name: "api".to_string(),
             env_file: Some("group.env".to_string()),
+            env_command: Some("sops -d x.json".to_string()),
             tasks: vec![task],
             services: vec![service],
             ..Default::default()
@@ -774,6 +795,24 @@ mod tests {
         let report = ConfigReport::from_config(&dir.path().join("zaz.toml"), &config);
 
         assert_eq!(report.settings.env_file.as_deref(), Some("secrets.env"));
+        assert_eq!(
+            report.settings.env_command.as_deref(),
+            Some("direnv export json")
+        );
+        assert_eq!(report.settings.env_passthrough, vec!["OP_*".to_string()]);
+        assert_eq!(report.settings.env_command_timeout_ms, Some(30_000));
+        assert_eq!(
+            report.groups[0].env_command.as_deref(),
+            Some("sops -d x.json")
+        );
+        assert_eq!(
+            report.groups[0].tasks[0].env_command.as_deref(),
+            Some("mise env --json")
+        );
+        assert_eq!(
+            report.groups[0].services[0].env_command.as_deref(),
+            Some("dotenvx get --format json")
+        );
         assert_eq!(report.groups[0].env_file.as_deref(), Some("group.env"));
         assert_eq!(
             report.groups[0].tasks[0].env_file.as_deref(),

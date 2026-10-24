@@ -1,6 +1,6 @@
 //! Task command runner.
 
-use crate::{CommandOutput, Executor, OutputLine, ProcessError};
+use crate::{CommandOutput, Executor, OutputLine, ProcessError, StreamingRun};
 use tokio::sync::mpsc;
 use zaz_config::TaskCommand;
 
@@ -19,6 +19,11 @@ impl TaskRunner {
     /// Run a raw command string and return the output.
     pub async fn run(&self, command: &str) -> Result<CommandOutput, ProcessError> {
         self.executor.run(command).await
+    }
+
+    /// Spawn a command without driving it, so the caller has its process group first.
+    pub fn spawn_streaming(&self, command: &str) -> Result<StreamingRun, ProcessError> {
+        self.executor.spawn_streaming(command)
     }
 
     /// Run a command, streaming output through an unbounded channel as it arrives.

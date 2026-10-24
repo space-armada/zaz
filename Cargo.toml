@@ -35,8 +35,9 @@ notify = "7"
 globset = "0.4"
 
 # Process management
-nix = { version = "0.29", features = ["signal", "process", "term"] }
+nix = { version = "0.29", features = ["fs", "poll", "signal", "process", "term"] }
 portable-pty = "0.8"
+libc = "0.2"
 
 # TUI
 ratatui = "0.29"

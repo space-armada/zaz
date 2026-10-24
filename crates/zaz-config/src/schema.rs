@@ -154,6 +154,26 @@ pub struct Settings {
     /// A relative path resolves against the config directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_file: Option<String>,
+
+    /// Command whose output is loaded into the environment of every process.
+    ///
+    /// The command prints one JSON object of string or `null` values, as `direnv export json`
+    /// does. It runs in the config directory, under `shell` or `/bin/sh`, and its string
+    /// expands `${...}` variables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_command: Option<String>,
+
+    /// Extra variable names, or `PREFIX_*` patterns, that `env_command` evaluation keeps from the
+    /// daemon's environment, beyond the fixed base list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_passthrough: Vec<String>,
+
+    /// How long any one `env_command` may run, from spawn to exit and end of output.
+    ///
+    /// Accepts human-readable strings ("30s", "5m") or integer milliseconds. Unset falls back to
+    /// 120 seconds. Setting this without an `env_command` anywhere is a validation error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_command_timeout: Option<HumanDuration>,
 }
 
 impl Default for Settings {
@@ -164,6 +184,9 @@ impl Default for Settings {
             log_format: LogFormat::Pretty,
             name: None,
             env_file: None,
+            env_command: None,
+            env_passthrough: Vec::new(),
+            env_command_timeout: None,
         }
     }
 }
@@ -228,6 +251,13 @@ pub struct Group {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_file: Option<String>,
 
+    /// Command whose output is loaded into the environment of all commands in this group.
+    ///
+    /// It runs in the group's working directory, after `env_file` and before inline `env`. See
+    /// the `env_command` setting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_command: Option<String>,
+
     /// Environment variables for all commands in this group.
     /// These are merged with task/daemon-specific env vars.
     pub env: HashMap<String, String>,
@@ -269,6 +299,12 @@ pub struct TaskCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_file: Option<String>,
 
+    /// Command whose output is loaded into this task's environment.
+    ///
+    /// It runs in the task's working directory, after `env_file` and before inline `env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_command: Option<String>,
+
     /// Environment variables for this task (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -284,6 +320,7 @@ impl TaskCommand {
             silence: Silence::None,
             working_dir: None,
             env_file: None,
+            env_command: None,
             env: HashMap::new(),
         }
     }
@@ -297,6 +334,7 @@ impl TaskCommand {
             silence: Silence::None,
             working_dir: None,
             env_file: None,
+            env_command: None,
             env: HashMap::new(),
         }
     }
@@ -430,6 +468,12 @@ pub struct ServiceCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_file: Option<String>,
 
+    /// Command whose output is loaded into this service's environment.
+    ///
+    /// It runs in the service's working directory, after `env_file` and before inline `env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_command: Option<String>,
+
     /// Environment variables for this service (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -454,6 +498,7 @@ impl ServiceCommand {
             ready_poll_interval: None,
             ready_timeout: None,
             env_file: None,
+            env_command: None,
             env: HashMap::new(),
         }
     }
@@ -476,6 +521,7 @@ impl ServiceCommand {
             ready_poll_interval: None,
             ready_timeout: None,
             env_file: None,
+            env_command: None,
             env: HashMap::new(),
         }
     }

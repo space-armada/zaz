@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 use zaz_config::{Config, Group, LogStorageBackend};
 use zaz_process::{
-    CommandOutput, Executor, HookRun, KillAction, OutputLine, ProcessError, ReadyPoll, Service,
-    StopEscalation, TaskRunner,
+    CancelHandle, CommandOutput, Executor, GroupRegistry, HookRun, KillAction, OutputLine,
+    ProcessError, ReadyPoll, Service, StopEscalation, TaskRunner,
 };
 use zaz_vars::Context;
 use zaz_watch::{FileEvent, PatternSet, Watcher, WatcherConfig};
@@ -73,6 +73,8 @@ struct TaskExecutionContext {
     executor: Executor,
     /// Log suppression level.
     silence: zaz_config::Silence,
+    /// Where the task's process group is recorded while it runs.
+    groups: GroupRegistry,
 }
 
 /// Check if output should be suppressed based on silence setting and output kind.
@@ -106,8 +108,14 @@ async fn execute_task(ctx: TaskExecutionContext, log_tx: mpsc::Sender<LogLine>) 
     // Create channel for streaming output
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<OutputLine>();
 
-    // Run command with streaming
-    let command_future = task_runner.run_streaming(&ctx.command, output_tx);
+    // Run command with streaming. The group is recorded from spawn to completion so an interrupt
+    // can reach it.
+    let command_future = async {
+        let run = task_runner.spawn_streaming(&ctx.command)?;
+        let _tracked = run.pgid().map(|pgid| ctx.groups.track(pgid));
+
+        run.stream(output_tx).await
+    };
     tokio::pin!(command_future);
 
     let result = loop {
@@ -942,6 +950,7 @@ pub struct Engine {
 
     /// Currently running tasks (by "group:task" id). All tasks can run in parallel.
     running_tasks: std::collections::HashSet<String>,
+    task_groups: GroupRegistry,
 
     /// Tasks that need to re-run after their current execution completes.
     /// Maximum 1 pending per task (HashSet deduplicates).
@@ -1139,7 +1148,11 @@ impl Engine {
     pub fn new(config_path: &Path) -> Result<Self, DaemonError> {
         let config_path =
             zaz_config::absolute_config_path(config_path).map_err(DaemonError::Config)?;
-        let prepared = evaluate::prepare(&config_path, evaluate::ENV_FILE_READ_DEADLINE)?;
+        let prepared = evaluate::prepare(
+            &config_path,
+            evaluate::ENV_FILE_READ_DEADLINE,
+            &CancelHandle::new(),
+        )?;
 
         Self::from_prepared(prepared, config_path, true, false)
     }
@@ -1148,13 +1161,19 @@ impl Engine {
     ///
     /// The evaluation runs on its own thread, so a source that blocks does not pin a runtime
     /// worker. `zaz task` has no event loop, so this is the one place it waits.
-    pub async fn load_task_only(config_path: &Path) -> Result<Self, DaemonError> {
+    ///
+    /// `cancel` stops the command that is running. The load then fails with a cancelled error.
+    pub async fn load_task_only(
+        config_path: &Path,
+        cancel: CancelHandle,
+    ) -> Result<Self, DaemonError> {
         let config_path =
             zaz_config::absolute_config_path(config_path).map_err(DaemonError::Config)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         evaluate::prepare_detached(
             config_path.clone(),
             evaluate::ENV_FILE_READ_DEADLINE,
+            cancel,
             move |result| {
                 let _ = tx.send(result);
             },
@@ -1173,8 +1192,12 @@ impl Engine {
     ) -> Result<Self, DaemonError> {
         let config_path =
             zaz_config::absolute_config_path(&config_path).map_err(DaemonError::Config)?;
-        let evaluated = evaluate::evaluate(&config, &config_path, evaluate::ENV_FILE_READ_DEADLINE)
-            .map_err(DaemonError::EnvFile)?;
+        let evaluated = evaluate::evaluate(
+            &config,
+            &config_path,
+            evaluate::ENV_FILE_READ_DEADLINE,
+            &CancelHandle::new(),
+        )?;
 
         Self::from_prepared(
             Prepared { config, evaluated },
@@ -1311,6 +1334,7 @@ impl Engine {
             status_tx,
             log_store,
             running_tasks: std::collections::HashSet::new(),
+            task_groups: GroupRegistry::new(),
             pending_tasks: std::collections::HashSet::new(),
             dependency_resolver,
             task_completion_rx,
@@ -1701,6 +1725,7 @@ impl Engine {
             command,
             executor,
             silence,
+            groups: self.task_groups.clone(),
         };
 
         let log_tx = self.log_store.sender();
@@ -2098,6 +2123,11 @@ impl Engine {
 
         self.update_state();
         Ok(())
+    }
+
+    /// The process groups of the tasks that are running, for a caller that must stop them.
+    pub fn task_groups(&self) -> GroupRegistry {
+        self.task_groups.clone()
     }
 
     /// Wait for all running tasks to complete.
@@ -2508,7 +2538,11 @@ impl Engine {
     /// instead, so only tests that have no event loop to protect call this.
     #[cfg(test)]
     async fn reload_config(&mut self) -> ReloadResult {
-        match evaluate::prepare(&self.config_path, evaluate::ENV_FILE_READ_DEADLINE) {
+        match evaluate::prepare(
+            &self.config_path,
+            evaluate::ENV_FILE_READ_DEADLINE,
+            &CancelHandle::new(),
+        ) {
             Ok(prepared) => self.apply_prepared(prepared).await,
             Err(e) => Self::prepare_failure(&e),
         }

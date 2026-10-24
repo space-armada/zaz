@@ -2,6 +2,7 @@
 //!
 //! Supports both TOML and JSON formats, auto-detected by file extension.
 
+mod env_command;
 mod env_file;
 mod error;
 mod schema;
@@ -10,6 +11,7 @@ mod unknown_keys;
 pub mod user;
 mod validate;
 
+pub use env_command::{env_command_sources, EnvCommandSource};
 pub use env_file::{
     env_file_sources, parse_env_file, read_env_file, read_env_files, EnvFileError,
     EnvFileErrorKind, EnvFileLevel, EnvFileNotRead, EnvFileReads, EnvFileSource, ParseProblem,

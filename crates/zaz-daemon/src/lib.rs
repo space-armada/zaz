@@ -6,6 +6,7 @@ mod api;
 mod dependency;
 mod engine;
 mod env;
+mod env_command;
 mod error;
 mod evaluate;
 mod host;
@@ -20,6 +21,7 @@ mod target;
 
 pub use api::{ApiRequest, ApiResponse, EngineCommand, LogLine, LogSource, OutputKind};
 pub use engine::Engine;
+pub use env_command::{EnvCommandError, EnvCommandErrorKind};
 pub use error::{DaemonError, LogStorageError};
 pub use host::{DaemonHost, RunOutcome};
 pub use log_layer::DaemonLogLayer;

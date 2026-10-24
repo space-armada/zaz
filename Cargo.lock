@@ -3037,8 +3037,10 @@ dependencies = [
 name = "zaz-process"
 version = "2026.7.1"
 dependencies = [
+ "libc",
  "nix 0.29.0",
  "portable-pty",
+ "regex",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
@@ -3061,6 +3063,7 @@ dependencies = [
  "tracing",
  "zaz-config",
  "zaz-daemon",
+ "zaz-process",
 ]
 
 [[package]]

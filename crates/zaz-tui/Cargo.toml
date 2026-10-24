@@ -20,6 +20,7 @@ zaz-daemon.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+zaz-process.workspace = true
 
 [[bench]]
 name = "ansi"

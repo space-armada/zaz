@@ -1,7 +1,8 @@
 //! Microbenchmarks for ANSI log-line parsing and stripping.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use zaz_tui::ansi::{parse_ansi, strip_ansi};
+use zaz_process::strip_ansi;
+use zaz_tui::ansi::parse_ansi;
 
 /// A log line with several SGR sequences: colors, bold, and a reset, plus plain
 /// text between them, so the parser walks both escape and literal runs.

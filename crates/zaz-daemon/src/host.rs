@@ -22,6 +22,7 @@ use crate::DaemonError;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use zaz_process::{CancelHandle, TERMINATE_GRACE};
 
 type Waiter = oneshot::Sender<ApiResponse>;
 
@@ -46,6 +47,7 @@ enum Slot {
 struct InFlight {
     id: u64,
     waiters: Vec<Waiter>,
+    cancel: CancelHandle,
 }
 
 struct Pending {
@@ -70,6 +72,7 @@ pub struct DaemonHost {
     outcomes_tx: mpsc::UnboundedSender<RunOutcome>,
     read_deadline: Duration,
     shutting_down: bool,
+    abandoned: Vec<CancelHandle>,
 }
 
 impl DaemonHost {
@@ -96,6 +99,7 @@ impl DaemonHost {
             outcomes_tx,
             read_deadline: evaluate::ENV_FILE_READ_DEADLINE,
             shutting_down: false,
+            abandoned: Vec::new(),
         };
 
         Ok((host, outcomes_rx))
@@ -222,12 +226,43 @@ impl DaemonHost {
     }
 
     /// Stop every process the engine started. A load still in flight is abandoned.
+    ///
+    /// A command the load is running is signalled, and this waits for its group to be terminated
+    /// before it returns. The evaluation thread dies with the daemon, so a command that ignores
+    /// SIGTERM would otherwise outlive it.
     pub async fn shutdown(&mut self) -> Result<(), DaemonError> {
         self.shutting_down = true;
 
-        match &mut self.slot {
+        if let Some(in_flight) = &self.in_flight {
+            self.abandon(in_flight.cancel.clone());
+        }
+
+        let result = match &mut self.slot {
             Slot::Loaded(engine) => engine.shutdown().await,
             Slot::Unloaded { .. } => Ok(()),
+        };
+
+        self.wait_for_abandoned().await;
+
+        result
+    }
+
+    fn abandon(&mut self, cancel: CancelHandle) {
+        cancel.cancel();
+        self.abandoned.push(cancel);
+    }
+
+    async fn wait_for_abandoned(&self) {
+        let limit = TERMINATE_GRACE + Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + limit;
+
+        while self.abandoned.iter().any(|cancel| !cancel.is_idle()) {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!("an env_command was still running when the shutdown wait ended");
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -259,12 +294,18 @@ impl DaemonHost {
         self.next_run += 1;
 
         tracing::debug!(run = id, scope = ?scope, "starting a load");
-        self.in_flight = Some(InFlight { id, waiters });
+        let cancel = CancelHandle::new();
+        self.in_flight = Some(InFlight {
+            id,
+            waiters,
+            cancel: cancel.clone(),
+        });
 
         let outcomes_tx = self.outcomes_tx.clone();
         evaluate::prepare_detached(
             self.config_path.clone(),
             self.read_deadline,
+            cancel,
             move |result| {
                 let _ = outcomes_tx.send(RunOutcome { id, result });
             },
@@ -272,8 +313,15 @@ impl DaemonHost {
     }
 
     /// Answer every waiter with a shutting-down result, and drop the load in flight.
+    ///
+    /// A command the load is running is signalled before the daemon exits, since the daemon runs
+    /// under `setsid` and nothing else would reach the command's process group.
     fn begin_shutdown(&mut self) -> ApiResponse {
         self.shutting_down = true;
+
+        if let Some(cancel) = self.in_flight.as_ref().map(|f| f.cancel.clone()) {
+            self.abandon(cancel);
+        }
 
         let in_flight = self.in_flight.take().into_iter().flat_map(|f| f.waiters);
         let pending = self.pending.take().into_iter().flat_map(|p| p.waiters);
