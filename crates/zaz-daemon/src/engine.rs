@@ -7,12 +7,13 @@ use crate::dependency::DependencyResolver;
 use crate::env::{self, GroupEnv, ProcessRef};
 use crate::evaluate::{self, EvaluatedEnv, Prepared};
 use crate::log_storage::{LogQuery, LogQueryResult};
+use crate::sources::{self, SourceIndex};
 use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
 };
 use crate::{ApiResponse, DaemonError};
 use indexmap::IndexMap;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -819,6 +820,11 @@ pub enum TriggerSource {
         /// Number of modified groups.
         modified: usize,
     },
+    /// A watched `env_file` or `env_watch` source changed the environment of some groups.
+    EnvChange {
+        /// Number of groups whose environment changed.
+        modified: usize,
+    },
     /// Dependency became ready during startup.
     DependencyReady {
         /// Group that completed.
@@ -851,6 +857,9 @@ impl fmt::Display for TriggerSource {
                 "config reload ({} added, {} removed, {} modified)",
                 added, removed, modified
             ),
+            TriggerSource::EnvChange { modified } => {
+                write!(f, "environment change ({} groups)", modified)
+            }
             TriggerSource::DependencyReady { completed_group } => {
                 write!(f, "dependency '{}' ready", completed_group)
             }
@@ -973,6 +982,37 @@ pub struct Engine {
 
     /// Whether this engine should skip service startup entirely.
     task_only: bool,
+
+    /// The watched sources of the running config, by the path the watcher reports.
+    sources: SourceIndex,
+
+    /// Where a source change asks the host for a partial evaluation. Unset when no host drives
+    /// the engine.
+    refresh_tx: Option<mpsc::UnboundedSender<BTreeSet<PathBuf>>>,
+
+    /// Groups whose environment a requested refresh may still change.
+    ///
+    /// File-change batches for these groups wait in `held` until the refresh has been applied.
+    stale_groups: HashSet<String>,
+
+    /// File-change batches waiting for a refresh, in arrival order.
+    held: Vec<HeldBatch>,
+}
+
+/// A file-change batch whose groups wait for a refreshed environment.
+struct HeldBatch {
+    events: Vec<FileEvent>,
+    groups: Vec<String>,
+}
+
+/// Why a config is being applied, which decides how the changed groups run.
+enum ApplyTrigger {
+    /// A reload of the config. Added and modified groups run under the reload context.
+    Reload,
+
+    /// A refresh of the environment under an unchanged config. Modified groups run under the
+    /// environment-change context, except the ones in `skip`, which a held batch runs later.
+    EnvChange { skip: HashSet<String> },
 }
 
 /// Result of a config reload operation.
@@ -1234,6 +1274,7 @@ impl Engine {
 
         let mut watcher = Watcher::new(watcher_config).map_err(DaemonError::Watch)?;
         watcher.watch(&config_dir).map_err(DaemonError::Watch)?;
+        let sources = register_sources(&mut watcher, &config, &config_dir);
 
         // Build pattern sets and managed groups
         let mut group_patterns = HashMap::new();
@@ -1342,7 +1383,48 @@ impl Engine {
             suppress_task_completion_cascade: std::collections::HashSet::new(),
             notification_config,
             task_only,
+            sources,
+            refresh_tx: None,
+            stale_groups: HashSet::new(),
+            held: Vec::new(),
         })
+    }
+
+    /// Register the sources of the config that was just applied with the watcher.
+    fn resync_sources(&mut self) {
+        let config_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+
+        self.sources = register_sources(&mut self.watcher, &self.config, &config_dir);
+    }
+
+    /// Hold a batch for `group`, as a pending refresh would.
+    #[cfg(test)]
+    pub(crate) fn hold_batch_for_test(&mut self, group: &str) {
+        self.stale_groups.insert(group.to_string());
+        self.held.push(HeldBatch {
+            events: Vec::new(),
+            groups: vec![group.to_string()],
+        });
+    }
+
+    /// How many batches wait for a refresh.
+    #[cfg(test)]
+    pub(crate) fn held_count(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Let source changes ask a host for a partial evaluation.
+    pub(crate) fn set_refresh_sender(&mut self, tx: mpsc::UnboundedSender<BTreeSet<PathBuf>>) {
+        self.refresh_tx = Some(tx);
+    }
+
+    /// The running config, for an evaluation that must not read `zaz.toml` again.
+    pub(crate) fn config_snapshot(&self) -> Config {
+        self.config.clone()
     }
 
     fn group_has_startup_tasks(&self, group_name: &str) -> bool {
@@ -1536,6 +1618,81 @@ impl Engine {
             return Ok(());
         }
 
+        let affected_groups = self.groups_matching(&events);
+        self.run_changes(events, affected_groups).await;
+
+        Ok(())
+    }
+
+    /// The groups whose patterns match any of the events.
+    fn groups_matching(&self, events: &[FileEvent]) -> Vec<String> {
+        let mut affected_groups = Vec::new();
+
+        for (name, patterns) in &self.group_patterns {
+            if events.iter().any(|e| patterns.matches(&e.path)) {
+                affected_groups.push(name.clone());
+            }
+        }
+
+        affected_groups
+    }
+
+    /// Route one batch from the watcher.
+    ///
+    /// A batch with source paths asks the host for a partial evaluation. Groups whose environment
+    /// that evaluation may change wait for it. The batch runs at once for every other group.
+    async fn route_changes(&mut self, events: Vec<FileEvent>) -> Result<(), DaemonError> {
+        let sources: BTreeSet<PathBuf> = events.iter().filter_map(|e| e.source.clone()).collect();
+
+        if !sources.is_empty() {
+            self.request_refresh(sources);
+        }
+
+        let affected = self.groups_matching(&events);
+        let (held, now): (Vec<String>, Vec<String>) = affected
+            .into_iter()
+            .partition(|group| self.stale_groups.contains(group));
+
+        if !held.is_empty() {
+            tracing::info!(
+                groups = ?held,
+                "holding file changes until the environment refresh is applied"
+            );
+            self.held.push(HeldBatch {
+                events: events.clone(),
+                groups: held,
+            });
+        }
+
+        if !now.is_empty() {
+            self.run_changes(events, now).await;
+        }
+
+        Ok(())
+    }
+
+    /// Ask the host to evaluate the sources behind these paths again.
+    fn request_refresh(&mut self, sources: BTreeSet<PathBuf>) {
+        let Some(tx) = &self.refresh_tx else {
+            return;
+        };
+
+        let mut levels = Vec::new();
+        for key in &sources {
+            levels.extend_from_slice(self.sources.levels(key));
+        }
+
+        let groups = sources::groups_fed_by(&self.config, &levels);
+
+        tracing::info!(sources = ?sources, groups = ?groups, "watched sources changed");
+
+        if tx.send(sources).is_ok() {
+            self.stale_groups.extend(groups);
+        }
+    }
+
+    /// Run the file-change triggers for `affected_groups`.
+    async fn run_changes(&mut self, events: Vec<FileEvent>, affected_groups: Vec<String>) {
         let changed_paths: Vec<PathBuf> = events.iter().map(|e| e.path.clone()).collect();
 
         self.state.last_change = Some(
@@ -1545,17 +1702,9 @@ impl Engine {
                 .as_millis() as u64,
         );
 
-        // Determine which groups are affected
-        let mut affected_groups = Vec::new();
-        for (name, patterns) in &self.group_patterns {
-            if changed_paths.iter().any(|p| patterns.matches(p)) {
-                affected_groups.push(name.clone());
-            }
-        }
-
         if affected_groups.is_empty() {
             tracing::debug!("no groups affected by changes");
-            return Ok(());
+            return;
         }
 
         // Dedupe affected groups to only root groups, because dependents get
@@ -1573,8 +1722,56 @@ impl Engine {
         let trigger_ctx = self.file_change_context(changed_paths);
 
         self.execute_groups(&roots, &trigger_ctx).await;
+    }
 
-        Ok(())
+    /// Run the batches that waited for a refresh, against the environment now in place.
+    ///
+    /// Groups the config no longer has are dropped from a batch.
+    pub(crate) async fn release_held(&mut self) {
+        self.stale_groups.clear();
+
+        for batch in std::mem::take(&mut self.held) {
+            let groups: Vec<String> = batch
+                .groups
+                .into_iter()
+                .filter(|group| self.groups.contains_key(group))
+                .collect();
+
+            self.run_changes(batch.events, groups).await;
+        }
+    }
+
+    /// Apply the environment a refresh evaluated, rebuilding only the groups it changed.
+    ///
+    /// The held batches keep waiting. The host releases them once no refresh is queued.
+    pub(crate) async fn apply_refresh(&mut self, evaluated: EvaluatedEnv) -> ReloadResult {
+        let skip: HashSet<String> = self
+            .held
+            .iter()
+            .flat_map(|batch| batch.groups.iter().cloned())
+            .collect();
+        let prepared = Prepared {
+            config: self.config.clone(),
+            evaluated,
+        };
+
+        self.apply_with(prepared, ApplyTrigger::EnvChange { skip })
+            .await
+    }
+
+    /// Record a refresh that failed. The running environment stays in place.
+    pub(crate) fn refresh_failed(&mut self, error: &DaemonError) {
+        tracing::error!(error = %error, "failed to refresh the environment from its sources");
+
+        self.state.env_refresh_error = Some(error.to_load_error());
+
+        if let Err(e) = self.push_log(LogLine::daemon(
+            "zaz",
+            format!("environment refresh failed, keeping the running environment: {error}"),
+        )) {
+            tracing::error!(error = %e, "failed to record the refresh failure");
+        }
+        self.update_state();
     }
 
     /// Execute the given groups under a shared trigger context.
@@ -2161,7 +2358,7 @@ impl Engine {
         let combined = self.combined_patterns()?;
 
         if let Some(events) = self.watcher.poll(&combined) {
-            self.handle_changes(events).await?;
+            self.route_changes(events).await?;
             Ok(true)
         } else {
             Ok(false)
@@ -2557,6 +2754,10 @@ impl Engine {
     /// 4. Starts services in new/modified groups
     /// 5. Broadcasts reload status
     pub(crate) async fn apply_prepared(&mut self, prepared: Prepared) -> ReloadResult {
+        self.apply_with(prepared, ApplyTrigger::Reload).await
+    }
+
+    async fn apply_with(&mut self, prepared: Prepared, trigger: ApplyTrigger) -> ReloadResult {
         let Prepared {
             config: new_config,
             evaluated: new_evaluated,
@@ -2640,6 +2841,34 @@ impl Engine {
         );
         self.commit_groups(staged, &diff);
 
+        let (skip, message) = match &trigger {
+            ApplyTrigger::Reload => {
+                self.resync_sources();
+                self.state.env_refresh_error = None;
+
+                (
+                    HashSet::new(),
+                    format!(
+                        "configuration reloaded: {} added, {} removed, {} modified",
+                        diff.added.len(),
+                        diff.removed.len(),
+                        diff.modified.len()
+                    ),
+                )
+            }
+            ApplyTrigger::EnvChange { skip } => {
+                self.state.env_refresh_error = None;
+
+                (
+                    skip.clone(),
+                    format!(
+                        "environment refreshed from its sources: {} groups changed",
+                        diff.modified.len()
+                    ),
+                )
+            }
+        };
+
         // 4. Run new/modified groups through the shared execution path.
         let reload_targets: Vec<String> = self
             .execution_order
@@ -2647,23 +2876,19 @@ impl Engine {
             .filter(|group_name| {
                 diff.added.contains(group_name) || diff.modified.contains(group_name)
             })
+            .filter(|group_name| !skip.contains(*group_name))
             .cloned()
             .collect();
         self.suppress_task_completion_cascade
             .extend(reload_targets.iter().cloned());
-        let trigger_ctx = self.reload_context(&diff);
+        let trigger_ctx = match &trigger {
+            ApplyTrigger::Reload => self.reload_context(&diff),
+            ApplyTrigger::EnvChange { .. } => self.env_change_context(&diff),
+        };
         self.execute_groups(&reload_targets, &trigger_ctx).await;
 
         // 5. Broadcast reload complete
-        if let Err(e) = self.push_log(LogLine::daemon(
-            "zaz",
-            format!(
-                "configuration reloaded: {} added, {} removed, {} modified",
-                diff.added.len(),
-                diff.removed.len(),
-                diff.modified.len()
-            ),
-        )) {
+        if let Err(e) = self.push_log(LogLine::daemon("zaz", message)) {
             tracing::error!(error = %e, "failed to record reload-complete log line");
         }
         self.update_state();
@@ -3033,6 +3258,23 @@ impl Engine {
         }
     }
 
+    /// Create a trigger context for groups whose environment a watched source changed.
+    ///
+    /// It rebuilds like a reload does, so it neither runs `on_change_only` tasks nor cascades.
+    fn env_change_context(&self, diff: &ConfigDiff) -> TriggerContext {
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        TriggerContext {
+            source: TriggerSource::EnvChange {
+                modified: diff.modified.len(),
+            },
+            vars: Context::new()
+                .with_variables(self.config.variables.clone())
+                .with_root(config_dir.to_path_buf()),
+            run_on_change_tasks: false,
+            should_cascade: false,
+        }
+    }
+
     /// Create a trigger context for when a dependency becomes ready.
     fn dependency_ready_context(&self, completed_group: &str) -> TriggerContext {
         let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
@@ -3399,6 +3641,36 @@ impl Engine {
             state: self.state.clone(),
         });
     }
+}
+
+/// Index the config's watched sources and register them with the watcher.
+///
+/// Every `env_watch` path is logged once, and a path that does not exist is called out so a typo
+/// shows up. A directory that cannot be watched is skipped. The next reload tries it again.
+fn register_sources(watcher: &mut Watcher, config: &Config, config_dir: &Path) -> SourceIndex {
+    let index = SourceIndex::build(config, config_dir);
+
+    for listed in index.listed() {
+        if std::fs::symlink_metadata(&listed.path).is_ok() {
+            tracing::info!(field = %listed.field, path = %listed.path.display(), "watching env_watch path");
+        } else {
+            tracing::warn!(
+                field = %listed.field,
+                path = %listed.path.display(),
+                "env_watch path does not exist yet, watching for it to appear"
+            );
+        }
+    }
+
+    for issue in watcher.set_sources(index.paths()) {
+        tracing::warn!(
+            dir = %issue.dir.display(),
+            error = %issue.error,
+            "cannot watch the directory of a source, so changes to it are not seen"
+        );
+    }
+
+    index
 }
 
 fn build_group_state(group: &Group) -> GroupState {
@@ -5011,6 +5283,7 @@ mod tests {
             .handle_changes(vec![FileEvent {
                 path: PathBuf::from("changed.test"),
                 kind: zaz_watch::FileEventKind::Modified,
+                source: None,
             }])
             .await
             .unwrap();

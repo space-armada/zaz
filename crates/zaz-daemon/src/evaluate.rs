@@ -13,9 +13,12 @@
 
 use crate::env::{self, EnvLayer, EnvMap, GroupEnv, Passthrough, Start};
 use crate::env_command::{self, EnvCommandError, EnvCommandErrorKind};
+use crate::sources;
 use crate::DaemonError;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,6 +42,100 @@ pub(crate) struct Prepared {
 /// own, so the worst case for a config is one limit per distinct file.
 pub(crate) const ENV_FILE_READ_DEADLINE: Duration = Duration::from_secs(120);
 
+/// How much of the sources an evaluation reads again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Read the config and run every command.
+    Full,
+
+    /// Read the sources only, and run the commands the changed paths make stale.
+    ///
+    /// The paths are the sources the watcher reported, in its normal form.
+    Partial(BTreeSet<PathBuf>),
+}
+
+impl Scope {
+    /// The scope of one run that serves two requests.
+    ///
+    /// A full run covers everything a partial one would, so it absorbs it.
+    pub(crate) fn merge(self, other: Scope) -> Scope {
+        match (self, other) {
+            (Scope::Partial(mut a), Scope::Partial(b)) => {
+                a.extend(b);
+                Scope::Partial(a)
+            }
+            _ => Scope::Full,
+        }
+    }
+}
+
+/// What each evaluation node produced last time, kept so a later run can reuse it.
+///
+/// A node is one level's `env_command`. A full load starts from an empty cache, so it runs every
+/// command. A partial run edits the cache in place.
+#[derive(Debug, Default)]
+pub(crate) struct EvalCache {
+    nodes: HashMap<EnvFileLevel, Node>,
+}
+
+#[derive(Debug)]
+struct Node {
+    key: CacheKey,
+    hashes: Vec<(PathBuf, FileHash)>,
+    layer: Option<EnvLayer>,
+}
+
+/// The content of one watched file, taken before a command spawns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileHash {
+    Absent,
+    Digest([u8; 32]),
+    /// A read error, a directory, or a file that is not a regular file. It never matches.
+    Unreadable,
+}
+
+fn hash_file(path: &Path) -> FileHash {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FileHash::Absent,
+        Err(_) => return FileHash::Unreadable,
+    };
+
+    if !meta.is_file() {
+        return FileHash::Unreadable;
+    }
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return FileHash::Unreadable;
+    };
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => return FileHash::Digest(hasher.finalize().into()),
+            Ok(n) => hasher.update(&buffer[..n]),
+            Err(_) => return FileHash::Unreadable,
+        }
+    }
+}
+
+fn hash_files(paths: &[PathBuf]) -> Vec<(PathBuf, FileHash)> {
+    paths
+        .iter()
+        .map(|path| (path.clone(), hash_file(path)))
+        .collect()
+}
+
+fn same_content(old: &[(PathBuf, FileHash)], new: &[(PathBuf, FileHash)]) -> bool {
+    old.len() == new.len()
+        && old
+            .iter()
+            .zip(new)
+            .all(|(a, b)| a.0 == b.0 && a.1 == b.1 && a.1 != FileHash::Unreadable)
+}
+
 /// Load the config at `config_path` and evaluate the sources it names.
 ///
 /// `config_path` must be absolute. This blocks on file reads, each for at most `read_deadline`, and
@@ -48,8 +145,45 @@ pub(crate) fn prepare(
     read_deadline: Duration,
     cancel: &CancelHandle,
 ) -> Result<Prepared, DaemonError> {
-    let config = zaz_config::load(config_path).map_err(DaemonError::Config)?;
-    let evaluated = evaluate(&config, config_path, read_deadline, cancel)?;
+    prepare_scoped(
+        config_path,
+        read_deadline,
+        cancel,
+        &Scope::Full,
+        None,
+        &Mutex::new(EvalCache::default()),
+    )
+}
+
+/// Evaluate `scope`, reusing the nodes of `cache` that a partial scope leaves clean.
+///
+/// A full scope reads `config_path` and runs every command. A partial scope never reads it, and
+/// evaluates `config`, the config the daemon is running.
+///
+/// The cache is shared with the host, so the nodes that finished survive a failure, and even a
+/// panic, of this evaluation.
+pub(crate) fn prepare_scoped(
+    config_path: &Path,
+    read_deadline: Duration,
+    cancel: &CancelHandle,
+    scope: &Scope,
+    config: Option<Config>,
+    cache: &Mutex<EvalCache>,
+) -> Result<Prepared, DaemonError> {
+    let config = match config {
+        Some(config) => config,
+        None => zaz_config::load(config_path).map_err(DaemonError::Config)?,
+    };
+
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let evaluated = evaluate_scoped(
+        &config,
+        config_path,
+        read_deadline,
+        cancel,
+        scope,
+        &mut cache,
+    )?;
 
     Ok(Prepared { config, evaluated })
 }
@@ -68,6 +202,25 @@ pub(crate) fn prepare_detached<F>(
     run_detached(move || prepare(&config_path, read_deadline, &cancel), done);
 }
 
+/// Run [`prepare_scoped`] on its own thread and deliver the result to `done`.
+///
+pub(crate) fn prepare_scoped_detached<F>(
+    config_path: PathBuf,
+    read_deadline: Duration,
+    cancel: CancelHandle,
+    scope: Scope,
+    config: Option<Config>,
+    cache: Arc<Mutex<EvalCache>>,
+    done: F,
+) where
+    F: FnOnce(Result<Prepared, DaemonError>) + Send + 'static,
+{
+    run_detached(
+        move || prepare_scoped(&config_path, read_deadline, &cancel, &scope, config, &cache),
+        done,
+    );
+}
+
 /// Run `work` on its own detached thread and deliver its result to `done`.
 ///
 /// The thread is detached, not a runtime blocking task, so the runtime can shut down while it
@@ -75,10 +228,11 @@ pub(crate) fn prepare_detached<F>(
 ///
 /// `done` runs exactly once. A panic in `work`, or a thread that cannot start, reaches it as an
 /// error.
-pub(crate) fn run_detached<W, F>(work: W, done: F)
+pub(crate) fn run_detached<T, W, F>(work: W, done: F)
 where
-    W: FnOnce() -> Result<Prepared, DaemonError> + Send + 'static,
-    F: FnOnce(Result<Prepared, DaemonError>) + Send + 'static,
+    T: Send + 'static,
+    W: FnOnce() -> Result<T, DaemonError> + Send + 'static,
+    F: FnOnce(Result<T, DaemonError>) + Send + 'static,
 {
     // A failed spawn drops the closure, and `done` with it. The slot keeps `done` reachable so the
     // failure can still be delivered.
@@ -174,6 +328,29 @@ pub(crate) fn evaluate(
     read_deadline: Duration,
     cancel: &CancelHandle,
 ) -> Result<EvaluatedEnv, DaemonError> {
+    evaluate_scoped(
+        config,
+        config_path,
+        read_deadline,
+        cancel,
+        &Scope::Full,
+        &mut EvalCache::default(),
+    )
+}
+
+/// [`evaluate`] for a given scope, reading and updating `cache`.
+///
+/// Files are read again every time, since a read is cheap and its parse decides whether anything
+/// below it changed. A command runs again when nothing cached covers it. A partial scope reuses
+/// every node the changed paths leave clean.
+pub(crate) fn evaluate_scoped(
+    config: &Config,
+    config_path: &Path,
+    read_deadline: Duration,
+    cancel: &CancelHandle,
+    scope: &Scope,
+    cache: &mut EvalCache,
+) -> Result<EvaluatedEnv, DaemonError> {
     let reads = zaz_config::read_env_files(
         config,
         config_path,
@@ -210,7 +387,7 @@ pub(crate) fn evaluate(
         }
     }
 
-    let mut run = CommandRun::new(config, config_path, cancel);
+    let mut run = CommandRun::new(config, config_path, cancel, scope, cache);
     let mut commands: HashMap<EnvFileLevel, EnvLayer> = HashMap::new();
     let mut dropped = Vec::new();
 
@@ -238,7 +415,9 @@ pub(crate) fn evaluate(
         dropped,
     };
 
-    log_provenance(&evaluated);
+    if *scope == Scope::Full {
+        log_provenance(&evaluated);
+    }
 
     Ok(evaluated)
 }
@@ -364,6 +543,10 @@ struct CacheKey {
 
 /// The state shared by the commands of one load.
 struct CommandRun<'a> {
+    scope: &'a Scope,
+    cache: &'a mut EvalCache,
+    watch: HashMap<EnvFileLevel, Vec<PathBuf>>,
+    dirty: HashSet<EnvFileLevel>,
     config: &'a Config,
     config_path: &'a Path,
     config_dir: PathBuf,
@@ -372,14 +555,24 @@ struct CommandRun<'a> {
     timeout: Duration,
     passthrough: Passthrough,
     context: zaz_vars::Context,
-    cache: HashMap<CacheKey, EnvLayer>,
+    shared: HashMap<CacheKey, EnvLayer>,
 }
 
 impl<'a> CommandRun<'a> {
-    fn new(config: &'a Config, config_path: &'a Path, cancel: &'a CancelHandle) -> Self {
+    fn new(
+        config: &'a Config,
+        config_path: &'a Path,
+        cancel: &'a CancelHandle,
+        scope: &'a Scope,
+        cache: &'a mut EvalCache,
+    ) -> Self {
         let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         Self {
+            scope,
+            cache,
+            watch: sources::command_watch_paths(config, &config_dir),
+            dirty: HashSet::new(),
             config,
             config_path,
             cancel,
@@ -397,7 +590,7 @@ impl<'a> CommandRun<'a> {
                 .with_variables(config.variables.clone())
                 .with_root(config_dir.clone()),
             config_dir,
-            cache: HashMap::new(),
+            shared: HashMap::new(),
         }
     }
 
@@ -452,7 +645,66 @@ impl<'a> CommandRun<'a> {
         env::build_env(env::base_env(&self.passthrough), &layers)
     }
 
-    /// Run one command, or reuse the output of an identical run in this load.
+    /// Whether a changed source names this level's command.
+    fn named_by_change(&self, level: EnvFileLevel) -> bool {
+        let Scope::Partial(changed) = self.scope else {
+            return false;
+        };
+
+        self.watch.get(&level).is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|path| changed.contains(&zaz_watch::normalize(path)))
+        })
+    }
+
+    /// Whether a command above this level ran again in this evaluation.
+    fn above_is_dirty(&self, level: EnvFileLevel) -> bool {
+        let settings = self.dirty.contains(&EnvFileLevel::Settings);
+
+        match level {
+            EnvFileLevel::Settings => false,
+            EnvFileLevel::Group { .. } => settings,
+            EnvFileLevel::Task { group, .. } | EnvFileLevel::Service { group, .. } => {
+                settings || self.dirty.contains(&EnvFileLevel::Group { group })
+            }
+        }
+    }
+
+    /// The cached layer of this level when nothing makes it stale.
+    ///
+    /// A node is stale when it has no result, when its command, directory, or input environment
+    /// differ, when a command above it ran again, or when a changed source names it and the
+    /// content of its watched files differs. A node whose last run failed is never reused.
+    fn reusable(&self, level: EnvFileLevel, key: &CacheKey) -> Option<EnvLayer> {
+        if *self.scope == Scope::Full {
+            return None;
+        }
+
+        let node = self.cache.nodes.get(&level)?;
+        let layer = node.layer.as_ref()?;
+
+        if node.key != *key || self.above_is_dirty(level) {
+            return None;
+        }
+
+        if self.named_by_change(level) {
+            let paths = self.watch.get(&level).map(Vec::as_slice).unwrap_or(&[]);
+
+            if !same_content(&node.hashes, &hash_files(paths)) {
+                return None;
+            }
+
+            tracing::info!(
+                level = ?level,
+                "watched files have the same content, so the env_command does not run again"
+            );
+        }
+
+        Some(layer.clone())
+    }
+
+    /// Run one command, or reuse the output of an earlier run.
     fn execute(
         &mut self,
         source: &zaz_config::EnvCommandSource,
@@ -484,9 +736,21 @@ impl<'a> CommandRun<'a> {
             env: sorted,
         };
 
-        if let Some(layer) = self.cache.get(&key) {
+        if let Some(layer) = self.reusable(source.level, &key) {
+            return Ok(layer);
+        }
+
+        self.dirty.insert(source.level);
+
+        let paths = self.watch.get(&source.level).cloned().unwrap_or_default();
+        let hashes = hash_files(&paths);
+
+        if let Some(layer) = self.shared.get(&key) {
             tracing::debug!(field = %source.field, "reusing the output of an identical env_command");
-            return Ok(layer.clone());
+            let layer = layer.clone();
+            self.remember(source.level, key, hashes, Some(layer.clone()));
+
+            return Ok(layer);
         }
 
         tracing::info!(
@@ -505,13 +769,32 @@ impl<'a> CommandRun<'a> {
                 timeout: self.timeout,
             },
             self.cancel,
-        )
-        .map_err(&fail)?;
+        );
 
-        let layer = EnvLayer::from_output(output);
-        self.cache.insert(key, layer.clone());
+        match output {
+            Ok(output) => {
+                let layer = EnvLayer::from_output(output);
+                self.shared.insert(key.clone(), layer.clone());
+                self.remember(source.level, key, hashes, Some(layer.clone()));
 
-        Ok(layer)
+                Ok(layer)
+            }
+            Err(kind) => {
+                self.remember(source.level, key, Vec::new(), None);
+
+                Err(fail(kind))
+            }
+        }
+    }
+
+    fn remember(
+        &mut self,
+        level: EnvFileLevel,
+        key: CacheKey,
+        hashes: Vec<(PathBuf, FileHash)>,
+        layer: Option<EnvLayer>,
+    ) {
+        self.cache.nodes.insert(level, Node { key, hashes, layer });
     }
 }
 
@@ -966,5 +1249,274 @@ mod tests {
             .names
             .iter()
             .any(|n| n == "ZAZ_UT_DROPPED_NAME"));
+    }
+
+    fn counted(dir: &Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho run >> '{}'\n{body}\n",
+                dir.join(format!("{name}.count")).display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        path.display().to_string()
+    }
+
+    fn runs(dir: &Path, name: &str) -> usize {
+        std::fs::read_to_string(dir.join(format!("{name}.count")))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn changed(dir: &Path, name: &str) -> Scope {
+        Scope::Partial(BTreeSet::from([zaz_watch::normalize(&dir.join(name))]))
+    }
+
+    fn refresh(
+        config: &Config,
+        path: &Path,
+        scope: &Scope,
+        cache: &mut EvalCache,
+    ) -> Result<EvaluatedEnv, DaemonError> {
+        evaluate_scoped(
+            config,
+            path,
+            ENV_FILE_READ_DEADLINE,
+            &CancelHandle::new(),
+            scope,
+            cache,
+        )
+    }
+
+    #[test]
+    fn scopes_union_and_a_full_run_absorbs_a_partial_one() {
+        let a = Scope::Partial(BTreeSet::from([PathBuf::from("/a")]));
+        let b = Scope::Partial(BTreeSet::from([PathBuf::from("/b")]));
+
+        assert_eq!(
+            a.clone().merge(b.clone()),
+            Scope::Partial(BTreeSet::from([PathBuf::from("/a"), PathBuf::from("/b")]))
+        );
+        assert_eq!(a.clone().merge(Scope::Full), Scope::Full);
+        assert_eq!(Scope::Full.merge(b), Scope::Full);
+    }
+
+    #[test]
+    fn a_named_node_with_unchanged_content_is_gated_and_changed_content_runs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("watched"), "one").unwrap();
+        let stub = counted(&root, "cmd", "printf '{\"V\":\"%s\"}' \"$(cat watched)\"");
+        let (config, path) = config_in(
+            &root,
+            &format!(
+                "[[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_command = '{stub}'\nenv_watch = [\"watched\"]\n"
+            ),
+        );
+        let mut cache = EvalCache::default();
+        let first = refresh(&config, &path, &Scope::Full, &mut cache).unwrap();
+        assert_eq!(runs(&root, "cmd"), 1);
+
+        std::fs::write(root.join("watched"), "one").unwrap();
+        let same = refresh(&config, &path, &changed(&root, "watched"), &mut cache).unwrap();
+        assert_eq!(
+            runs(&root, "cmd"),
+            1,
+            "same content must not run the command"
+        );
+        assert_eq!(same.group("a"), first.group("a"));
+
+        let other = refresh(&config, &path, &changed(&root, "unrelated"), &mut cache).unwrap();
+        assert_eq!(
+            runs(&root, "cmd"),
+            1,
+            "an event that names no node runs nothing"
+        );
+        assert_eq!(other.group("a"), first.group("a"));
+
+        std::fs::write(root.join("watched"), "two").unwrap();
+        let edited = refresh(&config, &path, &changed(&root, "watched"), &mut cache).unwrap();
+        assert_eq!(runs(&root, "cmd"), 2);
+        assert_ne!(edited.group("a"), first.group("a"));
+    }
+
+    #[test]
+    fn an_absent_file_and_an_empty_file_hash_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let stub = counted(&root, "cmd", "printf '{}'");
+        let (config, path) = config_in(
+            &root,
+            &format!(
+                "[[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_command = '{stub}'\nenv_watch = [\"watched\"]\n"
+            ),
+        );
+        let mut cache = EvalCache::default();
+        refresh(&config, &path, &Scope::Full, &mut cache).unwrap();
+
+        std::fs::write(root.join("watched"), "").unwrap();
+        refresh(&config, &path, &changed(&root, "watched"), &mut cache).unwrap();
+
+        assert_eq!(runs(&root, "cmd"), 2);
+    }
+
+    #[test]
+    fn a_directory_in_the_watch_list_always_counts_as_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("watched")).unwrap();
+        let stub = counted(&root, "cmd", "printf '{}'");
+        let (config, path) = config_in(
+            &root,
+            &format!(
+                "[[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_command = '{stub}'\nenv_watch = [\"watched\"]\n"
+            ),
+        );
+        let mut cache = EvalCache::default();
+        refresh(&config, &path, &Scope::Full, &mut cache).unwrap();
+        refresh(&config, &path, &changed(&root, "watched"), &mut cache).unwrap();
+
+        assert_eq!(runs(&root, "cmd"), 2);
+    }
+
+    #[test]
+    fn a_full_run_discards_the_nodes_and_runs_every_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let stub = counted(&root, "cmd", "printf '{}'");
+        let (config, path) = config_in(
+            &root,
+            &format!("[[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_command = '{stub}'\n"),
+        );
+        let mut cache = EvalCache::default();
+
+        refresh(&config, &path, &Scope::Full, &mut cache).unwrap();
+        refresh(&config, &path, &Scope::Full, &mut cache).unwrap();
+
+        assert_eq!(runs(&root, "cmd"), 2);
+    }
+
+    #[test]
+    fn a_dirty_upstream_runs_the_child_and_a_gated_one_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("up.txt"), "one").unwrap();
+        let upstream = counted(&root, "up", "printf '{\"UP\":\"%s\"}' \"$(cat up.txt)\"");
+        let child = counted(&root, "child", "printf '{\"V\":\"saw-%s\"}' \"$UP\"");
+        let (config, path) = config_in(
+            &root,
+            &format!(
+                "[settings]\nenv_command = '{upstream}'\nenv_watch = [\"up.txt\"]\n\n\
+                 [[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_command = '{child}'\n"
+            ),
+        );
+        let mut cache = EvalCache::default();
+        refresh(&config, &path, &Scope::Full, &mut cache).unwrap();
+
+        std::fs::write(root.join("up.txt"), "one").unwrap();
+        refresh(&config, &path, &changed(&root, "up.txt"), &mut cache).unwrap();
+        assert_eq!((runs(&root, "up"), runs(&root, "child")), (1, 1));
+
+        std::fs::write(root.join("up.txt"), "two").unwrap();
+        refresh(&config, &path, &changed(&root, "up.txt"), &mut cache).unwrap();
+        assert_eq!((runs(&root, "up"), runs(&root, "child")), (2, 2));
+    }
+
+    #[test]
+    fn a_failed_node_is_never_gated_and_its_upstream_stays_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("up.txt"), "one").unwrap();
+        let fail = root.join("fail");
+        let upstream = counted(&root, "up", "printf '{\"UP\":\"%s\"}' \"$(cat up.txt)\"");
+        let child = counted(
+            &root,
+            "child",
+            &format!(
+                "if [ -e '{}' ]; then exit 3; fi\nprintf '{{\"V\":\"saw-%s\"}}' \"$UP\"",
+                fail.display()
+            ),
+        );
+        let (config, path) = config_in(
+            &root,
+            &format!(
+                "[settings]\nenv_command = '{upstream}'\nenv_watch = [\"up.txt\"]\n\n\
+                 [[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_command = '{child}'\n"
+            ),
+        );
+        let mut cache = EvalCache::default();
+        refresh(&config, &path, &Scope::Full, &mut cache).unwrap();
+
+        std::fs::write(&fail, "").unwrap();
+        std::fs::write(root.join("up.txt"), "two").unwrap();
+        let error = refresh(&config, &path, &changed(&root, "up.txt"), &mut cache).unwrap_err();
+        assert_eq!(error.code(), "env_command_failed");
+        assert_eq!((runs(&root, "up"), runs(&root, "child")), (2, 2));
+
+        std::fs::remove_file(&fail).unwrap();
+        let retried = refresh(&config, &path, &changed(&root, "up.txt"), &mut cache).unwrap();
+        assert_eq!((runs(&root, "up"), runs(&root, "child")), (2, 3));
+        assert!(retried.group("a").is_some());
+    }
+
+    #[test]
+    fn levels_that_share_a_command_all_refresh_when_one_of_them_lists_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("w"), "one").unwrap();
+        let stub = counted(&root, "cmd", "printf '{\"V\":\"%s\"}' \"$(cat w)\"");
+        let (config, path) = config_in(
+            &root,
+            &format!(
+                "[[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_command = '{stub}'\nenv_watch = [\"w\"]\n\n\
+                 [[group]]\nname = \"b\"\npatterns = [\"*\"]\nenv_command = '{stub}'\n"
+            ),
+        );
+        let mut cache = EvalCache::default();
+        let first = refresh(&config, &path, &Scope::Full, &mut cache).unwrap();
+        assert_eq!(runs(&root, "cmd"), 1);
+
+        std::fs::write(root.join("w"), "two").unwrap();
+        let after = refresh(&config, &path, &changed(&root, "w"), &mut cache).unwrap();
+
+        assert_eq!(runs(&root, "cmd"), 2);
+        assert_ne!(first.group("a"), after.group("a"));
+        assert_ne!(first.group("b"), after.group("b"));
+    }
+
+    #[test]
+    fn an_env_file_save_touch_or_comment_edit_runs_no_downstream_command_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join(".env"), "A=1\n").unwrap();
+        let stub = counted(&root, "cmd", "printf '{\"V\":\"%s\"}' \"$A\"");
+        let (config, path) = config_in(
+            &root,
+            &format!(
+                "[settings]\nenv_file = \".env\"\n\n\
+                 [[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_command = '{stub}'\n"
+            ),
+        );
+        let mut cache = EvalCache::default();
+        let first = refresh(&config, &path, &Scope::Full, &mut cache).unwrap();
+
+        for text in ["A=1\n", "A=1\n", "# only a comment\nA=1\n"] {
+            std::fs::write(root.join(".env"), text).unwrap();
+            let after = refresh(&config, &path, &changed(&root, ".env"), &mut cache).unwrap();
+
+            assert_eq!(after.group("a"), first.group("a"));
+        }
+        assert_eq!(runs(&root, "cmd"), 1);
+
+        std::fs::write(root.join(".env"), "A=2\n").unwrap();
+        let edited = refresh(&config, &path, &changed(&root, ".env"), &mut cache).unwrap();
+
+        assert_eq!(runs(&root, "cmd"), 2);
+        assert_ne!(edited.group("a"), first.group("a"));
     }
 }

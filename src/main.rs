@@ -1399,6 +1399,29 @@ async fn show_status(target: &DaemonTarget) -> Result<()> {
                 }
                 println!("  fix the config and run `zaz reload`, or run `zaz stop`");
             }
+            if let Some(error) = &state.env_refresh_error {
+                println!(
+                    "Environment refresh error: [{}] the last refresh of a watched source failed, \
+                     running on the previous environment",
+                    error.code
+                );
+                for line in error.message.lines() {
+                    println!("  {line}");
+                }
+                if let Some(hint) = &error.hint {
+                    println!("  hint: {hint}");
+                }
+                println!("  fix the source, or run `zaz reload` to evaluate everything again");
+            }
+            for member in &state.member_refresh_errors {
+                println!(
+                    "Member environment refresh error: {} [{}]",
+                    member.member, member.error.code
+                );
+                for line in member.error.message.lines() {
+                    println!("  {line}");
+                }
+            }
             for member in &state.member_errors {
                 println!("Member error: {} [{}]", member.member, member.error.code);
                 for line in member.error.message.lines() {

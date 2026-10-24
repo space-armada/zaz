@@ -34,6 +34,9 @@ indexmap = { version = "2", features = ["serde"] }
 notify = "7"
 globset = "0.4"
 
+# Content hashing
+sha2 = "0.10"
+
 # Process management
 nix = { version = "0.29", features = ["fs", "poll", "signal", "process", "term"] }
 portable-pty = "0.8"

@@ -795,6 +795,10 @@ impl Supervisor {
                         continue;
                     }
 
+                    if let Some(error) = state.env_refresh_error {
+                        record_refresh_error(&mut merged, &member.token, error);
+                    }
+
                     starting |= state.status == DaemonStatus::Starting;
 
                     for (group_name, mut group) in state.groups {
@@ -1297,6 +1301,24 @@ pub(crate) async fn run_supervisor(
     Ok(())
 }
 
+/// Record a member's failed environment refresh in the aggregate.
+///
+/// Every member's failure is kept in `member_refresh_errors`. The top-level field carries the
+/// first one, tagged with its member, for clients that read only it. The member keeps running, so
+/// its groups are not marked failed.
+fn record_refresh_error(merged: &mut DaemonState, member: &str, error: LoadError) {
+    if merged.env_refresh_error.is_none() {
+        let mut tagged = error.clone();
+        tagged.message = format!("member '{member}': {}", error.message);
+        merged.env_refresh_error = Some(tagged);
+    }
+
+    merged.member_refresh_errors.push(MemberError {
+        member: member.to_string(),
+        error,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1756,5 +1778,38 @@ mod tests {
             "workspace_token_collision"
         );
         assert_eq!(state.member_errors[1].error.code, "workspace_attach_failed");
+    }
+
+    #[test]
+    fn every_members_refresh_failure_reaches_the_aggregate() {
+        let mut merged = DaemonState::default();
+
+        record_refresh_error(
+            &mut merged,
+            "api",
+            LoadError::new("env_command_failed", "api broke"),
+        );
+        record_refresh_error(
+            &mut merged,
+            "web",
+            LoadError::new("env_file_missing", "web broke"),
+        );
+
+        let top = merged
+            .env_refresh_error
+            .expect("the first failure is kept at the top");
+        assert_eq!(top.code, "env_command_failed");
+        assert_eq!(top.message, "member 'api': api broke");
+
+        let members: Vec<_> = merged
+            .member_refresh_errors
+            .iter()
+            .map(|m| (m.member.as_str(), m.error.code.as_str()))
+            .collect();
+        assert_eq!(
+            members,
+            [("api", "env_command_failed"), ("web", "env_file_missing")]
+        );
+        assert!(merged.groups.is_empty());
     }
 }

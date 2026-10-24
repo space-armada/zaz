@@ -363,6 +363,14 @@ fn validate_env_commands(config: &Config, errors: &mut ValidationErrors) {
         );
     }
 
+    for level in levels_with_env_watch_and_no_command(config) {
+        errors.push(
+            ValidationError::new(ValidationErrorKind::EnvWatchWithoutCommand { level }).with_hint(
+                "env_watch re-runs the same level's env_command; add one or remove the field",
+            ),
+        );
+    }
+
     for entry in &config.settings.env_passthrough {
         if let Some(problem) = passthrough_problem(entry) {
             errors.push(
@@ -409,6 +417,39 @@ fn validate_env_commands(config: &Config, errors: &mut ValidationErrors) {
             );
         }
     }
+}
+
+/// The levels that list `env_watch` paths and set no `env_command` of their own.
+fn levels_with_env_watch_and_no_command(config: &Config) -> Vec<String> {
+    let mut levels = Vec::new();
+
+    if !config.settings.env_watch.is_empty() && config.settings.env_command.is_none() {
+        levels.push("settings".to_string());
+    }
+
+    for group in &config.groups {
+        if !group.env_watch.is_empty() && group.env_command.is_none() {
+            levels.push(format!("group '{}'", group.name));
+        }
+
+        for task in &group.tasks {
+            if !task.env_watch.is_empty() && task.env_command.is_none() {
+                levels.push(format!("group '{}' task '{}'", group.name, task.name()));
+            }
+        }
+
+        for service in &group.services {
+            if !service.env_watch.is_empty() && service.env_command.is_none() {
+                levels.push(format!(
+                    "group '{}' service '{}'",
+                    group.name,
+                    service.name()
+                ));
+            }
+        }
+    }
+
+    levels
 }
 
 /// Whether `command` holds a `${` that the expander would reject for lacking a closing brace.
@@ -1269,6 +1310,21 @@ mod tests {
         );
 
         assert!(codes(&config).is_empty());
+    }
+
+    #[test]
+    fn test_env_watch_without_a_command_at_its_own_level_rejected() {
+        let config = env_command_config(
+            "[settings]\nenv_command = \"true\"\nenv_watch = [\".envrc\"]\n\n\
+             [[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_watch = [\"x\"]\n\n\
+             [[group.task]]\ncommand = \"t\"\nenv_watch = [\"y\"]\n\n\
+             [[group.service]]\ncommand = \"s\"\nenv_command = \"true\"\nenv_watch = [\"z\"]\n",
+        );
+
+        assert_eq!(
+            codes(&config),
+            vec!["env_watch_without_command", "env_watch_without_command"]
+        );
     }
 
     #[test]

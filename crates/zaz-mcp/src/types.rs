@@ -31,6 +31,14 @@ pub struct StatusReport {
     /// built until the config is fixed and reloaded. A later reload failure never sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_error: Option<LoadErrorReport>,
+    /// Why the last refresh of a watched source failed, when it did. The daemon keeps running on
+    /// the environment it already applied until a refresh succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_refresh_error: Option<LoadErrorReport>,
+    /// Failed environment refreshes per workspace member, reported by a workspace supervisor.
+    /// Each member is still running. `env_refresh_error` carries the first of these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_refresh_errors: Vec<MemberErrorReport>,
     /// Errors per workspace member, reported by a workspace supervisor.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_errors: Vec<MemberErrorReport>,
@@ -258,6 +266,9 @@ pub struct ConfigSettings {
     pub env_file: Option<String>,
     /// The `env_command` as written. Its output is never shown.
     pub env_command: Option<String>,
+    /// Literal paths whose changes re-run the `env_command`, as written.
+    #[serde(default)]
+    pub env_watch: Vec<String>,
     /// Extra variable names, or `PREFIX_*` patterns, kept from the daemon's environment.
     pub env_passthrough: Vec<String>,
     /// The `env_command_timeout` in milliseconds, when set.
@@ -283,6 +294,9 @@ pub struct ConfigGroup {
     pub working_dir: Option<String>,
     pub env_file: Option<String>,
     pub env_command: Option<String>,
+    /// Literal paths whose changes re-run the `env_command`, as written.
+    #[serde(default)]
+    pub env_watch: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tasks: Vec<ConfigTask>,
     pub services: Vec<ConfigService>,
@@ -298,6 +312,9 @@ pub struct ConfigTask {
     pub working_dir: Option<String>,
     pub env_file: Option<String>,
     pub env_command: Option<String>,
+    /// Literal paths whose changes re-run the `env_command`, as written.
+    #[serde(default)]
+    pub env_watch: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -320,6 +337,9 @@ pub struct ConfigService {
     pub ready_timeout_ms: Option<u64>,
     pub env_file: Option<String>,
     pub env_command: Option<String>,
+    /// Literal paths whose changes re-run the `env_command`, as written.
+    #[serde(default)]
+    pub env_watch: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -354,6 +374,15 @@ impl From<&DaemonState> for StatusReport {
             last_change_ms: state.last_change,
             groups: state.groups.values().map(GroupReport::from).collect(),
             load_error: state.load_error.as_ref().map(LoadErrorReport::from),
+            env_refresh_error: state.env_refresh_error.as_ref().map(LoadErrorReport::from),
+            member_refresh_errors: state
+                .member_refresh_errors
+                .iter()
+                .map(|m| MemberErrorReport {
+                    member: m.member.clone(),
+                    error: LoadErrorReport::from(&m.error),
+                })
+                .collect(),
             member_errors: state
                 .member_errors
                 .iter()
@@ -523,6 +552,7 @@ impl From<&Settings> for ConfigSettings {
             log_format: s.log_format.into(),
             env_file: s.env_file.clone(),
             env_command: s.env_command.clone(),
+            env_watch: s.env_watch.clone(),
             env_passthrough: s.env_passthrough.clone(),
             env_command_timeout_ms: s.env_command_timeout.map(|t| t.as_millis()),
         }
@@ -549,6 +579,7 @@ impl From<&Group> for ConfigGroup {
             working_dir: g.working_dir.clone(),
             env_file: g.env_file.clone(),
             env_command: g.env_command.clone(),
+            env_watch: g.env_watch.clone(),
             env: g.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             tasks: g.tasks.iter().map(ConfigTask::from).collect(),
             services: g.services.iter().map(ConfigService::from).collect(),
@@ -566,6 +597,7 @@ impl From<&TaskCommand> for ConfigTask {
             working_dir: t.working_dir.clone(),
             env_file: t.env_file.clone(),
             env_command: t.env_command.clone(),
+            env_watch: t.env_watch.clone(),
             env: t.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
@@ -586,6 +618,7 @@ impl From<&ServiceCommand> for ConfigService {
             working_dir: d.working_dir.clone(),
             env_file: d.env_file.clone(),
             env_command: d.env_command.clone(),
+            env_watch: d.env_watch.clone(),
             delay_ms: d.delay_ms(),
             stop_timeout_ms: d.stop_timeout_ms(),
             ready_poll_interval_ms: d.ready_poll_interval_ms(),
@@ -677,6 +710,30 @@ mod tests {
         assert_eq!(error.code, "env_file_missing");
         assert_eq!(error.hint.as_deref(), Some("create it"));
         assert!(report.member_errors.is_empty());
+    }
+
+    #[test]
+    fn status_report_carries_every_member_refresh_failure() {
+        let state = DaemonState {
+            env_refresh_error: Some(LoadError::new("a", "member 'api': x")),
+            member_refresh_errors: vec![
+                MemberError {
+                    member: "api".to_string(),
+                    error: LoadError::new("a", "x"),
+                },
+                MemberError {
+                    member: "web".to_string(),
+                    error: LoadError::new("b", "y"),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let report = StatusReport::from(&state);
+
+        assert!(report.env_refresh_error.is_some());
+        assert_eq!(report.member_refresh_errors.len(), 2);
+        assert_eq!(report.member_refresh_errors[1].member, "web");
     }
 
     #[test]
@@ -774,6 +831,7 @@ mod tests {
         let mut task = TaskCommand::new("build", "make");
         task.env_file = Some("task.env".to_string());
         task.env_command = Some("mise env --json".to_string());
+        task.env_watch = vec!["mise.toml".to_string()];
         let mut service = ServiceCommand::new("web", "run");
         service.env_file = Some("svc.env".to_string());
         service.env_command = Some("dotenvx get --format json".to_string());
@@ -782,6 +840,7 @@ mod tests {
         config.settings.env_file = Some("secrets.env".to_string());
         config.settings.env_command = Some("direnv export json".to_string());
         config.settings.env_passthrough = vec!["OP_*".to_string()];
+        config.settings.env_watch = vec![".envrc".to_string(), "../flake.nix".to_string()];
         config.settings.env_command_timeout = Some(zaz_config::HumanDuration::from_millis(30_000));
         config.groups.push(Group {
             name: "api".to_string(),
@@ -800,6 +859,8 @@ mod tests {
             Some("direnv export json")
         );
         assert_eq!(report.settings.env_passthrough, vec!["OP_*".to_string()]);
+        assert_eq!(report.settings.env_watch, [".envrc", "../flake.nix"]);
+        assert_eq!(report.groups[0].tasks[0].env_watch, ["mise.toml"]);
         assert_eq!(report.settings.env_command_timeout_ms, Some(30_000));
         assert_eq!(
             report.groups[0].env_command.as_deref(),

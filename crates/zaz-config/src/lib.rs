@@ -11,7 +11,7 @@ mod unknown_keys;
 pub mod user;
 mod validate;
 
-pub use env_command::{env_command_sources, EnvCommandSource};
+pub use env_command::{env_command_sources, env_watch_sources, EnvCommandSource, EnvWatchSource};
 pub use env_file::{
     env_file_sources, parse_env_file, read_env_file, read_env_files, EnvFileError,
     EnvFileErrorKind, EnvFileLevel, EnvFileNotRead, EnvFileReads, EnvFileSource, ParseProblem,

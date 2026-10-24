@@ -16,6 +16,7 @@ mod log_storage_sqlite;
 mod log_store;
 pub mod notify;
 mod server;
+mod sources;
 mod state;
 mod target;
 

@@ -163,6 +163,13 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_command: Option<String>,
 
+    /// Literal file paths whose changes re-run this level's `env_command`.
+    ///
+    /// A relative path resolves against the command's working directory. No globs. Setting this
+    /// without an `env_command` at the same level is a validation error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_watch: Vec<String>,
+
     /// Extra variable names, or `PREFIX_*` patterns, that `env_command` evaluation keeps from the
     /// daemon's environment, beyond the fixed base list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -185,6 +192,7 @@ impl Default for Settings {
             name: None,
             env_file: None,
             env_command: None,
+            env_watch: Vec::new(),
             env_passthrough: Vec::new(),
             env_command_timeout: None,
         }
@@ -258,6 +266,13 @@ pub struct Group {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_command: Option<String>,
 
+    /// Literal file paths whose changes re-run this level's `env_command`.
+    ///
+    /// A relative path resolves against the command's working directory. No globs. Setting this
+    /// without an `env_command` at the same level is a validation error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_watch: Vec<String>,
+
     /// Environment variables for all commands in this group.
     /// These are merged with task/daemon-specific env vars.
     pub env: HashMap<String, String>,
@@ -305,6 +320,13 @@ pub struct TaskCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_command: Option<String>,
 
+    /// Literal file paths whose changes re-run this level's `env_command`.
+    ///
+    /// A relative path resolves against the command's working directory. No globs. Setting this
+    /// without an `env_command` at the same level is a validation error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_watch: Vec<String>,
+
     /// Environment variables for this task (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -321,6 +343,7 @@ impl TaskCommand {
             working_dir: None,
             env_file: None,
             env_command: None,
+            env_watch: Vec::new(),
             env: HashMap::new(),
         }
     }
@@ -335,6 +358,7 @@ impl TaskCommand {
             working_dir: None,
             env_file: None,
             env_command: None,
+            env_watch: Vec::new(),
             env: HashMap::new(),
         }
     }
@@ -474,6 +498,13 @@ pub struct ServiceCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_command: Option<String>,
 
+    /// Literal file paths whose changes re-run this level's `env_command`.
+    ///
+    /// A relative path resolves against the command's working directory. No globs. Setting this
+    /// without an `env_command` at the same level is a validation error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_watch: Vec<String>,
+
     /// Environment variables for this service (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -499,6 +530,7 @@ impl ServiceCommand {
             ready_timeout: None,
             env_file: None,
             env_command: None,
+            env_watch: Vec::new(),
             env: HashMap::new(),
         }
     }
@@ -522,6 +554,7 @@ impl ServiceCommand {
             ready_timeout: None,
             env_file: None,
             env_command: None,
+            env_watch: Vec::new(),
             env: HashMap::new(),
         }
     }

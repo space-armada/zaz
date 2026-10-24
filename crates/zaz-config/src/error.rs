@@ -297,6 +297,11 @@ pub enum ValidationErrorKind {
     },
     /// `env_command_timeout` is set and no level of the config sets an `env_command`.
     EnvCommandTimeoutWithoutCommand,
+    /// A level lists `env_watch` paths and sets no `env_command` of its own to re-run.
+    EnvWatchWithoutCommand {
+        /// The level, such as `group 'api'`.
+        level: String,
+    },
     /// An `env_command` references a file-context built-in variable, which is never populated
     /// because the command runs at load.
     EnvCommandFileBuiltin {
@@ -355,6 +360,7 @@ impl ValidationErrorKind {
             Self::ReadyTuningWithoutCheck { .. } => "ready_tuning_without_check",
             Self::ZeroReadyPollInterval { .. } => "zero_ready_poll_interval",
             Self::EnvCommandTimeoutWithoutCommand => "env_command_timeout_without_command",
+            Self::EnvWatchWithoutCommand { .. } => "env_watch_without_command",
             Self::EnvCommandFileBuiltin { .. } => "env_command_file_builtin",
             Self::EnvCommandUndefinedVariable { .. } => "env_command_undefined_variable",
             Self::EnvCommandMalformedVariable { .. } => "env_command_malformed_variable",
@@ -481,6 +487,12 @@ impl fmt::Display for ValidationErrorKind {
                 write!(
                     f,
                     "settings: env_command_timeout is set but no env_command exists to time"
+                )
+            }
+            Self::EnvWatchWithoutCommand { level } => {
+                write!(
+                    f,
+                    "{level}: env_watch is set but the same level has no env_command to re-run"
                 )
             }
             Self::EnvCommandFileBuiltin { field, builtin } => {
