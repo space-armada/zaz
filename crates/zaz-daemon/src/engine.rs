@@ -1005,6 +1005,10 @@ pub struct Engine {
 
     /// File-change batches waiting for a refresh, in arrival order.
     held: Vec<HeldBatch>,
+
+    /// Groups a full reload rebuilt but left to their held batch. A group stays here until a
+    /// batch runs it or the release runs it under the reload context.
+    owed_reload: HashSet<String>,
 }
 
 /// A file-change batch whose groups wait for a refreshed environment.
@@ -1395,6 +1399,7 @@ impl Engine {
             refresh_tx: None,
             stale_groups: HashSet::new(),
             held: Vec::new(),
+            owed_reload: HashSet::new(),
         })
     }
 
@@ -1728,19 +1733,50 @@ impl Engine {
 
     /// Run the batches that waited for a refresh, against the environment now in place.
     ///
-    /// Groups the config no longer has are dropped from a batch.
+    /// Groups the config no longer has are dropped from a batch. A batch runs a group only when
+    /// one of its paths still matches the group's patterns, since a reload may have changed them.
+    /// A group a reload rebuilt for its batch, and that no batch runs, runs once under the reload
+    /// context so it is not left stopped.
     pub(crate) async fn release_held(&mut self) {
         self.stale_groups.clear();
+
+        let mut owed = std::mem::take(&mut self.owed_reload);
 
         for batch in std::mem::take(&mut self.held) {
             let groups: Vec<String> = batch
                 .groups
                 .into_iter()
                 .filter(|group| self.groups.contains_key(group))
+                .filter(|group| {
+                    self.group_patterns.get(group).is_some_and(|patterns| {
+                        batch.events.iter().any(|e| patterns.matches(&e.path))
+                    })
+                })
                 .collect();
+
+            for group in &groups {
+                owed.remove(group);
+            }
 
             self.run_changes(batch.events, groups).await;
         }
+
+        let remaining: Vec<String> = self
+            .execution_order
+            .iter()
+            .filter(|group| owed.contains(*group) && self.groups.contains_key(*group))
+            .cloned()
+            .collect();
+
+        if remaining.is_empty() {
+            return;
+        }
+
+        self.suppress_task_completion_cascade
+            .extend(remaining.iter().cloned());
+
+        let trigger_ctx = self.released_reload_context(remaining.len());
+        self.execute_groups(&remaining, &trigger_ctx).await;
     }
 
     /// The groups that have a file-change batch waiting for a refresh.
@@ -2849,6 +2885,14 @@ impl Engine {
 
         let (skip, message) = match &trigger {
             ApplyTrigger::Reload => {
+                let held = self.held_groups();
+                self.owed_reload.extend(
+                    diff.added
+                        .iter()
+                        .chain(diff.modified.iter())
+                        .filter(|group| held.contains(*group))
+                        .cloned(),
+                );
                 self.resync_sources();
                 self.state.env_refresh_error = None;
 
@@ -3278,6 +3322,23 @@ impl Engine {
                 .with_root(config_dir.to_path_buf()),
             run_on_change_tasks: false, // Don't run on_change_only tasks during reload
             should_cascade: false,      // Reload only executes added/modified groups directly
+        }
+    }
+
+    /// The reload context for groups a reload left to a held batch that no longer matched them.
+    fn released_reload_context(&self, modified: usize) -> TriggerContext {
+        let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        TriggerContext {
+            source: TriggerSource::ConfigReload {
+                added: 0,
+                removed: 0,
+                modified,
+            },
+            vars: Context::new()
+                .with_variables(self.config.variables.clone())
+                .with_root(config_dir.to_path_buf()),
+            run_on_change_tasks: false,
+            should_cascade: false,
         }
     }
 
@@ -6038,6 +6099,49 @@ mod tests {
         assert!(engine.suppress_task_completion_cascade.contains("free"));
         assert!(!engine.suppress_task_completion_cascade.contains("held"));
         assert_eq!(engine.held_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_release_runs_a_reload_skipped_group_by_the_context_its_paths_allow() {
+        let mut engine = create_test_engine(vec![
+            test_group_with_command("keeps", &["t"], "echo old"),
+            test_group_with_command("loses", &["t"], "echo old"),
+        ]);
+        let events = vec![FileEvent {
+            path: PathBuf::from("changed.test"),
+            kind: zaz_watch::FileEventKind::Modified,
+            source: None,
+        }];
+        engine.stale_groups.insert("keeps".to_string());
+        engine.stale_groups.insert("loses".to_string());
+        engine.held.push(HeldBatch {
+            events,
+            groups: vec!["keeps".to_string(), "loses".to_string()],
+        });
+        let evaluated = engine.evaluated.clone();
+
+        let mut loses = test_group_with_command("loses", &["t"], "echo new");
+        loses.patterns = vec!["*.other".to_string()];
+        let result = engine
+            .apply_prepared(Prepared {
+                config: test_config(vec![
+                    test_group_with_command("keeps", &["t"], "echo new"),
+                    loses,
+                ]),
+                evaluated,
+            })
+            .await;
+        assert!(matches!(result, ReloadResult::Success { .. }), "{result:?}");
+        assert_eq!(engine.owed_reload.len(), 2);
+        assert!(engine.running_tasks.is_empty());
+
+        engine.release_held().await;
+
+        assert!(engine.owed_reload.is_empty());
+        assert!(engine.running_tasks.contains("keeps:t"));
+        assert!(engine.running_tasks.contains("loses:t"));
+        assert!(!engine.suppress_task_completion_cascade.contains("keeps"));
+        assert!(engine.suppress_task_completion_cascade.contains("loses"));
     }
 
     #[tokio::test]

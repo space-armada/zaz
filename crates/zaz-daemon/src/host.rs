@@ -1438,6 +1438,97 @@ mod tests {
         fixture.host.shutdown().await.unwrap();
     }
 
+    /// A loaded fixture with a plain `env_file`, so a reload evaluates without blocking.
+    async fn loaded_fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zaz.toml"), CONFIG).unwrap();
+        std::fs::write(dir.path().join("slow.env"), "A=1\n").unwrap();
+        let mut fixture = Fixture::at(dir);
+        fixture.host.begin_first_load();
+        fixture.next_outcome().await;
+        assert!(fixture.host.is_loaded());
+
+        fixture
+    }
+
+    #[tokio::test]
+    async fn a_successful_full_run_replaces_the_node_cache() {
+        let mut fixture = loaded_fixture().await;
+        let before = Arc::clone(&fixture.host.cache);
+
+        let _reply = fixture.reload().await;
+        fixture.next_outcome().await;
+
+        assert!(!Arc::ptr_eq(&before, &fixture.host.cache));
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_run_whose_apply_fails_keeps_the_previous_node_cache() {
+        let mut fixture = loaded_fixture().await;
+        let before = Arc::clone(&fixture.host.cache);
+
+        let reply = fixture.reload().await;
+        let mut outcome = fixture.outcomes.recv().await.unwrap();
+        assert!(outcome.result.is_ok());
+
+        // Validation rejects a cycle at load, so the evaluated config is swapped for one that
+        // only the apply can refuse.
+        std::fs::write(
+            fixture.dir.path().join("cycle.toml"),
+            "[[group]]\nname = \"a\"\ndepends_on = [\"b\"]\n\n\
+             [[group]]\nname = \"b\"\ndepends_on = [\"a\"]\n",
+        )
+        .unwrap();
+        outcome.result = Ok(Prepared {
+            config: zaz_config::load_unvalidated(fixture.dir.path().join("cycle.toml")).unwrap(),
+            evaluated: Default::default(),
+        });
+
+        fixture
+            .host
+            .finish_run(outcome, &mut fixture.commands)
+            .await;
+
+        let response = reply.await.unwrap();
+        assert!(
+            message(&response).contains("dependency error"),
+            "{response:?}"
+        );
+        assert!(Arc::ptr_eq(&before, &fixture.host.cache));
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_during_the_apply_keeps_the_previous_node_cache() {
+        let mut fixture = loaded_fixture().await;
+        let before = Arc::clone(&fixture.host.cache);
+
+        std::fs::write(
+            fixture.dir.path().join("zaz.toml"),
+            format!("{CONFIG}{LONG_DELAYED_CONFIG}"),
+        )
+        .unwrap();
+        let _reply = fixture.reload().await;
+        let outcome = fixture.outcomes.recv().await.unwrap();
+
+        let (commands_tx, mut commands) = mpsc::channel(8);
+        let ((), _) = tokio::join!(
+            fixture.host.finish_run(outcome, &mut commands),
+            probe(
+                &commands_tx,
+                Duration::from_millis(300),
+                ApiRequest::Shutdown
+            ),
+        );
+
+        assert!(Arc::ptr_eq(&before, &fixture.host.cache));
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_first_load_that_outlasts_the_deadline_is_a_load_error_and_frees_the_queue() {
         let mut fixture = Fixture::with_fifo().with_deadline(Duration::from_millis(300));
