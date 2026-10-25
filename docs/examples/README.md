@@ -15,6 +15,8 @@ test, so the examples cannot silently fall out of sync.
 | [local-service-cleanup/](local-service-cleanup/README.md) | Clear a stale lockfile and reach a process that left its tracked process group. |
 | [http-service-readiness/](http-service-readiness/README.md) | Hold a dependent group until an HTTP service answers on its health endpoint. |
 | [docker-service-readiness/](docker-service-readiness/README.md) | Wait on a container's own `HEALTHCHECK` before calling the service ready. |
+| [direnv/](direnv/README.md) | Load a direnv environment with `env_command = "direnv export json"` instead of `direnv exec`. |
+| [monorepo-envrc/](monorepo-envrc/README.md) | Per-directory `.envrc` files, one per group, each evaluated in the group's `working_dir`. |
 
 For the full schema, see [../configuration.md](../configuration.md). For
 subcommand and flag reference, see [../cli.md](../cli.md). Migration

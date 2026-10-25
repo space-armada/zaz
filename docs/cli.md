@@ -420,9 +420,11 @@ Each group lists the sources that apply to it, in the order they are applied: an
 `env_command`, then the inline `env` table, from the `[settings]` level down. Each task and service
 lists the sources it adds. A source shows the names it set and the names it unset. A source that
 set and unset nothing says `produced no keys`. That is the signal for an `env_command` such as
-`direnv export json` that printed nothing, for example because a `.envrc` is not allowed. The view
-also lists the inherited variable names the base environment dropped, when a level sets an
-`env_command`.
+`direnv export json` that printed nothing, for example because the directory has no `.envrc` or the group's
+`working_dir` is wrong. A blocked `.envrc` is not this case. direnv exits non-zero then, and the load fails with its
+message.
+
+The view also lists the inherited variable names the base environment dropped, when a level sets an `env_command`.
 
 The keys come from the running config, not from the files on disk. An edit that the daemon has not
 loaded is not shown. When the last refresh of a watched source failed, the view shows the failure
