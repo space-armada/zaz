@@ -49,9 +49,9 @@ pub struct Cli {
 
 // CLI exit policy:
 //
-// - Query commands report state. `status` exits 0 when the daemon is running,
-//   exits 3 for "not running" per the LSB/systemctl convention, and exits 1
-//   for operational errors.
+// - Query commands report state. `status` and `env` exit 0 when the daemon is
+//   running, exit 3 for "not running" per the LSB/systemctl convention, and
+//   exit 1 for operational errors.
 // - Strict-mutating commands perform an action that requires a running daemon.
 //   `restart` and `reload` exit 1 when no daemon is running or when the daemon
 //   API returns an error.
@@ -88,6 +88,16 @@ pub enum Commands {
 
     /// Show status of running daemon
     Status,
+
+    /// Show the environment key names the running config loaded, not their values
+    Env {
+        /// Group to show (omit for all)
+        group: Option<String>,
+
+        /// Workspace project to show (required against a workspace supervisor)
+        #[arg(long, value_name = "PROJECT")]
+        project: Option<String>,
+    },
 
     /// Restart a group or all groups
     Restart {

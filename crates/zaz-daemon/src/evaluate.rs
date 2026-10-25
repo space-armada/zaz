@@ -11,9 +11,13 @@
 //! tasks and services. Each runs in exactly the environment its output is applied to, so the
 //! command of a lower level sees everything applied above it.
 
-use crate::env::{self, EnvLayer, EnvMap, GroupEnv, Passthrough, Start};
+use crate::env::{self, EnvLayer, EnvMap, GroupEnv, Passthrough, ProcessRef, Start};
 use crate::env_command::{self, EnvCommandError, EnvCommandErrorKind};
+use crate::env_report::{
+    EnvLevel, EnvReport, EnvSourceKind, EnvSourceReport, EnvStart, GroupEnvReport, ProcessEnvReport,
+};
 use crate::sources;
+use crate::state::{DaemonStatus, LoadError};
 use crate::DaemonError;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -281,6 +285,169 @@ impl EvaluatedEnv {
     }
 }
 
+impl EvaluatedEnv {
+    /// The loaded-keys report of `config`, which must be the config this was evaluated from.
+    ///
+    /// A process lists the sources of its whole chain, settings first. Within a level the order is
+    /// file, command, then inline `env`, which is the order they are applied in.
+    pub(crate) fn report(
+        &self,
+        config: &Config,
+        status: DaemonStatus,
+        refresh_error: Option<LoadError>,
+    ) -> EnvReport {
+        let level_sources = |level: EnvFileLevel, inline: &HashMap<String, String>| {
+            let mut sources: Vec<EnvSourceReport> = self
+                .sources
+                .iter()
+                .filter(|record| record.level == level)
+                .map(|record| record.to_report())
+                .collect();
+
+            if !inline.is_empty() {
+                sources.push(inline_report(level, inline, config));
+            }
+
+            sources
+        };
+        let no_inline = HashMap::new();
+        let settings = level_sources(EnvFileLevel::Settings, &no_inline);
+
+        let groups = config
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(g, group)| {
+                let env = self.group(&group.name);
+                let start_of = |start: Option<&Start>| match start {
+                    Some(start) if start.is_base() => EnvStart::Base,
+                    _ => EnvStart::Daemon,
+                };
+
+                let mut group_sources = settings.clone();
+                group_sources.extend(level_sources(EnvFileLevel::Group { group: g }, &group.env));
+
+                let tasks = group
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(t, task)| {
+                        let mut sources = group_sources.clone();
+                        sources.extend(level_sources(
+                            EnvFileLevel::Task { group: g, task: t },
+                            &task.env,
+                        ));
+
+                        ProcessEnvReport {
+                            name: task.name().to_string(),
+                            starts_from: start_of(
+                                env.map(|env| env.process_start(ProcessRef::Task(t)))
+                                    .as_ref(),
+                            ),
+                            sources,
+                        }
+                    })
+                    .collect();
+
+                let services = group
+                    .services
+                    .iter()
+                    .enumerate()
+                    .map(|(s, service)| {
+                        let mut sources = group_sources.clone();
+                        sources.extend(level_sources(
+                            EnvFileLevel::Service {
+                                group: g,
+                                service: s,
+                            },
+                            &service.env,
+                        ));
+
+                        ProcessEnvReport {
+                            name: service.name().to_string(),
+                            starts_from: start_of(
+                                env.map(|env| env.process_start(ProcessRef::Service(s)))
+                                    .as_ref(),
+                            ),
+                            sources,
+                        }
+                    })
+                    .collect();
+
+                GroupEnvReport {
+                    name: group.name.clone(),
+                    starts_from: start_of(env.map(|env| env.group_start())),
+                    sources: group_sources,
+                    tasks,
+                    services,
+                }
+            })
+            .collect();
+
+        EnvReport {
+            project: None,
+            status,
+            load_error: None,
+            refresh_error,
+            dropped_inherited: self
+                .dropped
+                .first()
+                .map(|record| record.names.clone())
+                .unwrap_or_default(),
+            groups,
+        }
+    }
+}
+
+fn inline_report(
+    level: EnvFileLevel,
+    inline: &HashMap<String, String>,
+    config: &Config,
+) -> EnvSourceReport {
+    let mut set: Vec<String> = inline.keys().cloned().collect();
+    set.sort();
+
+    let (kind_level, field) = match level {
+        EnvFileLevel::Settings => (EnvLevel::Settings, "settings env".to_string()),
+        EnvFileLevel::Group { group } => (
+            EnvLevel::Group,
+            format!("group '{}' env", config.groups[group].name),
+        ),
+        EnvFileLevel::Task { group, task } => {
+            let group = &config.groups[group];
+            (
+                EnvLevel::Task,
+                format!(
+                    "group '{}' task '{}' env",
+                    group.name,
+                    group.tasks[task].name()
+                ),
+            )
+        }
+        EnvFileLevel::Service { group, service } => {
+            let group = &config.groups[group];
+            (
+                EnvLevel::Service,
+                format!(
+                    "group '{}' service '{}' env",
+                    group.name,
+                    group.services[service].name()
+                ),
+            )
+        }
+    };
+
+    EnvSourceReport {
+        level: kind_level,
+        field,
+        kind: EnvSourceKind::Inline,
+        origin: None,
+        set,
+        unset: Vec::new(),
+        produced_no_keys: false,
+    }
+}
+
 /// Which kind of source a record describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceKind {
@@ -300,10 +467,34 @@ impl SourceKind {
 /// The names one source set and unset. A source with neither produced no variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceRecord {
+    level: EnvFileLevel,
     field: String,
     kind: SourceKind,
+    origin: String,
     set: Vec<String>,
     unset: Vec<String>,
+}
+
+impl SourceRecord {
+    fn to_report(&self) -> EnvSourceReport {
+        EnvSourceReport {
+            level: match self.level {
+                EnvFileLevel::Settings => EnvLevel::Settings,
+                EnvFileLevel::Group { .. } => EnvLevel::Group,
+                EnvFileLevel::Task { .. } => EnvLevel::Task,
+                EnvFileLevel::Service { .. } => EnvLevel::Service,
+            },
+            field: self.field.clone(),
+            kind: match self.kind {
+                SourceKind::File => EnvSourceKind::File,
+                SourceKind::Command => EnvSourceKind::Command,
+            },
+            origin: Some(self.origin.clone()),
+            set: self.set.clone(),
+            unset: self.unset.clone(),
+            produced_no_keys: self.set.is_empty() && self.unset.is_empty(),
+        }
+    }
 }
 
 /// The inherited names the base environment dropped for the level that selected it.
@@ -378,8 +569,10 @@ pub(crate) fn evaluate_scoped(
             let layer = EnvLayer::from_vars(vars);
 
             sources.push(SourceRecord {
+                level: source.level,
                 field: source.field.clone(),
                 kind: SourceKind::File,
+                origin: source.configured.clone(),
                 set: layer.set_keys(),
                 unset: Vec::new(),
             });
@@ -396,8 +589,10 @@ pub(crate) fn evaluate_scoped(
         let layer = run.execute(&source, input)?;
 
         sources.push(SourceRecord {
+            level: source.level,
             field: source.field.clone(),
             kind: SourceKind::Command,
+            origin: source.command.clone(),
             set: layer.set_keys(),
             unset: layer.unset_keys(),
         });
@@ -1518,5 +1713,169 @@ mod tests {
 
         assert_eq!(runs(&root, "cmd"), 2);
         assert_ne!(edited.group("a"), first.group("a"));
+    }
+
+    const REPORT_CONFIG: &str = r#"
+[settings]
+env_file = ".env"
+
+[[group]]
+name = "a"
+patterns = ["*"]
+env_command = "cat group.json"
+env = { GI = "zz-val-inline" }
+
+[[group.task]]
+name = "t"
+command = "true"
+env_file = "task.env"
+env = { TI = "zz-val-task-inline" }
+
+[[group.service]]
+name = "s"
+command = "sleep 1"
+env_command = "printf ''"
+
+[[group]]
+name = "b"
+patterns = ["*"]
+
+[[group.task]]
+name = "plain"
+command = "true"
+"#;
+
+    fn report_of(dir: &Path, toml: &str) -> EnvReport {
+        std::fs::write(
+            dir.join(".env"),
+            "S=zz-val-settings\nS2=zz-val-settings-2\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("task.env"), "T=zz-val-task\n").unwrap();
+        std::fs::write(dir.join("group.json"), r#"{"G":"zz-val-group","S":null}"#).unwrap();
+
+        let (config, _path, evaluated) = load_in(dir, toml);
+
+        evaluated.report(&config, DaemonStatus::Running, None)
+    }
+
+    fn fields(sources: &[EnvSourceReport]) -> Vec<&str> {
+        sources.iter().map(|source| source.field.as_str()).collect()
+    }
+
+    #[test]
+    fn the_report_lists_each_level_in_the_order_it_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = report_of(dir.path(), REPORT_CONFIG);
+
+        let a = &report.groups[0];
+        assert_eq!(
+            fields(&a.sources),
+            [
+                "settings env_file",
+                "group 'a' env_command",
+                "group 'a' env"
+            ]
+        );
+        assert_eq!(a.starts_from, EnvStart::Base);
+
+        let file = &a.sources[0];
+        assert_eq!(file.level, EnvLevel::Settings);
+        assert_eq!(file.kind, EnvSourceKind::File);
+        assert_eq!(file.origin.as_deref(), Some(".env"));
+        assert_eq!(file.set, ["S", "S2"]);
+        assert!(!file.produced_no_keys);
+
+        let command = &a.sources[1];
+        assert_eq!(command.level, EnvLevel::Group);
+        assert_eq!(command.kind, EnvSourceKind::Command);
+        assert_eq!(command.origin.as_deref(), Some("cat group.json"));
+        assert_eq!(command.set, ["G"]);
+        assert_eq!(command.unset, ["S"]);
+
+        let inline = &a.sources[2];
+        assert_eq!(inline.kind, EnvSourceKind::Inline);
+        assert_eq!(inline.origin, None);
+        assert_eq!(inline.set, ["GI"]);
+    }
+
+    #[test]
+    fn a_task_and_a_service_add_their_own_sources_after_the_group_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = report_of(dir.path(), REPORT_CONFIG);
+        let a = &report.groups[0];
+
+        assert_eq!(
+            fields(&a.tasks[0].sources),
+            [
+                "settings env_file",
+                "group 'a' env_command",
+                "group 'a' env",
+                "group 'a' task 't' env_file",
+                "group 'a' task 't' env",
+            ]
+        );
+        assert_eq!(a.tasks[0].name, "t");
+        assert_eq!(a.tasks[0].sources[3].level, EnvLevel::Task);
+        assert_eq!(a.tasks[0].sources[3].set, ["T"]);
+        assert_eq!(a.tasks[0].sources[4].set, ["TI"]);
+
+        let service = &a.services[0];
+        let last = service.sources.last().unwrap();
+        assert_eq!(last.level, EnvLevel::Service);
+        assert_eq!(last.field, "group 'a' service 's' env_command");
+        assert_eq!(service.starts_from, EnvStart::Base);
+    }
+
+    #[test]
+    fn a_command_that_prints_nothing_is_flagged_as_producing_no_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = report_of(dir.path(), REPORT_CONFIG);
+        let service = &report.groups[0].services[0];
+        let silent = service.sources.last().unwrap();
+
+        assert!(silent.produced_no_keys);
+        assert!(silent.set.is_empty() && silent.unset.is_empty());
+
+        let loaded = &report.groups[0].tasks[0].sources;
+        assert!(loaded.iter().filter(|s| s.produced_no_keys).count() == 0);
+    }
+
+    #[test]
+    fn a_group_with_no_command_starts_from_the_daemons_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = report_of(dir.path(), REPORT_CONFIG);
+        let b = &report.groups[1];
+
+        assert_eq!(b.starts_from, EnvStart::Daemon);
+        assert_eq!(b.tasks[0].starts_from, EnvStart::Daemon);
+        assert_eq!(fields(&b.sources), ["settings env_file"]);
+    }
+
+    #[test]
+    fn a_settings_command_puts_every_group_on_the_base_and_reports_the_dropped_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = report_of(
+            dir.path(),
+            "[settings]\nenv_command = \"printf '{}'\"\n\n\
+             [[group]]\nname = \"a\"\npatterns = [\"*\"]\n",
+        );
+
+        assert_eq!(report.groups[0].starts_from, EnvStart::Base);
+        assert!(report.groups[0].sources[0].produced_no_keys);
+        assert_eq!(
+            report.dropped_inherited,
+            env::dropped_names(&Passthrough::default())
+        );
+    }
+
+    #[test]
+    fn the_report_never_carries_a_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = report_of(dir.path(), REPORT_CONFIG);
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(json.contains("\"S2\""));
+        assert!(!json.contains("zz-val"));
     }
 }

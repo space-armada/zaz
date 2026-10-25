@@ -77,6 +77,11 @@ pub(crate) enum Start {
 }
 
 impl Start {
+    /// Whether this starts from the base environment.
+    pub(crate) fn is_base(&self) -> bool {
+        matches!(self, Self::Base(_))
+    }
+
     /// The starting environment, read from the daemon's environment now.
     pub(crate) fn build(&self) -> EnvMap {
         match self {
@@ -153,7 +158,11 @@ impl GroupEnv {
         }
     }
 
-    fn process_start(&self, process: ProcessRef) -> Start {
+    pub(crate) fn group_start(&self) -> &Start {
+        &self.group_start
+    }
+
+    pub(crate) fn process_start(&self, process: ProcessRef) -> Start {
         self.own(process)
             .map(|own| own.start.clone())
             .unwrap_or_else(|| self.group_start.clone())

@@ -17,8 +17,8 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt
 use crate::client;
 use crate::error::McpError;
 use crate::types::{
-    ConfigReport, GroupsReport, LogsReport, LogsRequest, MutationReport, RestartGroupRequest,
-    RestartProcessRequest, StatusReport,
+    ConfigReport, EnvRequest, EnvToolReport, GroupsReport, LogsReport, LogsRequest, MutationReport,
+    RestartGroupRequest, RestartProcessRequest, StatusReport,
 };
 
 /// Canonical vocabulary advertised in the server `instructions` field so an
@@ -116,6 +116,32 @@ impl ZazMcpServer {
             has_more: page.has_more,
             offset: page.offset,
         }))
+    }
+
+    /// Key names the running config loaded into each environment.
+    #[tool(
+        name = "zaz_env",
+        description = "Report which environment variable names the running config loaded for each group, task, and service, and which source each came from: an env_file, an env_command, or an inline env table. Also lists the names a source unset, the sources that produced no keys at all, the inherited names the base environment dropped, and the last source-refresh failure. Values are never returned, but the error of a failed source can carry that command's stderr. This describes the running config, so an edit that has not been reloaded is not in it; use zaz_config for the sources as written on disk. Use it to answer 'is FOO set for process X, and from where?' and 'did direnv load anything?'. Against a workspace supervisor, set `project` to select the member. Set `group` to narrow to one group."
+    )]
+    async fn zaz_env(
+        &self,
+        Parameters(req): Parameters<EnvRequest>,
+    ) -> Result<Json<EnvToolReport>, ErrorData> {
+        let report = client::fetch_env(&self.socket_path, req.project.as_deref())
+            .await
+            .map_err(into_error)?;
+        let report =
+            EnvToolReport::from_daemon(&report, req.group.as_deref()).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!(
+                        "no group named '{}' in the running config",
+                        req.group.as_deref().unwrap_or_default()
+                    ),
+                    None,
+                )
+            })?;
+
+        Ok(Json(report))
     }
 
     /// Return the parsed project configuration from disk.
@@ -291,6 +317,17 @@ mod tests {
     }
 
     #[test]
+    fn a_too_old_daemon_error_says_how_to_restart() {
+        let error = into_error(McpError::DaemonTooOld {
+            feature: "the loaded environment report",
+        });
+
+        assert!(error.message.contains("too old"), "{}", error.message);
+        assert!(error.message.contains("zaz stop"), "{}", error.message);
+        assert!(!error.message.contains("hint:"), "{}", error.message);
+    }
+
+    #[test]
     fn get_info_enables_tool_capability() {
         let info = server().get_info();
         assert!(
@@ -308,6 +345,7 @@ mod tests {
             "zaz_status",
             "zaz_list_groups",
             "zaz_logs",
+            "zaz_env",
             "zaz_config",
             "zaz_restart_group",
             "zaz_restart_process",
@@ -316,11 +354,7 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {expected} in {names:?}");
         }
-        assert_eq!(
-            names.len(),
-            8,
-            "expected exactly eight tools, got {names:?}"
-        );
+        assert_eq!(names.len(), 9, "expected exactly nine tools, got {names:?}");
     }
 
     #[test]

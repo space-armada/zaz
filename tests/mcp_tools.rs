@@ -1,4 +1,4 @@
-//! Integration tests for the eight MCP tools against a running zaz daemon.
+//! Integration tests for the nine MCP tools against a running zaz daemon.
 //!
 //! Each test brings up a real daemon via `zaz start`, spawns `zaz mcp`,
 //! drives the JSON-RPC handshake and a single `tools/call`, then asserts on
@@ -15,7 +15,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use support::{zaz_bin, StartedDaemon};
 use tempfile::TempDir;
-use zaz_mcp::{ConfigReport, GroupsReport, LogsReport, MutationReport, StatusReport};
+use zaz_mcp::{
+    ConfigReport, EnvSourceKindReport, EnvStartReport, EnvToolReport, GroupsReport, LogsReport,
+    MutationReport, StatusReport,
+};
 
 const INITIALIZE_REQUEST: &str = concat!(
     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","#,
@@ -243,6 +246,121 @@ fn mcp_zaz_config_returns_parsed_config() {
     assert_eq!(group.tasks[0].name, "noop");
     assert_eq!(group.services.len(), 1);
     assert_eq!(group.services[0].name, "sleeper");
+}
+
+const ENV_CONFIG: &str = r#"
+[settings]
+env_file = "base.env"
+
+[[group]]
+name = "api"
+patterns = []
+env_command = "cat group.json"
+env = { INLINE_KEY = "zz-val-inline" }
+
+[[group.task]]
+name = "build"
+command = "true"
+env_file = "task.env"
+
+[[group.service]]
+name = "web"
+command = "sleep 60"
+env_command = "printf ''"
+
+[[group]]
+name = "plain"
+patterns = []
+
+[[group.task]]
+name = "noop"
+command = "true"
+"#;
+
+fn write_env_project(temp: &TempDir) -> PathBuf {
+    let dir = temp.path();
+    std::fs::write(dir.join("base.env"), "BASE_KEY=zz-val-base\n").unwrap();
+    std::fs::write(dir.join("task.env"), "TASK_KEY=zz-val-task\n").unwrap();
+    std::fs::write(
+        dir.join("group.json"),
+        r#"{"GROUP_KEY":"zz-val-group","BASE_KEY":null}"#,
+    )
+    .unwrap();
+
+    let config = dir.join("zaz.toml");
+    std::fs::write(&config, ENV_CONFIG).unwrap();
+    config
+}
+
+#[test]
+fn mcp_zaz_env_reports_key_names_and_sources_without_values() {
+    let temp = TempDir::new().unwrap();
+    let config = write_env_project(&temp);
+    let socket = unique_socket_path(&temp, "mcp-env");
+    let _guard = StartedDaemon::launch(temp.path(), &config, &socket);
+
+    let response = call_tool(&socket, temp.path(), "zaz_env", json!({}));
+
+    assert_not_error(&response);
+    assert!(
+        !response.to_string().contains("zz-val"),
+        "no value may reach the tool result: {response}"
+    );
+    let report: EnvToolReport = parse_structured(&response);
+    assert!(report.scope.contains("running config"));
+    assert_eq!(report.groups.len(), 2);
+
+    let api = &report.groups[0];
+    assert!(matches!(api.starts_from, EnvStartReport::Base));
+    let fields: Vec<&str> = api.sources.iter().map(|s| s.field.as_str()).collect();
+    assert_eq!(
+        fields,
+        [
+            "settings env_file",
+            "group 'api' env_command",
+            "group 'api' env"
+        ]
+    );
+    assert_eq!(api.sources[0].set, ["BASE_KEY"]);
+    assert_eq!(api.sources[1].set, ["GROUP_KEY"]);
+    assert_eq!(api.sources[1].unset, ["BASE_KEY"]);
+    assert!(matches!(api.sources[2].kind, EnvSourceKindReport::Inline));
+    assert_eq!(api.sources[2].set, ["INLINE_KEY"]);
+
+    let build = &api.tasks[0];
+    assert_eq!(build.sources.last().unwrap().set, ["TASK_KEY"]);
+
+    let web = &api.services[0];
+    let silent = web.sources.last().unwrap();
+    assert!(silent.produced_no_keys, "{silent:?}");
+    assert_eq!(silent.origin.as_deref(), Some("printf ''"));
+
+    let plain = &report.groups[1];
+    assert!(matches!(plain.starts_from, EnvStartReport::Daemon));
+}
+
+#[test]
+fn mcp_zaz_env_narrows_to_a_group_and_rejects_an_unknown_one() {
+    let temp = TempDir::new().unwrap();
+    let config = write_env_project(&temp);
+    let socket = unique_socket_path(&temp, "mcp-env-group");
+    let _guard = StartedDaemon::launch(temp.path(), &config, &socket);
+
+    let response = call_tool(&socket, temp.path(), "zaz_env", json!({"group": "plain"}));
+    assert_not_error(&response);
+    let report: EnvToolReport = parse_structured(&response);
+    assert_eq!(report.groups.len(), 1);
+    assert_eq!(report.groups[0].name, "plain");
+
+    let response = call_tool(&socket, temp.path(), "zaz_env", json!({"group": "nope"}));
+    assert!(
+        response.get("error").is_some()
+            || response
+                .pointer("/result/isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        "an unknown group should error: {response}"
+    );
 }
 
 #[test]
@@ -597,4 +715,36 @@ fn mcp_workspace_logs_without_project_errors() {
         has_jsonrpc_error || has_tool_error,
         "a workspace log query without a project should error, got: {serialized}"
     );
+}
+
+#[test]
+fn mcp_workspace_env_scoped_by_project() {
+    let ws = StartedWorkspace::launch();
+
+    let response = call_tool(&ws.ws_socket, &ws.root, "zaz_env", json!({"project": "a"}));
+
+    assert_not_error(&response);
+    let report: EnvToolReport = parse_structured(&response);
+    assert_eq!(report.project.as_deref(), Some("a"));
+    assert_eq!(report.groups.len(), 1);
+    assert_eq!(report.groups[0].name, "g");
+}
+
+#[test]
+fn mcp_workspace_env_without_project_errors() {
+    let ws = StartedWorkspace::launch();
+
+    let response = call_tool(&ws.ws_socket, &ws.root, "zaz_env", json!({}));
+
+    let serialized = response.to_string();
+    let has_jsonrpc_error = response.get("error").is_some();
+    let has_tool_error = response
+        .pointer("/result/isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        has_jsonrpc_error || has_tool_error,
+        "a workspace env query without a project should error, got: {serialized}"
+    );
+    assert!(serialized.contains("requires a project"), "{serialized}");
 }

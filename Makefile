@@ -1,4 +1,4 @@
-.PHONY: all bench build build-macos check ci clean dist-linux dist-macos docs-check docs-cli fmt fmt-check lint lint-md lint-rust test
+.PHONY: all bench build build-macos check ci clean dist-linux dist-macos docs-check docs-cli fmt fmt-check lint lint-md lint-rust test test-select
 
 # Default target
 all: check
@@ -65,6 +65,12 @@ fmt-check:
 	bin/rumdl check .
 
 ci: fmt-check lint build test docs-check
+
+# Space-separated test-name filters for test-select. Empty runs every test.
+TESTS ?=
+
+test-select: ## Run a subset of tests by name, e.g. make test-select TESTS='host::tests'
+	cargo test --workspace --locked -- $(TESTS)
 
 # Runs the Criterion benchmark harness. Deliberately kept out of the `ci` gate:
 # benchmarks are non-gating and run on a manual or scheduled trigger only. See

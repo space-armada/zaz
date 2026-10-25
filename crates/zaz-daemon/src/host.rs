@@ -19,7 +19,8 @@
 //! run, if there is one, starts.
 
 use crate::api::{ApiRequest, ApiResponse, EngineCommand};
-use crate::engine::{answer_log_request, Engine};
+use crate::engine::{answer_log_request, BusySnapshot, Engine};
+use crate::env_report::EnvReport;
 use crate::evaluate::{self, EvalCache, Prepared, Scope};
 use crate::log_store::SharedLogStore;
 use crate::state::{DaemonState, DaemonStatus, LoadError};
@@ -251,7 +252,7 @@ impl DaemonHost {
             return;
         };
 
-        let snapshot = engine.status_snapshot();
+        let snapshot = engine.busy_snapshot();
         let logs = engine.log_handle();
         self.while_answering(engine.release_held(), &snapshot, &logs, commands)
             .await;
@@ -442,7 +443,7 @@ impl DaemonHost {
             result,
         ) {
             (Slot::Loaded(mut engine), Ok(prepared)) => {
-                let snapshot = engine.status_snapshot();
+                let snapshot = engine.busy_snapshot();
                 let logs = engine.log_handle();
                 let applied = match scope {
                     Scope::Full => {
@@ -500,7 +501,7 @@ impl DaemonHost {
     async fn while_answering<T>(
         &mut self,
         work: impl std::future::Future<Output = T>,
-        snapshot: &DaemonState,
+        snapshot: &BusySnapshot,
         logs: &SharedLogStore,
         commands: &mut mpsc::Receiver<EngineCommand>,
     ) -> Option<T> {
@@ -526,12 +527,13 @@ impl DaemonHost {
     /// contract promises. Service starts that wait out a `delay` finish later, and show in the
     /// group states as they do.
     ///
-    /// Log requests read the shared log store, so they answer in full during an apply. Restarts
-    /// are refused, since the engine that would run them is busy.
+    /// Log requests read the shared log store, so they answer in full during an apply. The loaded
+    /// environment answers from the snapshot taken before the apply began, like the state does.
+    /// Restarts are refused, since the engine that would run them is busy.
     fn answer_busy(
         &mut self,
         command: EngineCommand,
-        snapshot: &DaemonState,
+        snapshot: &BusySnapshot,
         logs: &SharedLogStore,
     ) {
         let EngineCommand {
@@ -544,7 +546,7 @@ impl DaemonHost {
             ApiRequest::Shutdown => self.begin_shutdown(),
             ApiRequest::Status | ApiRequest::ListGroups | ApiRequest::Subscribe => {
                 ApiResponse::Status {
-                    state: snapshot.clone(),
+                    state: snapshot.state.clone(),
                 }
             }
             ApiRequest::RestartGroup { .. }
@@ -552,6 +554,9 @@ impl DaemonHost {
             | ApiRequest::RestartAll => ApiResponse::error(
                 "daemon busy [daemon_busy]: it is still starting or reloading its services",
             ),
+            ApiRequest::GetEnv { .. } => ApiResponse::Env {
+                report: snapshot.env.clone(),
+            },
             request @ (ApiRequest::GetLogs { .. } | ApiRequest::SubscribeLogs { .. }) => {
                 if let Err(e) = logs.drain() {
                     tracing::error!(error = %e, "log drain error");
@@ -593,9 +598,10 @@ impl DaemonHost {
         // The groups are built, so the daemon is `Running` from here, however long the service
         // starts take.
         engine.set_refresh_sender(self.refresh_tx.clone());
-        let mut snapshot = engine.status_snapshot();
-        snapshot.status = DaemonStatus::Running;
-        let groups = snapshot.groups.len();
+        let mut snapshot = engine.busy_snapshot();
+        snapshot.state.status = DaemonStatus::Running;
+        snapshot.env.status = DaemonStatus::Running;
+        let groups = snapshot.state.groups.len();
 
         // A failed startup keeps the daemon up, as it always has.
         let logs = engine.log_handle();
@@ -662,6 +668,13 @@ fn answer_unloaded(
                 offset: None,
             }
         }
+        ApiRequest::GetEnv { .. } => ApiResponse::Env {
+            report: EnvReport {
+                status: DaemonStatus::Starting,
+                load_error: error.cloned(),
+                ..Default::default()
+            },
+        },
         ApiRequest::Identify => {
             let config_path = config_path
                 .canonicalize()
@@ -843,6 +856,15 @@ mod tests {
         let subscribe = fixture.request(ApiRequest::Subscribe).await;
         assert!(matches!(subscribe, ApiResponse::Status { .. }));
 
+        let ApiResponse::Env { report } =
+            fixture.request(ApiRequest::GetEnv { project: None }).await
+        else {
+            panic!("expected an env report");
+        };
+        assert_eq!(report.status, DaemonStatus::Starting);
+        assert!(report.groups.is_empty());
+        assert!(report.load_error.is_none());
+
         for request in [
             ApiRequest::RestartAll,
             ApiRequest::RestartGroup {
@@ -884,6 +906,15 @@ mod tests {
             message(&restart).contains("first_load_failed"),
             "{restart:?}"
         );
+
+        let ApiResponse::Env { report } =
+            fixture.request(ApiRequest::GetEnv { project: None }).await
+        else {
+            panic!("expected an env report");
+        };
+        assert_eq!(report.status, DaemonStatus::Starting);
+        assert_eq!(report.load_error.unwrap().code, "env_file_missing");
+        assert!(report.groups.is_empty());
 
         std::fs::write(fixture.dir.path().join("slow.env"), "A=1\n").unwrap();
         let response = fixture.reload().await;
@@ -1100,6 +1131,10 @@ mod tests {
     const DELAYED_CONFIG: &str = "[[group]]\nname = \"svc\"\n\n\
                                   [[group.service]]\nname = \"s\"\ncommand = \"sleep 30\"\ndelay = \"3s\"\n";
 
+    /// A delay far longer than any bound a test asserts, for tests that must end the wait early.
+    const LONG_DELAYED_CONFIG: &str = "[[group]]\nname = \"svc\"\n\n\
+                                       [[group.service]]\nname = \"s\"\ncommand = \"sleep 60\"\ndelay = \"30s\"\n";
+
     /// Send `request` on `commands_tx` after `wait`, and report when and how it was answered.
     async fn probe(
         commands_tx: &mpsc::Sender<EngineCommand>,
@@ -1180,9 +1215,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_during_a_delayed_start_ends_the_wait_and_stops_the_engine() {
+    async fn the_env_report_answers_from_the_snapshot_during_a_delayed_start() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("zaz.toml"), DELAYED_CONFIG).unwrap();
+        let mut fixture = Fixture::at(dir);
+        fixture.host.begin_first_load();
+        let outcome = fixture.outcomes.recv().await.unwrap();
+
+        let (commands_tx, mut commands) = mpsc::channel(8);
+        let ((), (_, reply)) = tokio::join!(
+            fixture.host.finish_run(outcome, &mut commands),
+            probe(
+                &commands_tx,
+                Duration::from_millis(300),
+                ApiRequest::GetEnv { project: None }
+            ),
+        );
+
+        let ApiResponse::Env { report } = reply else {
+            panic!("expected an env report, got {reply:?}");
+        };
+        assert_eq!(report.status, DaemonStatus::Running);
+        assert_eq!(report.groups[0].name, "svc");
+        assert_eq!(report.groups[0].services[0].name, "s");
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_a_delayed_start_ends_the_wait_and_stops_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zaz.toml"), LONG_DELAYED_CONFIG).unwrap();
         let mut fixture = Fixture::at(dir);
         fixture.host.begin_first_load();
         let outcome = fixture.outcomes.recv().await.unwrap();
@@ -1272,6 +1335,16 @@ mod tests {
         let state = fixture.host.state();
         assert!(state.env_refresh_error.is_some());
         assert!(state.load_error.is_none());
+
+        let ApiResponse::Env { report } =
+            fixture.request(ApiRequest::GetEnv { project: None }).await
+        else {
+            panic!("expected an env report");
+        };
+        assert_eq!(report.status, DaemonStatus::Running);
+        assert_eq!(report.refresh_error, state.env_refresh_error);
+        assert_eq!(report.groups[0].name, "app");
+        assert_eq!(report.groups[0].sources[0].set, ["A"]);
 
         fixture.host.shutdown().await.unwrap();
     }

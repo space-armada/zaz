@@ -34,6 +34,14 @@ pub enum McpError {
     #[error("unexpected daemon response: {0}")]
     UnexpectedResponse(String),
 
+    /// The daemon predates a request this build sends, so it answered with an unknown-request
+    /// error.
+    #[error(
+        "the running daemon is too old to provide {feature}: restart it with this version of zaz \
+         by running `zaz stop`, then `zaz start`"
+    )]
+    DaemonTooOld { feature: &'static str },
+
     /// The daemon understood the request but refused to perform the operation,
     /// e.g. an unknown group name or a config reload that fails to parse.
     #[error("daemon refused {operation}: {message}")]
@@ -101,6 +109,19 @@ mod tests {
             err.hint(),
             Some("run `zaz mcp` from a project directory containing zaz.toml or zaz.json")
         );
+    }
+
+    #[test]
+    fn daemon_too_old_names_the_feature_and_says_how_to_restart() {
+        let err = McpError::DaemonTooOld {
+            feature: "the loaded environment report",
+        };
+        let message = err.to_string();
+
+        assert!(message
+            .starts_with("the running daemon is too old to provide the loaded environment report"));
+        assert!(message.contains("`zaz stop`, then `zaz start`"));
+        assert_eq!(err.hint(), None);
     }
 
     #[test]

@@ -18,6 +18,7 @@ use zaz_daemon::{
 use zaz_mcp::McpError;
 use zaz_process::{CancelHandle, DaemonLauncher, LaunchHandle, TERMINATE_GRACE};
 
+mod env_view;
 mod startup;
 mod supervisor;
 
@@ -573,6 +574,16 @@ async fn try_main() -> Result<()> {
                 &current_dir,
             )?;
             show_status(&target).await
+        }
+        Some(Commands::Env { group, project }) => {
+            prepare_log_files(&explicit_log_paths)?;
+            _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
+            let target = resolve_command_target(
+                &at_most_one_config(&cli.config)?,
+                cli.socket.clone(),
+                &current_dir,
+            )?;
+            show_env(&target, group.as_deref(), project).await
         }
         Some(Commands::Restart { group }) => {
             prepare_log_files(&explicit_log_paths)?;
@@ -1371,16 +1382,22 @@ async fn start_supervisor_command(
     }
 }
 
-async fn show_status(target: &DaemonTarget) -> Result<()> {
-    let mut client = match Client::connect(target.socket()).await {
-        Ok(c) => c,
+/// Connect for a query command. A missing daemon prints on stdout and exits 3, since "not
+/// running" is an answer to a query and not a failure.
+async fn connect_for_query(target: &DaemonTarget) -> Result<Client> {
+    match Client::connect(target.socket()).await {
+        Ok(client) => Ok(client),
         Err(_) => {
-            // Status's "no daemon" path lands on stdout per ZAZ-005 query-command
-            // semantics, and the process exits 3 via `StatusNotRunning`.
+            // The "no daemon" path lands on stdout per ZAZ-005 query-command semantics, and the
+            // process exits 3 via `StatusNotRunning`.
             print_no_daemon(&NoDaemon::new(target), NoDaemonHint::Show);
-            return Err(StatusNotRunning.into());
+            Err(StatusNotRunning.into())
         }
-    };
+    }
+}
+
+async fn show_status(target: &DaemonTarget) -> Result<()> {
+    let mut client = connect_for_query(target).await?;
 
     let response = client.request(&ApiRequest::Status).await?;
     match response {
@@ -1455,6 +1472,31 @@ async fn show_status(target: &DaemonTarget) -> Result<()> {
             Ok(())
         }
         other => handle_daemon_response(other, "status request", ""),
+    }
+}
+
+/// Print the key names the running config loaded, never values.
+async fn show_env(
+    target: &DaemonTarget,
+    group: Option<&str>,
+    project: Option<String>,
+) -> Result<()> {
+    let mut client = connect_for_query(target).await?;
+
+    match client.request(&ApiRequest::GetEnv { project }).await? {
+        ApiResponse::Env { report } => {
+            print!("{}", env_view::render(&report, group)?);
+            Ok(())
+        }
+        ApiResponse::Error { message }
+            if zaz_daemon::is_unknown_request_error(&message, "get_env") =>
+        {
+            Err(McpError::DaemonTooOld {
+                feature: "the loaded environment report",
+            }
+            .into())
+        }
+        other => handle_daemon_response(other, "env request", ""),
     }
 }
 

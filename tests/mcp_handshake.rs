@@ -147,6 +147,7 @@ fn mcp_tools_list_advertises_all_tools() {
         "zaz_status",
         "zaz_list_groups",
         "zaz_logs",
+        "zaz_env",
         "zaz_config",
         "zaz_restart_group",
         "zaz_restart_process",
@@ -162,11 +163,7 @@ fn mcp_tools_list_advertises_all_tools() {
         !names.iter().any(|n| n.contains("shutdown")),
         "shutdown tool must not be advertised; got {names:?}"
     );
-    assert_eq!(
-        names.len(),
-        8,
-        "expected exactly eight tools, got {names:?}"
-    );
+    assert_eq!(names.len(), 9, "expected exactly nine tools, got {names:?}");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

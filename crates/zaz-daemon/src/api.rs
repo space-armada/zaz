@@ -1,5 +1,6 @@
 //! API request and response types.
 
+use crate::env_report::EnvReport;
 use crate::state::DaemonState;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -188,11 +189,29 @@ pub enum ApiRequest {
     /// Reload configuration.
     ReloadConfig,
 
+    /// Report the key names the running config loaded into each environment, never values.
+    GetEnv {
+        /// Workspace project token selecting which member daemon to query. A single-config
+        /// daemon ignores it. A supervisor requires it, and answers for that one member.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+    },
+
     /// Report the config the daemon is serving, for identity verification.
     Identify,
 
     /// Graceful shutdown.
     Shutdown,
+}
+
+/// Whether `message` is an older daemon's answer to a request type it does not know.
+///
+/// The server answers a request it cannot parse with `invalid request: ` and the serde error. For
+/// an unknown request type that error names the variant, as in ``unknown variant `get_env` ``. A
+/// supervisor wraps a member's answer, so the text may sit inside a longer message.
+pub fn is_unknown_request_error(message: &str, request_type: &str) -> bool {
+    message.contains("invalid request")
+        && message.contains(&format!("unknown variant `{request_type}`"))
 }
 
 /// Internal command sent from server to engine.
@@ -234,6 +253,9 @@ pub enum ApiResponse {
 
     /// Log line (streaming).
     Log(LogLine),
+
+    /// The key names the running config loaded, with their sources.
+    Env { report: EnvReport },
 
     /// Identity of the config a daemon is serving (canonical path).
     Identity { config_path: String },
@@ -288,6 +310,45 @@ mod tests {
         // An unset project is omitted from the wire, keeping the shape compatible
         // with single-config clients.
         assert!(!json.contains("project"));
+    }
+
+    #[test]
+    fn get_env_omits_an_unset_project_and_round_trips_a_set_one() {
+        let json = serde_json::to_string(&ApiRequest::GetEnv { project: None }).unwrap();
+        assert_eq!(json, r#"{"type":"get_env"}"#);
+
+        let json = serde_json::to_string(&ApiRequest::GetEnv {
+            project: Some("api".to_string()),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"type":"get_env","project":"api"}"#);
+
+        let req: ApiRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(req, ApiRequest::GetEnv { project: Some(p) } if p == "api"));
+    }
+
+    #[test]
+    fn an_older_daemons_unknown_variant_answer_is_detected() {
+        let err = serde_json::from_str::<ApiRequest>(r#"{"type":"get_envx"}"#).unwrap_err();
+        let answer = format!("invalid request: {}", err);
+        assert!(!is_unknown_request_error(&answer, "get_env"));
+        assert!(is_unknown_request_error(&answer, "get_envx"));
+
+        let older =
+            "invalid request: unknown variant `get_env`, expected one of `status`, `subscribe`";
+        assert!(is_unknown_request_error(older, "get_env"));
+
+        let wrapped = format!("project 'api': {older}");
+        assert!(is_unknown_request_error(&wrapped, "get_env"));
+
+        assert!(!is_unknown_request_error(
+            "unknown project 'api'",
+            "get_env"
+        ));
+        assert!(!is_unknown_request_error(
+            "invalid request: EOF while parsing",
+            "get_env"
+        ));
     }
 
     #[test]

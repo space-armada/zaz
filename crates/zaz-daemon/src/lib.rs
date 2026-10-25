@@ -7,6 +7,7 @@ mod dependency;
 mod engine;
 mod env;
 mod env_command;
+mod env_report;
 mod error;
 mod evaluate;
 mod host;
@@ -20,9 +21,15 @@ mod sources;
 mod state;
 mod target;
 
-pub use api::{ApiRequest, ApiResponse, EngineCommand, LogLine, LogSource, OutputKind};
+pub use api::{
+    is_unknown_request_error, ApiRequest, ApiResponse, EngineCommand, LogLine, LogSource,
+    OutputKind,
+};
 pub use engine::Engine;
 pub use env_command::{EnvCommandError, EnvCommandErrorKind};
+pub use env_report::{
+    EnvLevel, EnvReport, EnvSourceKind, EnvSourceReport, EnvStart, GroupEnvReport, ProcessEnvReport,
+};
 pub use error::{DaemonError, LogStorageError};
 pub use host::{DaemonHost, RunOutcome};
 pub use log_layer::DaemonLogLayer;

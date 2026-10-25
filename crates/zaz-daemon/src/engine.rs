@@ -925,6 +925,14 @@ pub struct TriggerContext {
     pub should_cascade: bool,
 }
 
+/// The state and loaded environment as they stood when the engine became busy.
+///
+/// An apply holds the engine, so read-only requests answer from this copy.
+pub(crate) struct BusySnapshot {
+    pub(crate) state: DaemonState,
+    pub(crate) env: crate::EnvReport,
+}
+
 /// The core orchestration engine.
 pub struct Engine {
     /// Loaded configuration.
@@ -1462,6 +1470,14 @@ impl Engine {
     pub(crate) fn status_snapshot(&mut self) -> DaemonState {
         self.update_state();
         self.state.clone()
+    }
+
+    /// What the host answers read-only requests from while the engine is busy.
+    pub(crate) fn busy_snapshot(&mut self) -> BusySnapshot {
+        BusySnapshot {
+            state: self.status_snapshot(),
+            env: self.env_report(),
+        }
     }
 
     /// Subscribe to status updates.
@@ -3145,6 +3161,9 @@ impl Engine {
                 "the engine does not reload itself [reload_not_supported]: reloads go through the \
                  daemon host, which loads sources off the event loop",
             ),
+            ApiRequest::GetEnv { .. } => ApiResponse::Env {
+                report: self.env_report(),
+            },
             ApiRequest::Identify => {
                 let config_path = self
                     .config_path
@@ -3159,6 +3178,18 @@ impl Engine {
                 ApiResponse::ok_with_message("shutting down")
             }
         }
+    }
+
+    /// The key names the running config loaded, with their sources and the last refresh failure.
+    ///
+    /// It reads the environment the groups were built from, so it never shows an edit that has not
+    /// been loaded.
+    fn env_report(&self) -> crate::EnvReport {
+        self.evaluated.report(
+            &self.config,
+            self.state.status,
+            self.state.env_refresh_error.clone(),
+        )
     }
 
     /// Create a combined pattern set from all groups.

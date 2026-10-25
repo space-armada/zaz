@@ -12,8 +12,9 @@ use zaz_config::{
     Config, Group, LogFormat, ServiceCommand, Settings, Signal, Silence, TaskCommand,
 };
 use zaz_daemon::{
-    DaemonState, DaemonStatus, GroupState, GroupStatus, LoadError, LogLine, LogSource, OutputKind,
-    ProcessState, ProcessStatus,
+    DaemonState, DaemonStatus, EnvLevel, EnvReport, EnvSourceKind, EnvSourceReport, EnvStart,
+    GroupEnvReport, GroupState, GroupStatus, LoadError, LogLine, LogSource, OutputKind,
+    ProcessEnvReport, ProcessState, ProcessStatus,
 };
 
 /// Top-level daemon status response for the `zaz_status` tool.
@@ -160,6 +161,121 @@ pub struct LogsRequest {
     /// Case-insensitive substring filter applied to log content.
     #[serde(default)]
     pub search: Option<String>,
+}
+
+/// Input parameters for the `zaz_env` tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct EnvRequest {
+    /// Project token selecting one workspace member. Required against a workspace supervisor;
+    /// omit for a single-config daemon.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Group to report. Omit for every group.
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// The loaded environment of the running config, for the `zaz_env` tool.
+///
+/// It holds key names and where each came from, never values. The error text of a failed source
+/// can carry that command's stderr.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvToolReport {
+    /// What this report describes. It reflects the running config, so an edit to `zaz.toml` or to
+    /// a source that has not been reloaded or picked up by the watcher is not in it.
+    pub scope: String,
+    /// The workspace project this report describes, when the daemon is a workspace supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Overall lifecycle state of the daemon. `starting` with no groups means nothing is loaded.
+    pub daemon_status: DaemonStatusReport,
+    /// Why the first load failed, when it did. No keys are reported then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<LoadErrorReport>,
+    /// Why the last refresh of a watched source failed, when it did. The groups show the
+    /// environment the daemon is still running on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_error: Option<LoadErrorReport>,
+    /// Inherited variable names the base environment dropped, for chains that start from it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_inherited: Vec<String>,
+    /// The groups, in declaration order.
+    pub groups: Vec<EnvGroupReport>,
+}
+
+/// The environment sources of one group and its processes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvGroupReport {
+    pub name: String,
+    /// What the group's own environment starts from.
+    pub starts_from: EnvStartReport,
+    /// Sources that apply to the group, in the order they are applied.
+    pub sources: Vec<EnvSourceInfo>,
+    pub tasks: Vec<EnvProcessReport>,
+    pub services: Vec<EnvProcessReport>,
+}
+
+/// The environment sources of one task or service.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvProcessReport {
+    pub name: String,
+    /// What the process's environment starts from.
+    pub starts_from: EnvStartReport,
+    /// Sources that apply to the process, in the order they are applied. They run from the
+    /// settings level through the group's and then the process's own.
+    pub sources: Vec<EnvSourceInfo>,
+}
+
+/// What a chain of sources is applied to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvStartReport {
+    /// The daemon's own environment.
+    Daemon,
+    /// The fixed base environment plus any `env_passthrough` names.
+    Base,
+}
+
+/// The config level a source was declared at.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvLevelReport {
+    Settings,
+    Group,
+    Task,
+    Service,
+}
+
+/// The kind of environment source.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvSourceKindReport {
+    /// An `env_file`.
+    File,
+    /// An `env_command`.
+    Command,
+    /// An inline `env` table.
+    Inline,
+}
+
+/// The key names one source set and unset.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvSourceInfo {
+    pub level: EnvLevelReport,
+    /// The config field, such as `group 'api' env_file`.
+    pub field: String,
+    pub kind: EnvSourceKindReport,
+    /// The `env_file` path or `env_command` as written in the config. Unset for an inline table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Names the source set.
+    pub set: Vec<String>,
+    /// Names the source removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unset: Vec<String>,
+    /// True when the source set and unset nothing. An `env_command` that prints nothing, such as
+    /// `direnv export json` with an unallowed or missing `.envrc`, looks like this.
+    pub produced_no_keys: bool,
 }
 
 /// Input parameters for the `zaz_restart_group` tool.
@@ -391,6 +507,91 @@ impl From<&DaemonState> for StatusReport {
                     error: LoadErrorReport::from(&m.error),
                 })
                 .collect(),
+        }
+    }
+}
+
+impl EnvToolReport {
+    /// Build the tool report from the daemon's, narrowed to `group` when one is named.
+    ///
+    /// Returns `None` when `group` names no group of a loaded config.
+    pub fn from_daemon(report: &EnvReport, group: Option<&str>) -> Option<Self> {
+        let groups: Vec<EnvGroupReport> = report
+            .groups
+            .iter()
+            .filter(|candidate| group.map_or(true, |name| candidate.name == name))
+            .map(EnvGroupReport::from)
+            .collect();
+
+        if group.is_some() && groups.is_empty() && !report.groups.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            scope: "Key names loaded by the running config. Values are never reported. Edits to \
+                    zaz.toml or to a source that the daemon has not reloaded or picked up are not \
+                    reflected."
+                .to_string(),
+            project: report.project.clone(),
+            daemon_status: report.status.into(),
+            load_error: report.load_error.as_ref().map(LoadErrorReport::from),
+            refresh_error: report.refresh_error.as_ref().map(LoadErrorReport::from),
+            dropped_inherited: report.dropped_inherited.clone(),
+            groups,
+        })
+    }
+}
+
+impl From<&GroupEnvReport> for EnvGroupReport {
+    fn from(group: &GroupEnvReport) -> Self {
+        Self {
+            name: group.name.clone(),
+            starts_from: group.starts_from.into(),
+            sources: group.sources.iter().map(EnvSourceInfo::from).collect(),
+            tasks: group.tasks.iter().map(EnvProcessReport::from).collect(),
+            services: group.services.iter().map(EnvProcessReport::from).collect(),
+        }
+    }
+}
+
+impl From<&ProcessEnvReport> for EnvProcessReport {
+    fn from(process: &ProcessEnvReport) -> Self {
+        Self {
+            name: process.name.clone(),
+            starts_from: process.starts_from.into(),
+            sources: process.sources.iter().map(EnvSourceInfo::from).collect(),
+        }
+    }
+}
+
+impl From<&EnvSourceReport> for EnvSourceInfo {
+    fn from(source: &EnvSourceReport) -> Self {
+        Self {
+            level: match source.level {
+                EnvLevel::Settings => EnvLevelReport::Settings,
+                EnvLevel::Group => EnvLevelReport::Group,
+                EnvLevel::Task => EnvLevelReport::Task,
+                EnvLevel::Service => EnvLevelReport::Service,
+            },
+            field: source.field.clone(),
+            kind: match source.kind {
+                EnvSourceKind::File => EnvSourceKindReport::File,
+                EnvSourceKind::Command => EnvSourceKindReport::Command,
+                EnvSourceKind::Inline => EnvSourceKindReport::Inline,
+            },
+            origin: source.origin.clone(),
+            set: source.set.clone(),
+            unset: source.unset.clone(),
+            produced_no_keys: source.produced_no_keys,
+        }
+    }
+}
+
+impl From<EnvStart> for EnvStartReport {
+    fn from(start: EnvStart) -> Self {
+        match start {
+            EnvStart::Daemon => Self::Daemon,
+            EnvStart::Base => Self::Base,
         }
     }
 }
