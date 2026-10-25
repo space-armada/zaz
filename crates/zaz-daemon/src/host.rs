@@ -207,15 +207,20 @@ impl DaemonHost {
             _ => return,
         };
 
-        // A failed full run is dropped with its nodes, since the running config is still the one
-        // the kept nodes belong to. A partial run edits the kept nodes in place.
-        if let (Some(fresh), Ok(_)) = (fresh, &outcome.result) {
-            self.cache = fresh;
-        }
-
+        let evaluated = outcome.result.is_ok();
         let response = self
             .apply(outcome.result, &scope, from_watcher, commands)
             .await;
+
+        // A full run's nodes replace the kept ones only once the config they belong to is
+        // running. A failed run, or an apply that fails, drops them. A partial run edits the kept
+        // nodes in place.
+        if let Some(fresh) = fresh {
+            if evaluated && !matches!(response, ApiResponse::Error { .. }) {
+                self.cache = fresh;
+            }
+        }
+
         self.release_held_when_idle(commands).await;
         self.in_flight = None;
 
@@ -1251,20 +1256,24 @@ mod tests {
         let outcome = fixture.outcomes.recv().await.unwrap();
 
         let (commands_tx, mut commands) = mpsc::channel(8);
-        let begun = std::time::Instant::now();
-        let ((), (_, reply)) = tokio::join!(
-            fixture.host.finish_run(outcome, &mut commands),
-            probe(
-                &commands_tx,
-                Duration::from_millis(300),
-                ApiRequest::Shutdown
-            ),
-        );
+        // Building the engine runs synchronously on the first poll and can take seconds on a busy
+        // machine. The bound starts when the shutdown is sent, so it measures only the wait.
+        let (sent, reply) = {
+            let probe = async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let sent = std::time::Instant::now();
+                let (_, reply) = probe(&commands_tx, Duration::ZERO, ApiRequest::Shutdown).await;
+                (sent, reply)
+            };
+            let ((), probed) = tokio::join!(fixture.host.finish_run(outcome, &mut commands), probe);
+            probed
+        };
+        let waited = sent.elapsed();
 
         assert_eq!(message(&reply), "shutting down");
         assert!(
-            begun.elapsed() < Duration::from_millis(2500),
-            "the wait should end early"
+            waited < Duration::from_millis(2500),
+            "the wait should end early, took {waited:?}"
         );
         assert!(fixture.host.is_loaded());
 

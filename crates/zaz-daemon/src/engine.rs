@@ -1626,20 +1626,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Process file change events.
-    ///
-    /// All tasks run in parallel. Same task cannot run concurrently - it gets queued.
-    pub async fn handle_changes(&mut self, events: Vec<FileEvent>) -> Result<(), DaemonError> {
-        if events.is_empty() {
-            return Ok(());
-        }
-
-        let affected_groups = self.groups_matching(&events);
-        self.run_changes(events, affected_groups).await;
-
-        Ok(())
-    }
-
     /// The groups whose patterns match any of the events.
     fn groups_matching(&self, events: &[FileEvent]) -> Vec<String> {
         let mut affected_groups = Vec::new();
@@ -1757,15 +1743,19 @@ impl Engine {
         }
     }
 
+    /// The groups that have a file-change batch waiting for a refresh.
+    fn held_groups(&self) -> HashSet<String> {
+        self.held
+            .iter()
+            .flat_map(|batch| batch.groups.iter().cloned())
+            .collect()
+    }
+
     /// Apply the environment a refresh evaluated, rebuilding only the groups it changed.
     ///
     /// The held batches keep waiting. The host releases them once no refresh is queued.
     pub(crate) async fn apply_refresh(&mut self, evaluated: EvaluatedEnv) -> ReloadResult {
-        let skip: HashSet<String> = self
-            .held
-            .iter()
-            .flat_map(|batch| batch.groups.iter().cloned())
-            .collect();
+        let skip = self.held_groups();
         let prepared = Prepared {
             config: self.config.clone(),
             evaluated,
@@ -2862,8 +2852,10 @@ impl Engine {
                 self.resync_sources();
                 self.state.env_refresh_error = None;
 
+                // A group with a held batch is rebuilt once, by that batch, under the file-change
+                // context. Running it here as well would restart its services twice.
                 (
-                    HashSet::new(),
+                    self.held_groups(),
                     format!(
                         "configuration reloaded: {} added, {} removed, {} modified",
                         diff.added.len(),
@@ -5311,7 +5303,7 @@ mod tests {
         let mut engine = create_test_engine(groups);
 
         engine
-            .handle_changes(vec![FileEvent {
+            .route_changes(vec![FileEvent {
                 path: PathBuf::from("changed.test"),
                 kind: zaz_watch::FileEventKind::Modified,
                 source: None,
@@ -6021,6 +6013,31 @@ mod tests {
         assert!(engine.groups.contains_key("keep"));
 
         engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reload_leaves_a_held_group_to_its_held_batch() {
+        let mut engine = create_test_engine(vec![
+            test_group_with_command("held", &["t"], "echo old"),
+            test_group_with_command("free", &["t"], "echo old"),
+        ]);
+        engine.hold_batch_for_test("held");
+        let evaluated = engine.evaluated.clone();
+
+        let result = engine
+            .apply_prepared(Prepared {
+                config: test_config(vec![
+                    test_group_with_command("held", &["t"], "echo new"),
+                    test_group_with_command("free", &["t"], "echo new"),
+                ]),
+                evaluated,
+            })
+            .await;
+
+        assert!(matches!(result, ReloadResult::Success { .. }), "{result:?}");
+        assert!(engine.suppress_task_completion_cascade.contains("free"));
+        assert!(!engine.suppress_task_completion_cascade.contains("held"));
+        assert_eq!(engine.held_count(), 1);
     }
 
     #[tokio::test]

@@ -208,6 +208,7 @@ pub(crate) fn prepare_detached<F>(
 
 /// Run [`prepare_scoped`] on its own thread and deliver the result to `done`.
 ///
+/// `scope` and `config` select a full or a partial run.
 pub(crate) fn prepare_scoped_detached<F>(
     config_path: PathBuf,
     read_deadline: Duration,
