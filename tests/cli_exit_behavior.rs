@@ -8,7 +8,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use support::{run_zaz, stderr_string, stdout_string, zaz_bin, StartedDaemon};
+use support::{
+    run_zaz, stderr_string, stdout_string, wait_for_socket_gone, zaz_bin, StartedDaemon,
+};
 use tempfile::TempDir;
 use zaz_daemon::{ApiRequest, ApiResponse};
 
@@ -67,6 +69,46 @@ fn task_returns_zero_when_all_tasks_succeed() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+// Each case runs a `pwd` task so the assertion covers the default working directory and not only
+// the watcher setup.
+#[test]
+fn task_resolves_relative_config_paths_against_the_current_directory() {
+    let temp = TempDir::new().unwrap();
+    let nested = temp.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let config_path = nested.join("zaz.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[[group]]
+name = "tasks"
+
+[[group.task]]
+name = "where"
+command = "pwd"
+"#,
+    )
+    .unwrap();
+
+    let cases = [
+        ("bare filename", nested.as_path(), "zaz.toml"),
+        ("dot-relative", nested.as_path(), "./zaz.toml"),
+        ("other directory", temp.path(), "nested/zaz.toml"),
+    ];
+
+    for (name, current_dir, config) in cases {
+        let output = run_zaz(current_dir, &["--config", config, "task"]);
+        let stdout = stdout_string(&output);
+        let stderr = stderr_string(&output);
+
+        assert_eq!(output.status.code(), Some(0), "{name}: stderr: {stderr}");
+        assert!(
+            stdout.contains("/nested"),
+            "{name}: task did not run in the config directory: {stdout}"
+        );
+    }
+}
+
 #[test]
 fn task_returns_nonzero_when_any_task_fails() {
     let temp = TempDir::new().unwrap();
@@ -105,7 +147,9 @@ fn wait_for_daemon(current_dir: &Path, socket_path: &Path) {
 
     while Instant::now() < deadline {
         let output = run_zaz(current_dir, &["--socket", socket, "status"]);
-        if output.status.code() == Some(0) && stdout_string(&output).contains("Daemon Status:") {
+        if output.status.code() == Some(0)
+            && stdout_string(&output).contains("Daemon Status: Running")
+        {
             return;
         }
         thread::sleep(Duration::from_millis(50));
@@ -349,6 +393,50 @@ command = ""
 }
 
 #[test]
+fn check_json_reports_unknown_keys_with_line_and_column() {
+    let temp = TempDir::new().unwrap();
+    let config_path = temp.path().join("zaz.toml");
+
+    std::fs::write(
+        &config_path,
+        r#"[settings]
+shel = "bash"
+
+[[group]]
+name = "backend"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "build"
+comand = "cargo build"
+command = "cargo build"
+"#,
+    )
+    .unwrap();
+
+    let config = config_path.to_str().unwrap();
+    let output = run_zaz(temp.path(), &["check", "--json", config]);
+    let payload: Value =
+        serde_json::from_str(&stdout_string(&output)).expect("stdout should be valid json");
+
+    assert!(!output.status.success());
+    assert_eq!(payload["valid"], false);
+
+    let errors = payload["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2);
+
+    assert_eq!(errors[0]["code"], "unknown_key");
+    assert_eq!(errors[0]["line"], 2);
+    assert_eq!(errors[0]["column"], 1);
+    assert_eq!(errors[0]["hint"], "did you mean 'shell'?");
+
+    assert_eq!(errors[1]["code"], "unknown_key");
+    assert_eq!(errors[1]["line"], 10);
+    assert_eq!(errors[1]["column"], 1);
+    assert_eq!(errors[1]["hint"], "did you mean 'command'?");
+}
+
+#[test]
 fn restart_returns_nonzero_on_unexpected_response() {
     let temp = TempDir::new().unwrap();
     let socket_path = temp.path().join("daemon.sock");
@@ -526,7 +614,7 @@ fn start_then_status_reports_running() {
     let stdout = stdout_string(&output);
 
     assert_eq!(output.status.code(), Some(0), "stdout: {stdout}");
-    assert!(stdout.contains("Daemon Status:"));
+    assert!(stdout.contains("Daemon Status: Running"));
     assert!(stdout.contains("backend"));
 }
 
@@ -693,7 +781,7 @@ command = "true"
 }
 
 #[test]
-fn start_reports_crash_when_config_is_invalid() {
+fn start_prints_the_coded_error_and_stops_the_daemon_when_config_is_invalid() {
     let temp = TempDir::new().unwrap();
     let config_path = temp.path().join("zaz.toml");
     std::fs::write(
@@ -724,8 +812,12 @@ patterns = ["**/*.rs"
 
     assert!(!output.status.success());
     assert!(
-        stderr.contains("daemon exited before becoming ready"),
-        "expected crash-detection message, got: {stderr}"
+        stderr.contains("daemon failed to load its configuration [parse_error]"),
+        "expected the coded load error, got: {stderr}"
+    );
+    assert!(
+        wait_for_socket_gone(&socket_path, Duration::from_secs(5)),
+        "a daemon whose first load failed should be shut down"
     );
 }
 

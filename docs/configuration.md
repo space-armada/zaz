@@ -30,8 +30,9 @@ subcommand agrees on both the config and the daemon it addresses. See
 
 ## Schema validation policy
 
-Project config uses `deny_unknown_fields` on every struct: unknown keys
-are rejected with a clear error. There is no `version` field; schema
+Project config rejects unknown keys at every level, in TOML and JSON. Each
+unknown key is a validation error with a did-you-mean hint, and TOML errors
+carry a line and column. There is no `version` field; schema
 evolution is backwards-compatible by policy. See the schema-evolution
 rationale in `docs/architecture.md`.
 

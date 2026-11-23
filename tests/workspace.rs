@@ -164,7 +164,7 @@ impl Workspace {
     fn status_running(&self, socket: &Path) -> bool {
         let out = self.status(socket);
         out.status.code() == Some(0)
-            && String::from_utf8_lossy(&out.stdout).contains("Daemon Status:")
+            && String::from_utf8_lossy(&out.stdout).contains("Daemon Status: Running")
     }
 
     fn wait_running(&self, socket: &Path, timeout: Duration) -> bool {
@@ -246,8 +246,8 @@ command = "sleep 600"
     )
 }
 
-/// A config that fails validation (`deny_unknown_fields`), so attaching its
-/// member must fail.
+/// A config that fails to load because `bogus_field` is an unknown key, so attaching its member
+/// must fail.
 fn invalid_config() -> &'static str {
     r#"
 [[group]]
@@ -354,11 +354,17 @@ fn workspace_refuses_member_socket_bound_elsewhere() {
     assert!(ws.wait_running(&a_sock, Duration::from_secs(10)));
     let a_inode_before = std::fs::metadata(&a_sock).expect("a socket metadata").ino();
 
+    // The refused member is a failed member, so the start names it and fails, and the supervisor
+    // and member b keep running.
     let out = ws.start_workspace(&[&a, &b]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        out.status.success(),
-        "supervisor should still come up: {}",
-        String::from_utf8_lossy(&out.stderr)
+        !out.status.success(),
+        "start should name the refused member"
+    );
+    assert!(
+        stderr.contains("refusing to double-manage"),
+        "start should explain the refusal: {stderr}"
     );
     assert!(
         ws.wait_running(&ws.ws_socket, Duration::from_secs(10)),
@@ -433,12 +439,27 @@ fn workspace_attach_failure_leaves_running_set_undisturbed() {
     let good_sock = ws.member_socket(&good);
     let bad_sock = ws.member_socket(&bad);
 
-    let out = ws.start_workspace(&[&good, &bad]);
-    assert!(
-        out.status.success(),
-        "supervisor should still come up: {}",
-        String::from_utf8_lossy(&out.stderr)
+    let check = ws.run_in(
+        bad.parent().unwrap(),
+        &[OsStr::new("check"), bad.as_os_str()],
     );
+    assert!(!check.status.success(), "invalid member should fail check");
+    assert!(
+        String::from_utf8_lossy(&check.stderr).contains("unknown key 'bogus_field'"),
+        "invalid member should fail on its unknown key: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // The member with the bad config is launched anyway, under a provisional token. Its daemon
+    // reports the load error, so the start names it and fails, and leaves the rest running.
+    let out = ws.start_workspace(&[&good, &bad]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "start should fail naming the member");
+    assert!(
+        stderr.contains("member bad:"),
+        "start should name the failed member: {stderr}"
+    );
+    assert!(stderr.contains("unknown_key"), "{stderr}");
 
     assert!(
         ws.wait_running(&ws.ws_socket, Duration::from_secs(10)),
@@ -450,7 +471,13 @@ fn workspace_attach_failure_leaves_running_set_undisturbed() {
     );
     assert!(
         !ws.status_running(&bad_sock),
-        "invalid member should not have a daemon"
+        "invalid member should not be running"
+    );
+
+    let member_status = ws.status(&bad_sock);
+    assert!(
+        String::from_utf8_lossy(&member_status.stdout).contains("Daemon Status: Starting"),
+        "the invalid member's own daemon should report its failed first load"
     );
 
     cleanup(&ws, &[&ws.ws_socket, &good_sock, &bad_sock]);
@@ -872,11 +899,13 @@ fn workspace_duplicate_token_aborts_startup() {
     let out = ws.start_workspace(&[&a, &b]);
     assert!(
         !out.status.success(),
-        "duplicate project token should abort startup"
+        "duplicate project token should abort startup: stdout: {}\nstderr: {}",
+        stdout_of(&out),
+        stderr_of(&out)
     );
 
-    // The supervisor never binds its control socket, and the children it spawned
-    // during the boot loop are torn down rather than orphaned.
+    // The supervisor exits without serving, and the children it spawned during
+    // the boot loop are torn down rather than orphaned.
     assert!(
         !ws.status_running(&ws.ws_socket),
         "supervisor should not be running after a collision abort"
@@ -891,4 +920,300 @@ fn workspace_duplicate_token_aborts_startup() {
     );
 
     cleanup(&ws, &[&ws.ws_socket, &a_sock, &b_sock]);
+}
+
+/// A long-running member that names its token and loads `slow.env` from its own directory.
+fn env_file_config(name: &str) -> String {
+    format!(
+        r#"
+[settings]
+name = "{name}"
+
+[[group]]
+name = "g"
+patterns = []
+env_file = "slow.env"
+
+[[group.daemon]]
+name = "d"
+command = "sleep 600"
+"#
+    )
+}
+
+fn make_fifo(path: &Path) {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo is required for these tests");
+}
+
+/// Let a load blocked on the pipe at `path` read `text`.
+fn feed_fifo(path: &Path, text: &'static str) {
+    let path = path.to_path_buf();
+
+    thread::spawn(move || {
+        let _ = std::fs::write(path, text);
+    });
+}
+
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn workspace_provisional_member_that_collides_with_a_healthy_one_is_failed() {
+    let ws = Workspace::new();
+    let healthy = ws.member("a", &named_config("dup"));
+    // The directory name is the broken member's provisional token.
+    let broken = ws.member("nested/dup", invalid_config());
+    let healthy_sock = ws.member_socket(&healthy);
+    let broken_sock = ws.member_socket(&broken);
+
+    let out = ws.start_workspace(&[&healthy, &broken]);
+    let stderr = stderr_of(&out);
+    assert!(
+        !out.status.success(),
+        "start should fail naming the failed member"
+    );
+    assert!(stderr.contains("workspace_token_collision"), "{stderr}");
+    assert!(stderr.contains("nested/dup/zaz.toml"), "{stderr}");
+    assert!(stderr.contains("a/zaz.toml"), "{stderr}");
+
+    // Boot never aborts, and the healthy member keeps running and routing.
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&healthy_sock, Duration::from_secs(10)));
+
+    let status = stdout_of(&ws.status(&ws.ws_socket));
+    assert!(status.contains("dup/g"), "{status}");
+    assert!(
+        status.contains("nested/dup/zaz.toml (Failed)"),
+        "the failed member shows under its config path: {status}"
+    );
+    assert!(status.contains("Member error:"), "{status}");
+
+    let restart = ws.restart(&ws.ws_socket, Some("dup/g"));
+    assert!(
+        restart.status.success(),
+        "routing to the healthy member is unaffected: {}",
+        stderr_of(&restart)
+    );
+
+    // The failed member's daemon is left up, reporting its own load error, for a fix.
+    let member_status = stdout_of(&ws.status(&broken_sock));
+    assert!(member_status.contains("Load error:"), "{member_status}");
+
+    cleanup(&ws, &[&ws.ws_socket, &healthy_sock, &broken_sock]);
+}
+
+#[test]
+fn workspace_re_resolve_collision_then_rename_and_reload_brings_the_member_back() {
+    let ws = Workspace::new();
+    let good = ws.member("a", &named_config("good"));
+    let moving = ws.member("m", invalid_config());
+    let good_sock = ws.member_socket(&good);
+    let moving_sock = ws.member_socket(&moving);
+
+    // The member starts with a config that does not parse, under its provisional token "m".
+    let out = ws.start_workspace(&[&good, &moving]);
+    assert!(
+        !out.status.success(),
+        "the unparseable member fails the start"
+    );
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+
+    // Its config now loads, but names a token another member holds.
+    std::fs::write(&moving, named_config("good")).unwrap();
+    let reload = ws.reload(&ws.ws_socket);
+    assert!(!reload.status.success(), "the collision fails the reload");
+    assert!(
+        stderr_of(&reload).contains("workspace_token_collision"),
+        "{}",
+        stderr_of(&reload)
+    );
+
+    // A member that failed at re-resolve has already loaded, so its daemon is shut down.
+    assert!(
+        ws.wait_socket_gone(&moving_sock, Duration::from_secs(10)),
+        "the failed member's daemon should be shut down"
+    );
+    let status = stdout_of(&ws.status(&ws.ws_socket));
+    assert!(status.contains("good/g"), "{status}");
+    assert!(status.contains("m/zaz.toml (Failed)"), "{status}");
+
+    // Rename it and reload. The workspace reload attaches it again and re-resolves its token.
+    std::fs::write(&moving, named_config("renamed")).unwrap();
+    let reload = ws.reload(&ws.ws_socket);
+    assert!(
+        reload.status.success(),
+        "the rename should bring the member back: {}",
+        stderr_of(&reload)
+    );
+    assert!(ws.wait_running(&moving_sock, Duration::from_secs(10)));
+
+    let status = stdout_of(&ws.status(&ws.ws_socket));
+    assert!(status.contains("renamed/g"), "{status}");
+    assert!(status.contains("good/g"), "{status}");
+    assert!(!status.contains("Member error:"), "{status}");
+
+    cleanup(&ws, &[&ws.ws_socket, &good_sock, &moving_sock]);
+}
+
+#[test]
+fn workspace_adopted_member_that_loses_its_token_recovers_after_a_rename_and_reload() {
+    let ws = Workspace::new();
+    let good = ws.member("a", &named_config("good"));
+    let adopted = ws.member("m", invalid_config());
+    let good_sock = ws.member_socket(&good);
+    let adopted_sock = ws.member_socket(&adopted);
+
+    // A daemon the user started, with a config that does not parse. The supervisor adopts it.
+    let mut daemon = Command::new(zaz_bin())
+        .arg("-c")
+        .arg(&adopted)
+        .arg("--socket")
+        .arg(&adopted_sock)
+        .args(["daemon", "--quiet"])
+        .current_dir(&ws.root)
+        .env("HOME", &ws.home)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn zaz daemon");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !String::from_utf8_lossy(&ws.status(&adopted_sock).stdout).contains("Load error:") {
+        assert!(
+            Instant::now() < deadline,
+            "the member daemon never reported"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let out = ws.start_workspace(&[&good, &adopted]);
+    assert!(
+        !out.status.success(),
+        "the unparseable member fails the start"
+    );
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+
+    // Its config now loads, but names a token another member holds.
+    std::fs::write(&adopted, named_config("good")).unwrap();
+    let reload = ws.reload(&ws.ws_socket);
+    assert!(!reload.status.success(), "the collision fails the reload");
+    assert!(stderr_of(&reload).contains("workspace_token_collision"));
+
+    // The supervisor did not start this daemon, so it stays up and the member stays failed.
+    assert!(
+        ws.status_running(&adopted_sock),
+        "an adopted daemon is never shut down"
+    );
+    let status = stdout_of(&ws.status(&ws.ws_socket));
+    assert!(status.contains("m/zaz.toml (Failed)"), "{status}");
+
+    // A rename and a workspace reload put it back, though it is neither provisional nor down.
+    std::fs::write(&adopted, named_config("renamed")).unwrap();
+    let reload = ws.reload(&ws.ws_socket);
+    assert!(
+        reload.status.success(),
+        "the rename should bring the adopted member back: {}",
+        stderr_of(&reload)
+    );
+
+    let status = stdout_of(&ws.status(&ws.ws_socket));
+    assert!(status.contains("renamed/g"), "{status}");
+    assert!(!status.contains("Member error:"), "{status}");
+
+    cleanup(&ws, &[&ws.ws_socket, &good_sock, &adopted_sock]);
+    let _ = daemon.wait();
+}
+
+#[test]
+fn workspace_start_waits_on_a_slow_member_and_follows_the_start_rule() {
+    let ws = Workspace::new();
+    let fast = ws.member("fast", &named_config("fast"));
+    let slow = ws.member("slow", &env_file_config("slow"));
+    let fast_sock = ws.member_socket(&fast);
+    let slow_sock = ws.member_socket(&slow);
+    let pipe = slow.parent().unwrap().join("slow.env");
+    make_fifo(&pipe);
+
+    let mut start = Command::new(zaz_bin());
+    for member in [&fast, &slow] {
+        start.arg("-c").arg(member);
+    }
+    let start = start
+        .arg("--socket")
+        .arg(&ws.ws_socket)
+        .arg("start")
+        .current_dir(&ws.root)
+        .env("HOME", &ws.home)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn zaz start");
+
+    // The aggregate answers `Starting` for as long as the slow member evaluates.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let starting = loop {
+        let status = stdout_of(&ws.status(&ws.ws_socket));
+        if status.contains("Daemon Status: Starting") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "never saw Starting: {status}");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!starting.contains("Member error:"), "{starting}");
+    thread::sleep(Duration::from_millis(1500));
+
+    feed_fifo(&pipe, "A=1\n");
+    let output = start.wait_with_output().expect("wait for zaz start");
+    assert!(
+        output.status.success(),
+        "start should succeed once the member settles: {}",
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("workspace supervisor started"));
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+
+    cleanup(&ws, &[&ws.ws_socket, &fast_sock, &slow_sock]);
+}
+
+#[test]
+fn workspace_member_whose_source_fails_is_named_and_recovers_on_reload() {
+    let ws = Workspace::new();
+    let healthy = ws.member("healthy", &named_config("healthy"));
+    let failing = ws.member("failing", &env_file_config("failing"));
+    let healthy_sock = ws.member_socket(&healthy);
+    let failing_sock = ws.member_socket(&failing);
+
+    let out = ws.start_workspace(&[&healthy, &failing]);
+    let stderr = stderr_of(&out);
+    assert!(!out.status.success());
+    assert!(stderr.contains("member failing:"), "{stderr}");
+    assert!(stderr.contains("env_file_missing"), "{stderr}");
+
+    // The supervisor and the healthy member are left running.
+    assert!(ws.wait_running(&ws.ws_socket, Duration::from_secs(10)));
+    assert!(ws.wait_running(&healthy_sock, Duration::from_secs(10)));
+
+    // The failed member stays attached, so a workspace reload retries it.
+    std::fs::write(failing.parent().unwrap().join("slow.env"), "A=1\n").unwrap();
+    let reload = ws.reload(&ws.ws_socket);
+    assert!(
+        reload.status.success(),
+        "reload should recover the member: {}",
+        stderr_of(&reload)
+    );
+    assert!(ws.wait_running(&failing_sock, Duration::from_secs(10)));
+
+    let status = stdout_of(&ws.status(&ws.ws_socket));
+    assert!(status.contains("failing/g"), "{status}");
+    assert!(!status.contains("Member error:"), "{status}");
+
+    cleanup(&ws, &[&ws.ws_socket, &healthy_sock, &failing_sock]);
 }

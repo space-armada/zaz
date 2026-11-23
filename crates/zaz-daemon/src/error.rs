@@ -1,5 +1,6 @@
 //! Error types for the daemon.
 
+use crate::state::LoadError;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -11,8 +12,20 @@ pub enum DaemonError {
     Bind(#[from] std::io::Error),
 
     /// Configuration error.
-    #[error("configuration error: {0}")]
+    #[error("configuration error: {}", format_config_error(.0))]
     Config(#[from] zaz_config::ConfigError),
+
+    /// One or more `env_file`s could not be loaded.
+    #[error("{}", format_env_file_errors(.0))]
+    EnvFile(Vec<zaz_config::EnvFileError>),
+
+    /// The thread that loads and evaluates a config panicked.
+    #[error("loading the config panicked")]
+    EvaluationPanicked,
+
+    /// The thread that loads and evaluates a config could not start.
+    #[error("could not start the thread that loads the config: {0}")]
+    EvaluationThread(std::io::Error),
 
     /// Watch error.
     #[error("watch error: {0}")]
@@ -55,6 +68,24 @@ pub enum DaemonError {
     LogStorage(#[from] LogStorageError),
 }
 
+/// A validation failure with one line per error, each ending in its code. Any other config error
+/// keeps its own message.
+fn format_config_error(error: &zaz_config::ConfigError) -> String {
+    match error {
+        zaz_config::ConfigError::Validation(errors) => errors.display_with_codes(),
+        other => other.to_string(),
+    }
+}
+
+/// One line per error, each ending in its code.
+fn format_env_file_errors(errors: &[zaz_config::EnvFileError]) -> String {
+    errors
+        .iter()
+        .map(|e| format!("{e} [{}]", e.code()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Errors that can occur in a log storage backend.
 ///
 /// The in-memory backend currently never returns these, but every variant maps
@@ -88,16 +119,45 @@ pub enum LogStorageError {
 }
 
 impl DaemonError {
+    /// A stable code for the failure. A load failure reports the code of its first error.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::EnvFile(errors) => errors.first().map_or("env_file_error", |e| e.code()),
+            Self::Config(error) => error.code(),
+            Self::EvaluationPanicked => "evaluation_panicked",
+            Self::EvaluationThread(_) => "evaluation_unavailable",
+            Self::CyclicDependency(_) => "dependency_cycle",
+            Self::Watch(_) => "watch_error",
+            Self::LogStorage(_) => "log_storage_error",
+            _ => "load_failed",
+        }
+    }
+
+    /// This failure in the form a daemon reports as its `load_error`.
+    pub fn to_load_error(&self) -> LoadError {
+        let error = LoadError::new(self.code(), self.to_string());
+
+        match self.hint() {
+            Some(hint) => error.with_hint(hint),
+            None => error,
+        }
+    }
+
     /// Recovery suggestion for variants where a concrete next step exists.
     /// Returns `None` for terminal errors with no actionable recovery.
-    pub fn hint(&self) -> Option<&'static str> {
+    pub fn hint(&self) -> Option<String> {
         match self {
-            Self::SocketResolution { .. } => {
-                Some("run this command from a zaz project directory or pass --socket <PATH>")
+            Self::EnvFile(errors) => errors.first().and_then(|e| e.hint()).map(str::to_string),
+            Self::Config(zaz_config::ConfigError::Validation(errors)) => {
+                errors.iter().next().and_then(|e| e.hint.clone())
             }
-            Self::WorkspaceSocketResolution { .. } => {
-                Some("create a .zaz/ workspace root above your configs or pass --socket <PATH>")
-            }
+            Self::SocketResolution { .. } => Some(
+                "run this command from a zaz project directory or pass --socket <PATH>".to_string(),
+            ),
+            Self::WorkspaceSocketResolution { .. } => Some(
+                "create a .zaz/ workspace root above your configs or pass --socket <PATH>"
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -125,7 +185,7 @@ mod tests {
             start_dir: PathBuf::from("/tmp/outside"),
         };
         assert_eq!(
-            err.hint(),
+            err.hint().as_deref(),
             Some("run this command from a zaz project directory or pass --socket <PATH>")
         );
     }
@@ -148,9 +208,52 @@ mod tests {
             start_dir: PathBuf::from("/tmp/outside"),
         };
         assert_eq!(
-            err.hint(),
+            err.hint().as_deref(),
             Some("create a .zaz/ workspace root above your configs or pass --socket <PATH>")
         );
+    }
+
+    #[test]
+    fn a_validation_failure_carries_a_code_on_every_line_and_the_first_hint() {
+        let toml =
+            "[[group]]\nname = \"api\"\npatterns = [\"*\"]\nenv_flie = \".env\"\nbogus = 1\n";
+        let error = DaemonError::from(zaz_config::parse_toml(toml).unwrap_err());
+
+        let message = error.to_string();
+        assert_eq!(message.matches("[unknown_key]").count(), 2, "{message}");
+        assert_eq!(error.code(), "unknown_key");
+        assert_eq!(error.hint().as_deref(), Some("did you mean 'env_file'?"));
+        assert_eq!(
+            error.to_load_error().hint.as_deref(),
+            Some("did you mean 'env_file'?")
+        );
+    }
+
+    #[test]
+    fn a_non_validation_config_failure_uses_the_shared_code() {
+        let error = DaemonError::from(zaz_config::parse_toml("invalid = [").unwrap_err());
+
+        assert_eq!(error.code(), "parse_error");
+    }
+
+    #[test]
+    fn an_env_file_read_timeout_names_the_field_and_path_and_hints_at_pipes() {
+        let error = DaemonError::EnvFile(vec![zaz_config::EnvFileError {
+            config: PathBuf::from("/p/zaz.toml"),
+            field: "settings env_file".to_string(),
+            path: PathBuf::from("/p/slow.env"),
+            kind: zaz_config::EnvFileErrorKind::Timeout {
+                limit: std::time::Duration::from_secs(120),
+            },
+        }]);
+
+        assert_eq!(error.code(), "env_file_read_timeout");
+
+        let text = error.to_string();
+        assert!(text.contains("settings env_file"), "{text}");
+        assert!(text.contains("/p/slow.env"), "{text}");
+        assert!(text.contains("did not finish within 120s"), "{text}");
+        assert!(error.hint().unwrap().contains("named pipe"));
     }
 
     #[test]

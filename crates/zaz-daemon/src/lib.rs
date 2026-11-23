@@ -5,7 +5,10 @@
 mod api;
 mod dependency;
 mod engine;
+mod env;
 mod error;
+mod evaluate;
+mod host;
 mod log_layer;
 mod log_storage;
 mod log_storage_sqlite;
@@ -18,11 +21,15 @@ mod target;
 pub use api::{ApiRequest, ApiResponse, EngineCommand, LogLine, LogSource, OutputKind};
 pub use engine::Engine;
 pub use error::{DaemonError, LogStorageError};
+pub use host::{DaemonHost, RunOutcome};
 pub use log_layer::DaemonLogLayer;
 pub use log_storage::{LogQuery, LogQueryResult, LogStorage, LogStorageStats};
 pub use server::{
     discover_config_upward, discover_workspace_root_upward, resolve_target,
     resolve_workspace_socket, socket_path_for_config, Client, Server,
 };
-pub use state::{DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus};
+pub use state::{
+    DaemonState, DaemonStatus, GroupState, GroupStatus, LoadError, MemberError, ProcessState,
+    ProcessStatus,
+};
 pub use target::{ConfigOrigin, DaemonTarget};

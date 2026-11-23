@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+use zaz_daemon::{DaemonState, DaemonStatus};
 
 /// Draw the main UI.
 ///
@@ -24,6 +25,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Delegate to the active style's renderer
     let renderer = get_renderer(app.style);
     renderer.draw(frame, app);
+
+    // The default state reads as starting, so only a daemon that has actually reported gets one.
+    if app.is_connected() {
+        if let Some(banner) = daemon_banner(&app.state) {
+            draw_daemon_banner(frame, &banner);
+        }
+    }
 
     // Draw input overlay if in input mode
     match app.input_mode {
@@ -37,6 +45,68 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         crate::help::draw_help(frame);
     }
+}
+
+/// A line the TUI shows while the daemon has not finished loading its config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonBanner {
+    pub text: String,
+    pub is_error: bool,
+}
+
+/// The banner for a daemon that is still starting, or whose first load failed.
+///
+/// A daemon that is running, or one that is shutting down, needs none.
+pub fn daemon_banner(state: &DaemonState) -> Option<DaemonBanner> {
+    if let Some(error) = &state.load_error {
+        let first_line = error.message.lines().next().unwrap_or_default();
+
+        return Some(DaemonBanner {
+            text: format!(
+                "Config failed to load [{}]: {} Fix it and run `zaz reload`.",
+                error.code, first_line
+            ),
+            is_error: true,
+        });
+    }
+
+    if state.status == DaemonStatus::Starting {
+        return Some(DaemonBanner {
+            text: "Daemon is loading its configuration...".to_string(),
+            is_error: false,
+        });
+    }
+
+    None
+}
+
+/// Draw the daemon banner on the bottom row.
+fn draw_daemon_banner(frame: &mut Frame, banner: &DaemonBanner) {
+    let area = frame.area();
+    if area.height == 0 {
+        return;
+    }
+
+    let row = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+    let color = if banner.is_error {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+
+    frame.render_widget(Clear, row);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            banner.text.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )),
+        row,
+    );
 }
 
 /// Draw the input overlay for filter/search mode.
@@ -109,4 +179,46 @@ fn draw_quit_prompt(frame: &mut Frame) {
     ]);
 
     frame.render_widget(paragraph, text_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zaz_daemon::LoadError;
+
+    #[test]
+    fn a_starting_daemon_gets_a_progress_banner() {
+        let banner = daemon_banner(&DaemonState::default()).expect("starting shows a banner");
+
+        assert!(!banner.is_error);
+        assert!(banner.text.contains("loading"));
+    }
+
+    #[test]
+    fn a_failed_first_load_gets_an_error_banner_with_the_code_and_the_next_step() {
+        let state = DaemonState {
+            load_error: Some(LoadError::new(
+                "env_file_missing",
+                "env_file not found [env_file_missing]\nsecond line",
+            )),
+            ..Default::default()
+        };
+
+        let banner = daemon_banner(&state).expect("a load error shows a banner");
+
+        assert!(banner.is_error);
+        assert!(banner.text.contains("env_file_missing"));
+        assert!(banner.text.contains("zaz reload"));
+        assert!(!banner.text.contains("second line"));
+    }
+
+    #[test]
+    fn a_running_daemon_needs_no_banner() {
+        let state = DaemonState {
+            status: DaemonStatus::Running,
+            ..Default::default()
+        };
+
+        assert_eq!(daemon_banner(&state), None);
+    }
 }

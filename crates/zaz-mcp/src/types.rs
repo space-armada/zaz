@@ -12,7 +12,7 @@ use zaz_config::{
     Config, Group, LogFormat, ServiceCommand, Settings, Signal, Silence, TaskCommand,
 };
 use zaz_daemon::{
-    DaemonState, DaemonStatus, GroupState, GroupStatus, LogLine, LogSource, OutputKind,
+    DaemonState, DaemonStatus, GroupState, GroupStatus, LoadError, LogLine, LogSource, OutputKind,
     ProcessState, ProcessStatus,
 };
 
@@ -27,6 +27,33 @@ pub struct StatusReport {
     pub last_change_ms: Option<u64>,
     /// All configured groups in declaration order.
     pub groups: Vec<GroupReport>,
+    /// Why the daemon's first load failed, when it did. The daemon is `starting` with nothing
+    /// built until the config is fixed and reloaded. A later reload failure never sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<LoadErrorReport>,
+    /// Errors per workspace member, reported by a workspace supervisor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_errors: Vec<MemberErrorReport>,
+}
+
+/// A coded failure to load a config.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LoadErrorReport {
+    /// Stable machine-readable code of the first error.
+    pub code: String,
+    /// Every error, one per line, each ending in its code.
+    pub message: String,
+    /// What to do next, when the first error carries a hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// The error of one workspace member.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemberErrorReport {
+    /// The member's project token, or its config path when it has none.
+    pub member: String,
+    pub error: LoadErrorReport,
 }
 
 /// Daemon lifecycle state.
@@ -227,6 +254,8 @@ pub struct ConfigSettings {
     pub shell: Option<String>,
     pub debounce_ms: u64,
     pub log_format: LogFormatReport,
+    /// The `env_file` path as written. Loaded values are never shown.
+    pub env_file: Option<String>,
 }
 
 /// Log output format.
@@ -246,6 +275,7 @@ pub struct ConfigGroup {
     pub ignore: Vec<String>,
     pub depends_on: Vec<String>,
     pub working_dir: Option<String>,
+    pub env_file: Option<String>,
     pub env: BTreeMap<String, String>,
     pub tasks: Vec<ConfigTask>,
     pub services: Vec<ConfigService>,
@@ -259,6 +289,7 @@ pub struct ConfigTask {
     pub on_change_only: bool,
     pub silence: SilenceReport,
     pub working_dir: Option<String>,
+    pub env_file: Option<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -279,6 +310,7 @@ pub struct ConfigService {
     pub stop_timeout_ms: Option<u64>,
     pub ready_poll_interval_ms: Option<u64>,
     pub ready_timeout_ms: Option<u64>,
+    pub env_file: Option<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -312,6 +344,25 @@ impl From<&DaemonState> for StatusReport {
             watched_files: state.watched_files,
             last_change_ms: state.last_change,
             groups: state.groups.values().map(GroupReport::from).collect(),
+            load_error: state.load_error.as_ref().map(LoadErrorReport::from),
+            member_errors: state
+                .member_errors
+                .iter()
+                .map(|m| MemberErrorReport {
+                    member: m.member.clone(),
+                    error: LoadErrorReport::from(&m.error),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<&LoadError> for LoadErrorReport {
+    fn from(error: &LoadError) -> Self {
+        Self {
+            code: error.code.clone(),
+            message: error.message.clone(),
+            hint: error.hint.clone(),
         }
     }
 }
@@ -461,6 +512,7 @@ impl From<&Settings> for ConfigSettings {
             shell: s.shell.clone(),
             debounce_ms: s.debounce_ms(),
             log_format: s.log_format.into(),
+            env_file: s.env_file.clone(),
         }
     }
 }
@@ -483,6 +535,7 @@ impl From<&Group> for ConfigGroup {
             ignore: g.ignore.clone(),
             depends_on: g.depends_on.clone(),
             working_dir: g.working_dir.clone(),
+            env_file: g.env_file.clone(),
             env: g.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             tasks: g.tasks.iter().map(ConfigTask::from).collect(),
             services: g.services.iter().map(ConfigService::from).collect(),
@@ -498,6 +551,7 @@ impl From<&TaskCommand> for ConfigTask {
             on_change_only: t.on_change_only,
             silence: t.silence.into(),
             working_dir: t.working_dir.clone(),
+            env_file: t.env_file.clone(),
             env: t.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
@@ -516,6 +570,7 @@ impl From<&ServiceCommand> for ConfigService {
             no_pty: d.no_pty,
             silence: d.silence.into(),
             working_dir: d.working_dir.clone(),
+            env_file: d.env_file.clone(),
             delay_ms: d.delay_ms(),
             stop_timeout_ms: d.stop_timeout_ms(),
             ready_poll_interval_ms: d.ready_poll_interval_ms(),
@@ -556,6 +611,7 @@ mod tests {
     use indexmap::IndexMap;
     use std::path::PathBuf;
     use zaz_config::TaskCommand;
+    use zaz_daemon::MemberError;
 
     fn sample_state() -> DaemonState {
         let mut groups = IndexMap::new();
@@ -585,7 +641,57 @@ mod tests {
             groups,
             watched_files: 17,
             last_change: Some(1_700_000_000_000),
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn status_report_carries_the_load_error_of_a_starting_daemon() {
+        let state = DaemonState {
+            status: DaemonStatus::Starting,
+            load_error: Some(
+                LoadError::new("env_file_missing", "no such file").with_hint("create it"),
+            ),
+            ..Default::default()
+        };
+
+        let report = StatusReport::from(&state);
+
+        assert!(matches!(report.daemon_status, DaemonStatusReport::Starting));
+        let error = report.load_error.expect("the load error is reported");
+        assert_eq!(error.code, "env_file_missing");
+        assert_eq!(error.hint.as_deref(), Some("create it"));
+        assert!(report.member_errors.is_empty());
+    }
+
+    #[test]
+    fn status_report_carries_member_errors() {
+        let state = DaemonState {
+            member_errors: vec![MemberError {
+                member: "/repo/web/zaz.toml".to_string(),
+                error: LoadError::new("workspace_token_collision", "taken"),
+            }],
+            ..Default::default()
+        };
+
+        let report = StatusReport::from(&state);
+
+        assert_eq!(report.member_errors.len(), 1);
+        assert_eq!(report.member_errors[0].member, "/repo/web/zaz.toml");
+        assert_eq!(
+            report.member_errors[0].error.code,
+            "workspace_token_collision"
+        );
+    }
+
+    #[test]
+    fn a_status_report_without_error_fields_still_deserializes() {
+        let older =
+            r#"{"daemon_status":"running","watched_files":0,"last_change_ms":null,"groups":[]}"#;
+
+        let report: StatusReport = serde_json::from_str(older).unwrap();
+
+        assert!(report.load_error.is_none());
     }
 
     #[test]
@@ -642,6 +748,44 @@ mod tests {
         assert_eq!(report.groups[0].tasks.len(), 1);
         assert_eq!(report.groups[0].tasks[0].name, "typecheck");
         assert_eq!(report.groups[0].tasks[0].command, "tsc --noEmit");
+    }
+
+    #[test]
+    fn config_report_shows_env_file_as_written_and_never_its_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("secrets.env");
+        std::fs::write(&env_path, "TOKEN=hunter2\n").unwrap();
+
+        let mut task = TaskCommand::new("build", "make");
+        task.env_file = Some("task.env".to_string());
+        let mut service = ServiceCommand::new("web", "run");
+        service.env_file = Some("svc.env".to_string());
+
+        let mut config = Config::default();
+        config.settings.env_file = Some("secrets.env".to_string());
+        config.groups.push(Group {
+            name: "api".to_string(),
+            env_file: Some("group.env".to_string()),
+            tasks: vec![task],
+            services: vec![service],
+            ..Default::default()
+        });
+
+        let report = ConfigReport::from_config(&dir.path().join("zaz.toml"), &config);
+
+        assert_eq!(report.settings.env_file.as_deref(), Some("secrets.env"));
+        assert_eq!(report.groups[0].env_file.as_deref(), Some("group.env"));
+        assert_eq!(
+            report.groups[0].tasks[0].env_file.as_deref(),
+            Some("task.env")
+        );
+        assert_eq!(
+            report.groups[0].services[0].env_file.as_deref(),
+            Some("svc.env")
+        );
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("hunter2"), "{json}");
     }
 
     #[test]

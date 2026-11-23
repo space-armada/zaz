@@ -2,12 +2,19 @@
 //!
 //! Supports both TOML and JSON formats, auto-detected by file extension.
 
+mod env_file;
 mod error;
 mod schema;
 mod toml_spanned;
+mod unknown_keys;
 pub mod user;
 mod validate;
 
+pub use env_file::{
+    env_file_sources, parse_env_file, read_env_file, read_env_files, EnvFileError,
+    EnvFileErrorKind, EnvFileLevel, EnvFileNotRead, EnvFileReads, EnvFileSource, ParseProblem,
+    SpecialFiles,
+};
 pub use error::{ConfigError, Span, ValidationError, ValidationErrorKind, ValidationErrors};
 pub use schema::{
     Config, Group, HumanDuration, LogFormat, ServiceCommand, Settings, Signal, Silence, TaskCommand,
@@ -19,10 +26,29 @@ pub use user::{
 };
 pub use validate::validate;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Default configuration file names to search for.
 pub const CONFIG_FILES: &[&str] = &["zaz.toml", "zaz.json"];
+
+/// Make a config path absolute without resolving symlinks.
+///
+/// A bare filename such as `zaz.toml` has an empty parent, which is not a usable directory.
+/// Making the path absolute once keeps every directory derived from it valid. This avoids
+/// `canonicalize` so symlinks in the path are preserved.
+pub fn absolute_config_path(path: &Path) -> Result<PathBuf, ConfigError> {
+    std::path::absolute(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Resolve a relative `working_dir` against the config directory.
+///
+/// An absolute value is returned unchanged. The config directory is expected to be absolute.
+pub fn resolve_against_config_dir(config_dir: &Path, dir: &str) -> PathBuf {
+    config_dir.join(dir)
+}
 
 /// Load configuration from a file, auto-detecting format by extension.
 pub fn load<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
@@ -34,16 +60,30 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
 
     match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => {
-            // Use spanned parser for TOML to get line/column info
-            let (config, span_info) = toml_spanned::parse_toml_with_spans(&contents)?;
-            validate::validate_with_spans(&config, &contents, Some(&span_info))?;
-            Ok(config)
+            let collected = unknown_keys::collect_toml(&contents)?;
+            let doc = toml_edit::ImDocument::parse(contents.as_str()).ok();
+            let span_info = doc.as_ref().map(toml_spanned::SpanInfo::from_document);
+
+            let mut errors =
+                unknown_keys::unknown_key_errors(&collected.ignored, doc.as_ref(), &contents);
+            validate::collect_errors(
+                &collected.config,
+                &contents,
+                span_info.as_ref(),
+                &mut errors,
+            );
+            errors.into_result()?;
+
+            Ok(collected.config)
         }
         Some("json") => {
-            let config = parse_json(&contents)?;
-            // No span info for JSON
-            validate::validate_with_spans(&config, &contents, None)?;
-            Ok(config)
+            let collected = unknown_keys::collect_json(&contents)?;
+
+            let mut errors = unknown_keys::unknown_key_errors(&collected.ignored, None, &contents);
+            validate::collect_errors(&collected.config, &contents, None, &mut errors);
+            errors.into_result()?;
+
+            Ok(collected.config)
         }
         _ => Err(ConfigError::UnknownFormat {
             path: path.to_path_buf(),
@@ -51,7 +91,10 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
     }
 }
 
-/// Load configuration without validation (for testing).
+/// Load configuration without running the semantic validation passes.
+///
+/// Unknown keys are still rejected. Duplicate names, dependency problems, and bad patterns are
+/// not checked.
 pub fn load_unvalidated<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
     let path = path.as_ref();
     let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
@@ -69,21 +112,62 @@ pub fn load_unvalidated<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> 
 }
 
 /// Parse TOML configuration.
+///
+/// Unknown keys are reported as validation errors with their line and column.
 pub fn parse_toml(contents: &str) -> Result<Config, ConfigError> {
-    toml::from_str(contents).map_err(|e| ConfigError::Toml {
-        message: e.message().to_string(),
-        span: e.span(),
-    })
+    let collected = unknown_keys::collect_toml(contents)?;
+    if collected.ignored.is_empty() {
+        return Ok(collected.config);
+    }
+
+    let doc = toml_edit::ImDocument::parse(contents).ok();
+    unknown_keys::unknown_key_errors(&collected.ignored, doc.as_ref(), contents).into_result()?;
+
+    Ok(collected.config)
 }
 
 /// Parse JSON configuration.
+///
+/// Unknown keys are reported as validation errors. JSON errors carry no location.
 pub fn parse_json(contents: &str) -> Result<Config, ConfigError> {
-    serde_json::from_str(contents).map_err(ConfigError::Json)
+    let collected = unknown_keys::collect_json(contents)?;
+    unknown_keys::unknown_key_errors(&collected.ignored, None, contents).into_result()?;
+
+    Ok(collected.config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_absolute_config_path_makes_relative_paths_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+
+        for given in ["zaz.toml", "./zaz.toml"] {
+            let absolute = absolute_config_path(Path::new(given)).unwrap();
+
+            assert!(absolute.is_absolute(), "{given} -> {}", absolute.display());
+            assert_eq!(absolute.parent(), Some(cwd.as_path()), "{given}");
+        }
+
+        let already = absolute_config_path(Path::new("/etc/zaz.toml")).unwrap();
+        assert_eq!(already, Path::new("/etc/zaz.toml"));
+    }
+
+    #[test]
+    fn test_resolve_against_config_dir() {
+        let dir = Path::new("/project");
+
+        assert_eq!(
+            resolve_against_config_dir(dir, "sub/dir"),
+            Path::new("/project/sub/dir")
+        );
+        assert_eq!(
+            resolve_against_config_dir(dir, "/elsewhere"),
+            Path::new("/elsewhere")
+        );
+    }
 
     #[test]
     fn test_parse_minimal_toml() {
@@ -915,5 +999,107 @@ command = "./srv"
         assert!(config.groups[0].env.is_empty());
         assert!(config.groups[0].tasks[0].env.is_empty());
         assert!(config.groups[0].services[0].env.is_empty());
+    }
+
+    #[test]
+    fn test_env_file_parses_at_every_level_in_toml() {
+        let toml = r#"
+[settings]
+env_file = "root.env"
+
+[[group]]
+name = "api"
+patterns = ["*.rs"]
+env_file = "group.env"
+
+[[group.task]]
+name = "build"
+command = "make"
+env_file = "task.env"
+
+[[group.service]]
+name = "web"
+command = "run"
+env_file = "service.env"
+"#;
+        let config = parse_toml(toml).unwrap();
+
+        assert_eq!(config.settings.env_file.as_deref(), Some("root.env"));
+        assert_eq!(config.groups[0].env_file.as_deref(), Some("group.env"));
+        assert_eq!(
+            config.groups[0].tasks[0].env_file.as_deref(),
+            Some("task.env")
+        );
+        assert_eq!(
+            config.groups[0].services[0].env_file.as_deref(),
+            Some("service.env")
+        );
+    }
+
+    #[test]
+    fn test_env_file_parses_at_every_level_in_json() {
+        let json = r#"{
+            "settings": { "env_file": "root.env" },
+            "groups": [{
+                "name": "api",
+                "patterns": ["*.rs"],
+                "env_file": "group.env",
+                "tasks": [{ "command": "make", "env_file": "task.env" }],
+                "services": [{ "command": "run", "env_file": "service.env" }]
+            }]
+        }"#;
+        let config = parse_json(json).unwrap();
+
+        assert_eq!(config.settings.env_file.as_deref(), Some("root.env"));
+        assert_eq!(config.groups[0].env_file.as_deref(), Some("group.env"));
+        assert_eq!(
+            config.groups[0].tasks[0].env_file.as_deref(),
+            Some("task.env")
+        );
+        assert_eq!(
+            config.groups[0].services[0].env_file.as_deref(),
+            Some("service.env")
+        );
+    }
+
+    #[test]
+    fn test_env_file_unset_is_not_serialized() {
+        let config = parse_toml("[[group]]\nname = \"a\"\npatterns = [\"*\"]\n").unwrap();
+
+        let toml = toml::to_string(&config).unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(!toml.contains("env_file"), "{toml}");
+        assert!(!json.contains("env_file"), "{json}");
+    }
+
+    #[test]
+    fn test_misspelled_group_env_file_in_toml_is_reported_with_a_hint() {
+        let toml = "[[group]]\nname = \"api\"\npatterns = [\"*\"]\nenv_flie = \".env\"\n";
+
+        let Err(ConfigError::Validation(errors)) = parse_toml(toml) else {
+            panic!("expected a validation error");
+        };
+
+        let error = errors.iter().next().unwrap();
+        assert_eq!(error.code(), "unknown_key");
+        assert_eq!(error.span.map(|s| s.line), Some(4));
+        assert_eq!(error.hint.as_deref(), Some("did you mean 'env_file'?"));
+    }
+
+    #[test]
+    fn test_misspelled_env_file_is_reported_at_every_other_level() {
+        for toml in [
+            "[settings]\nenv_flie = \".env\"\n",
+            "[[group]]\nname = \"a\"\npatterns = [\"*\"]\n[[group.task]]\ncommand = \"x\"\nenv_flie = \".env\"\n",
+            "[[group]]\nname = \"a\"\npatterns = [\"*\"]\n[[group.service]]\ncommand = \"x\"\nenv_flie = \".env\"\n",
+        ] {
+            let Err(ConfigError::Validation(errors)) = parse_toml(toml) else {
+                panic!("expected a validation error for {toml}");
+            };
+
+            let hint = errors.iter().next().unwrap().hint.clone();
+            assert_eq!(hint.as_deref(), Some("did you mean 'env_file'?"), "{toml}");
+        }
     }
 }

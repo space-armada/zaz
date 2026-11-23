@@ -4,7 +4,9 @@
 
 use crate::api::LogLine;
 use crate::dependency::DependencyResolver;
-use crate::log_storage::{LogQuery, LogQueryResult, LogStorage};
+use crate::env::{self, GroupEnv, ProcessRef};
+use crate::evaluate::{self, EvaluatedEnv, Prepared};
+use crate::log_storage::{LogQuery, LogQueryResult};
 use crate::state::{
     DaemonState, DaemonStatus, GroupState, GroupStatus, ProcessState, ProcessStatus,
 };
@@ -914,6 +916,9 @@ pub struct Engine {
     /// Path to the configuration file.
     config_path: PathBuf,
 
+    /// Environment layers evaluated from the sources `config` names.
+    evaluated: EvaluatedEnv,
+
     /// File system watcher.
     watcher: Watcher,
 
@@ -933,7 +938,7 @@ pub struct Engine {
     status_tx: broadcast::Sender<ApiResponse>,
 
     /// Log storage with channel-based ingestion from spawned tasks.
-    log_store: crate::log_store::LogStore,
+    log_store: crate::log_store::SharedLogStore,
 
     /// Currently running tasks (by "group:task" id). All tasks can run in parallel.
     running_tasks: std::collections::HashSet<String>,
@@ -974,6 +979,12 @@ pub enum ReloadResult {
     Failed(String),
 }
 
+/// The groups of a config being applied, built before any running service is stopped.
+struct StagedGroups {
+    patterns: HashMap<String, PatternSet>,
+    built: HashMap<String, ManagedGroup>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ConfigDiff {
     added: Vec<String>,
@@ -999,6 +1010,12 @@ struct ManagedGroup {
     /// Group configuration.
     config: Group,
 
+    /// Directory that relative `working_dir` values resolve against.
+    config_dir: PathBuf,
+
+    /// Evaluated environment layers every process of the group is built from.
+    env: GroupEnv,
+
     /// Task executor.
     executor: Executor,
 
@@ -1023,31 +1040,129 @@ struct ManagedGroup {
     pending_ready: Option<PendingReady>,
 }
 
+/// Answer a `GetLogs` or `SubscribeLogs` request from a log store.
+///
+/// The engine and the daemon host share this, so logs read the same whether or not the engine is
+/// busy applying a config. The caller drains the store first when it needs fresh lines.
+pub(crate) fn answer_log_request(
+    store: &crate::log_store::SharedLogStore,
+    request: crate::ApiRequest,
+) -> crate::ApiResponse {
+    use crate::{ApiRequest, ApiResponse};
+
+    match request {
+        ApiRequest::GetLogs {
+            name,
+            lines,
+            offset,
+            limit,
+            search,
+            ..
+        } => {
+            let use_pagination = offset.is_some() || limit.is_some() || search.is_some();
+
+            if use_pagination {
+                let mut query = if name == "*" {
+                    LogQuery::all()
+                } else {
+                    LogQuery::process(&name)
+                };
+
+                if let Some(off) = offset {
+                    query = query.with_offset(off);
+                }
+                if let Some(lim) = limit {
+                    query = query.with_limit(lim);
+                } else if let Some(lines_limit) = lines {
+                    query = query.with_limit(lines_limit);
+                }
+                if let Some(ref pattern) = search {
+                    query = query.with_search(pattern);
+                }
+
+                match store.query(query) {
+                    Ok(result) => ApiResponse::Logs {
+                        name,
+                        lines: result.logs,
+                        total_count: Some(result.total_count),
+                        has_more: Some(result.has_more),
+                        offset: Some(result.offset),
+                    },
+                    Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
+                }
+            } else {
+                match store.get(&name, lines) {
+                    Ok(logs) => ApiResponse::Logs {
+                        name,
+                        lines: logs,
+                        total_count: None,
+                        has_more: None,
+                        offset: None,
+                    },
+                    Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
+                }
+            }
+        }
+        // The caller streams from `subscribe_logs`. This returns the lines so far.
+        ApiRequest::SubscribeLogs { name } => match store.get(&name, Some(100)) {
+            Ok(logs) => ApiResponse::Logs {
+                name,
+                lines: logs,
+                total_count: None,
+                has_more: None,
+                offset: None,
+            },
+            Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
+        },
+        _ => ApiResponse::error("not a log request"),
+    }
+}
+
+impl ManagedGroup {
+    /// The executor for the task at `index` of the group's config.
+    fn task_executor(&self, index: usize) -> Executor {
+        env::process_executor(
+            &self.executor,
+            &self.config_dir,
+            self.config.tasks[index].working_dir.as_deref(),
+            &self.env,
+            ProcessRef::Task(index),
+        )
+    }
+}
+
 impl Engine {
     /// Create a new engine from a configuration file.
-    pub fn new(config_path: &Path) -> Result<Self, DaemonError> {
-        Self::with_mode(config_path, true, false)
-    }
-
-    /// Create a new engine from a configuration file in task-only mode.
-    pub fn new_task_only(config_path: &Path) -> Result<Self, DaemonError> {
-        Self::with_mode(config_path, true, true)
-    }
-
-    /// Create a new engine with options.
     ///
-    /// `verbose_output` controls whether process output is printed to stdout.
-    pub fn with_options(config_path: &Path, verbose_output: bool) -> Result<Self, DaemonError> {
-        Self::with_mode(config_path, verbose_output, false)
+    /// This blocks on the config's sources. The daemon builds its engine from a load that ran
+    /// elsewhere instead.
+    pub fn new(config_path: &Path) -> Result<Self, DaemonError> {
+        let config_path =
+            zaz_config::absolute_config_path(config_path).map_err(DaemonError::Config)?;
+        let prepared = evaluate::prepare(&config_path, evaluate::ENV_FILE_READ_DEADLINE)?;
+
+        Self::from_prepared(prepared, config_path, true, false)
     }
 
-    fn with_mode(
-        config_path: &Path,
-        verbose_output: bool,
-        task_only: bool,
-    ) -> Result<Self, DaemonError> {
-        let config = zaz_config::load(config_path).map_err(DaemonError::Config)?;
-        Self::from_config_with_mode(config, config_path.to_path_buf(), verbose_output, task_only)
+    /// Create a task-only engine, awaiting the load and evaluation of its config.
+    ///
+    /// The evaluation runs on its own thread, so a source that blocks does not pin a runtime
+    /// worker. `zaz task` has no event loop, so this is the one place it waits.
+    pub async fn load_task_only(config_path: &Path) -> Result<Self, DaemonError> {
+        let config_path =
+            zaz_config::absolute_config_path(config_path).map_err(DaemonError::Config)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        evaluate::prepare_detached(
+            config_path.clone(),
+            evaluate::ENV_FILE_READ_DEADLINE,
+            move |result| {
+                let _ = tx.send(result);
+            },
+        );
+
+        let prepared = rx.await.unwrap_or(Err(DaemonError::EvaluationPanicked))?;
+
+        Self::from_prepared(prepared, config_path, true, true)
     }
 
     /// Create a new engine from a loaded configuration.
@@ -1056,15 +1171,30 @@ impl Engine {
         config_path: PathBuf,
         verbose_output: bool,
     ) -> Result<Self, DaemonError> {
-        Self::from_config_with_mode(config, config_path, verbose_output, false)
+        let config_path =
+            zaz_config::absolute_config_path(&config_path).map_err(DaemonError::Config)?;
+        let evaluated = evaluate::evaluate(&config, &config_path, evaluate::ENV_FILE_READ_DEADLINE)
+            .map_err(DaemonError::EnvFile)?;
+
+        Self::from_prepared(
+            Prepared { config, evaluated },
+            config_path,
+            verbose_output,
+            false,
+        )
     }
 
-    fn from_config_with_mode(
-        config: Config,
+    /// Build an engine from a config that is already loaded and evaluated.
+    ///
+    /// `config_path` must be absolute. This does no source reads, so it is quick.
+    pub(crate) fn from_prepared(
+        prepared: Prepared,
         config_path: PathBuf,
         verbose_output: bool,
         task_only: bool,
     ) -> Result<Self, DaemonError> {
+        let Prepared { config, evaluated } = prepared;
+
         // Load user config for notification settings
         let user_config = zaz_config::load_user_config();
         let notification_config = user_config.notifications;
@@ -1093,7 +1223,12 @@ impl Engine {
             group_patterns.insert(group.name.clone(), patterns);
             groups.insert(
                 group.name.clone(),
-                build_managed_group(group, config.settings.shell.clone(), &config_dir),
+                build_managed_group(
+                    group,
+                    config.settings.shell.clone(),
+                    &config_dir,
+                    group_env(&evaluated, &group.name)?,
+                ),
             );
         }
 
@@ -1116,6 +1251,7 @@ impl Engine {
                 .collect(),
             watched_files: 0,
             last_change: None,
+            ..Default::default()
         };
 
         // Create broadcast channel for status updates (capacity 16)
@@ -1157,7 +1293,7 @@ impl Engine {
                 }
             }
 
-            store
+            crate::log_store::SharedLogStore::new(store)
         };
 
         // Create mpsc channel for task completion signals
@@ -1166,6 +1302,7 @@ impl Engine {
         Ok(Self {
             config,
             config_path,
+            evaluated,
             watcher,
             group_patterns,
             groups,
@@ -1215,6 +1352,12 @@ impl Engine {
         &self.state
     }
 
+    /// A refreshed copy of the daemon state, as a status request reports it.
+    pub(crate) fn status_snapshot(&mut self) -> DaemonState {
+        self.update_state();
+        self.state.clone()
+    }
+
     /// Subscribe to status updates.
     pub fn subscribe(&self) -> broadcast::Receiver<ApiResponse> {
         self.status_tx.subscribe()
@@ -1223,6 +1366,11 @@ impl Engine {
     /// Subscribe to log stream.
     pub fn subscribe_logs(&self) -> broadcast::Receiver<LogLine> {
         self.log_store.subscribe()
+    }
+
+    /// A handle to the log store that outlives a borrow of the engine.
+    pub(crate) fn log_handle(&self) -> crate::log_store::SharedLogStore {
+        self.log_store.clone()
     }
 
     /// Get a sender for submitting logs (for spawned tasks).
@@ -1474,13 +1622,16 @@ impl Engine {
         );
 
         // Get group configuration
-        let (tasks, executor) = {
+        let (tasks, executors) = {
             let Some(group) = self.groups.get_mut(group_name) else {
                 tracing::warn!(group = %group_name, "group not found");
                 return;
             };
             group.state.status = GroupStatus::Running;
-            (group.config.tasks.clone(), group.executor.clone())
+            let executors: Vec<Executor> = (0..group.config.tasks.len())
+                .map(|idx| group.task_executor(idx))
+                .collect();
+            (group.config.tasks.clone(), executors)
         };
 
         // Spawn each task independently (parallel execution)
@@ -1501,21 +1652,12 @@ impl Engine {
                 }
             };
 
-            // Use task-specific working_dir and env if set
-            let mut task_executor = executor.clone();
-            if let Some(ref dir) = task.working_dir {
-                task_executor = task_executor.with_working_dir(dir.clone());
-            }
-            if !task.env.is_empty() {
-                task_executor = task_executor.extend_env(task.env.clone());
-            }
-
             self.spawn_task(
                 group_name,
                 task.name(),
                 idx,
                 command,
-                task_executor,
+                executors[idx].clone(),
                 task.silence,
             );
         }
@@ -1715,8 +1857,12 @@ impl Engine {
                 if let Some((group_name, task_name)) = completion.task_id.split_once(':') {
                     // Get executor and command for re-run
                     if let Some(group) = self.groups.get(group_name) {
-                        if let Some(task) =
-                            group.config.tasks.iter().find(|t| t.name() == task_name)
+                        if let Some((task_idx, task)) = group
+                            .config
+                            .tasks
+                            .iter()
+                            .enumerate()
+                            .find(|(_, t)| t.name() == task_name)
                         {
                             // For re-run, we use empty context (no specific changed files)
                             let context = Context::new()
@@ -1729,14 +1875,7 @@ impl Engine {
                                 );
                             let expander = zaz_vars::Expander::new(&context);
                             if let Ok(command) = expander.expand(&task.command) {
-                                // Use task-specific working_dir and env if set
-                                let mut task_executor = group.executor.clone();
-                                if let Some(ref dir) = task.working_dir {
-                                    task_executor = task_executor.with_working_dir(dir.clone());
-                                }
-                                if !task.env.is_empty() {
-                                    task_executor = task_executor.extend_env(task.env.clone());
-                                }
+                                let task_executor = group.task_executor(task_idx);
                                 self.spawn_task(
                                     group_name,
                                     task_name,
@@ -2337,28 +2476,77 @@ impl Engine {
         Ok(())
     }
 
-    /// Reload configuration from the file.
+    /// The API answer to a reload.
+    pub(crate) fn reload_response(result: ReloadResult) -> ApiResponse {
+        match result {
+            ReloadResult::Success {
+                added,
+                removed,
+                modified,
+            } => ApiResponse::ok_with_message(format!(
+                "config reloaded: {} added, {} removed, {} modified",
+                added.len(),
+                removed.len(),
+                modified.len()
+            )),
+            ReloadResult::Failed(e) => ApiResponse::error(format!("reload failed: {}", e)),
+        }
+    }
+
+    /// The reload result for a config that failed to load or evaluate. The running config stays
+    /// in place.
+    ///
+    /// The message is the error's own, so a validation failure and an `env_file` failure both list
+    /// one error per line with its code.
+    pub(crate) fn prepare_failure(error: &DaemonError) -> ReloadResult {
+        tracing::error!(error = %error, "failed to load config");
+
+        ReloadResult::Failed(error.to_string())
+    }
+
+    /// Reload from disk and apply, blocking on the sources. The daemon loads on a separate thread
+    /// instead, so only tests that have no event loop to protect call this.
+    #[cfg(test)]
+    async fn reload_config(&mut self) -> ReloadResult {
+        match evaluate::prepare(&self.config_path, evaluate::ENV_FILE_READ_DEADLINE) {
+            Ok(prepared) => self.apply_prepared(prepared).await,
+            Err(e) => Self::prepare_failure(&e),
+        }
+    }
+
+    /// Apply a freshly loaded and evaluated config.
     ///
     /// This:
-    /// 1. Parses and validates the new config
+    /// 1. Works out everything that can fail, while the running config is untouched
     /// 2. Stops services in removed/modified groups
     /// 3. Updates group configurations
     /// 4. Starts services in new/modified groups
     /// 5. Broadcasts reload status
-    pub async fn reload_config(&mut self) -> ReloadResult {
-        tracing::info!(path = %self.config_path.display(), "reloading configuration");
+    pub(crate) async fn apply_prepared(&mut self, prepared: Prepared) -> ReloadResult {
+        let Prepared {
+            config: new_config,
+            evaluated: new_evaluated,
+        } = prepared;
 
-        // 1. Parse and validate new config
-        let new_config = match zaz_config::load(&self.config_path) {
-            Ok(config) => config,
+        // 1. Compute changes, and build everything the new config needs. A failure here leaves
+        // the running config in place, with no service stopped.
+        let diff = self.get_config_diff(&new_config, &new_evaluated);
+
+        let execution_order = match topological_sort(&new_config.groups) {
+            Ok(order) => order,
             Err(e) => {
-                tracing::error!(error = %e, "failed to parse config");
-                return ReloadResult::Failed(format!("parse error: {}", e));
+                tracing::error!(error = %e, "failed to compute execution order");
+                return ReloadResult::Failed(format!("dependency error: {}", e));
             }
         };
 
-        // 2. Compute changes
-        let diff = self.get_config_diff(&new_config);
+        let staged = match self.stage_groups(&new_config, &new_evaluated) {
+            Ok(staged) => staged,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build groups");
+                return ReloadResult::Failed(format!("rebuild error: {}", e));
+            }
+        };
 
         // Stop hooks expand against the config being replaced, since they belong to the
         // services that config started.
@@ -2373,9 +2561,9 @@ impl Engine {
         let expander = zaz_vars::Expander::new(&var_context);
         let log_tx = self.log_store.sender();
 
-        // 3. Stop services in removed groups, then 4. in modified groups (they'll be
-        // restarted). A stop hook outlives the group it belongs to: it runs detached, so
-        // rebuilding the group below drops the service without cutting the hook short.
+        // 2. Stop services in removed groups, then in modified groups (they'll be restarted).
+        // A stop hook outlives the group it belongs to: it runs detached, so rebuilding the
+        // group below drops the service without cutting the hook short.
         let stopping: Vec<String> = diff
             .removed
             .iter()
@@ -2406,34 +2594,19 @@ impl Engine {
             }
         }
 
-        // 5. Compute new execution order
-        let execution_order = match topological_sort(&new_config.groups) {
-            Ok(order) => order,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to compute execution order");
-                return ReloadResult::Failed(format!("dependency error: {}", e));
-            }
-        };
-
-        // 6. Apply new configuration
+        // 3. Apply the new configuration. Nothing past this point can fail.
         self.config = new_config;
+        self.evaluated = new_evaluated;
         self.execution_order = execution_order;
-
-        // 6b. Rebuild dependency resolver from new config
         self.dependency_resolver = DependencyResolver::from_groups(
             self.config
                 .groups
                 .iter()
                 .map(|g| (g.name.as_str(), g.depends_on.as_slice())),
         );
+        self.commit_groups(staged, &diff);
 
-        // 7. Rebuild groups
-        if let Err(e) = self.rebuild_groups(diff.clone()) {
-            tracing::error!(error = %e, "failed to rebuild groups");
-            return ReloadResult::Failed(format!("rebuild error: {}", e));
-        }
-
-        // 8. Run new/modified groups through the shared execution path.
+        // 4. Run new/modified groups through the shared execution path.
         let reload_targets: Vec<String> = self
             .execution_order
             .iter()
@@ -2447,7 +2620,7 @@ impl Engine {
         let trigger_ctx = self.reload_context(&diff);
         self.execute_groups(&reload_targets, &trigger_ctx).await;
 
-        // 9. Broadcast reload complete
+        // 5. Broadcast reload complete
         if let Err(e) = self.push_log(LogLine::daemon(
             "zaz",
             format!(
@@ -2469,47 +2642,80 @@ impl Engine {
     }
 
     /// Compute changes between current config and new config.
-    fn get_config_diff(&self, new_config: &Config) -> ConfigDiff {
-        compute_config_diff(&self.config, new_config)
+    fn get_config_diff(&self, new_config: &Config, new_evaluated: &EvaluatedEnv) -> ConfigDiff {
+        compute_config_diff(&self.config, &self.evaluated, new_config, new_evaluated)
     }
 
-    /// Rebuild group patterns and managed groups from current config.
-    fn rebuild_groups(&mut self, diff: ConfigDiff) -> Result<(), DaemonError> {
-        // Clear and rebuild group patterns
-        self.group_patterns.clear();
-        let mut new_groups = IndexMap::new();
-        let mut old_groups = std::mem::take(&mut self.groups);
-
-        // Get config directory for default working directory
+    /// Build the pattern set and a fresh managed group for every group of `new_config`.
+    ///
+    /// This is the part of a rebuild that can fail, and it touches nothing running. A group the
+    /// reload leaves unchanged keeps its running instance, so its fresh one goes unused.
+    fn stage_groups(
+        &self,
+        new_config: &Config,
+        new_evaluated: &EvaluatedEnv,
+    ) -> Result<StagedGroups, DaemonError> {
         let config_dir = self.config_path.parent().unwrap_or(Path::new("."));
+        let mut patterns = HashMap::new();
+        let mut built = HashMap::new();
 
-        for group in &self.config.groups {
-            // Create pattern set for this group
-            let patterns =
-                PatternSet::new(&group.patterns, &group.ignore).map_err(DaemonError::Watch)?;
-            self.group_patterns.insert(group.name.clone(), patterns);
-            let managed_group = if diff.unchanged.contains(&group.name) {
-                let mut existing = old_groups
-                    .swap_remove(&group.name)
-                    .ok_or_else(|| DaemonError::GroupNotFound(group.name.clone()))?;
-                existing.config = group.clone();
-                existing
-            } else {
-                build_managed_group(group, self.config.settings.shell.clone(), config_dir)
-            };
-            new_groups.insert(group.name.clone(), managed_group);
+        for group in &new_config.groups {
+            patterns.insert(
+                group.name.clone(),
+                PatternSet::new(&group.patterns, &group.ignore).map_err(DaemonError::Watch)?,
+            );
+            built.insert(
+                group.name.clone(),
+                build_managed_group(
+                    group,
+                    new_config.settings.shell.clone(),
+                    config_dir,
+                    group_env(new_evaluated, &group.name)?,
+                ),
+            );
         }
 
+        Ok(StagedGroups { patterns, built })
+    }
+
+    /// Swap the staged groups in for the running ones, keeping the runtime state of every
+    /// unchanged group. `self.config` must already be the new config.
+    fn commit_groups(&mut self, staged: StagedGroups, diff: &ConfigDiff) {
+        let StagedGroups {
+            patterns,
+            mut built,
+        } = staged;
+        let mut old_groups = std::mem::take(&mut self.groups);
+        let mut new_groups = IndexMap::new();
+
+        for group in &self.config.groups {
+            let kept = if diff.unchanged.contains(&group.name) {
+                old_groups.swap_remove(&group.name)
+            } else {
+                None
+            };
+
+            let managed_group = match kept {
+                Some(mut existing) => {
+                    existing.config = group.clone();
+                    Some(existing)
+                }
+                None => built.remove(&group.name),
+            };
+
+            if let Some(managed_group) = managed_group {
+                new_groups.insert(group.name.clone(), managed_group);
+            }
+        }
+
+        self.group_patterns = patterns;
         self.groups = new_groups;
 
-        // Update daemon state
         self.state.groups = self
             .groups
             .iter()
             .map(|(k, v)| (k.clone(), v.state.clone()))
             .collect();
-
-        Ok(())
     }
 
     /// Restart a specific process (task or service) within a group.
@@ -2550,14 +2756,7 @@ impl Engine {
                 .expand(&task_config.command)
                 .map_err(|e| DaemonError::VarExpansion(e.to_string()))?;
 
-            // Use task-specific working_dir and env if set
-            let mut executor = group.executor.clone();
-            if let Some(ref dir) = task_config.working_dir {
-                executor = executor.with_working_dir(dir.clone());
-            }
-            if !task_config.env.is_empty() {
-                executor = executor.extend_env(task_config.env.clone());
-            }
+            let executor = group.task_executor(task_idx);
             let silence = task_config.silence;
 
             // Spawn task in background (same as restart_group) for proper log streaming
@@ -2661,74 +2860,8 @@ impl Engine {
                     state: self.state.clone(),
                 }
             }
-            ApiRequest::GetLogs {
-                name,
-                lines,
-                offset,
-                limit,
-                search,
-                ..
-            } => {
-                // Use new pagination if any pagination param is set, otherwise use legacy
-                let use_pagination = offset.is_some() || limit.is_some() || search.is_some();
-
-                if use_pagination {
-                    // Build query from request parameters
-                    let mut query = if name == "*" {
-                        LogQuery::all()
-                    } else {
-                        LogQuery::process(&name)
-                    };
-
-                    if let Some(off) = offset {
-                        query = query.with_offset(off);
-                    }
-                    if let Some(lim) = limit {
-                        query = query.with_limit(lim);
-                    } else if let Some(lines_limit) = lines {
-                        // Fall back to legacy `lines` parameter
-                        query = query.with_limit(lines_limit);
-                    }
-                    if let Some(ref pattern) = search {
-                        query = query.with_search(pattern);
-                    }
-
-                    match self.query_logs(query) {
-                        Ok(result) => ApiResponse::Logs {
-                            name,
-                            lines: result.logs,
-                            total_count: Some(result.total_count),
-                            has_more: Some(result.has_more),
-                            offset: Some(result.offset),
-                        },
-                        Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
-                    }
-                } else {
-                    // Legacy behavior: just return logs with optional limit
-                    match self.get_logs(&name, lines) {
-                        Ok(logs) => ApiResponse::Logs {
-                            name,
-                            lines: logs,
-                            total_count: None,
-                            has_more: None,
-                            offset: None,
-                        },
-                        Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
-                    }
-                }
-            }
-            ApiRequest::SubscribeLogs { name } => {
-                // Return current logs; caller should use subscribe_logs() for streaming
-                match self.get_logs(&name, Some(100)) {
-                    Ok(logs) => ApiResponse::Logs {
-                        name,
-                        lines: logs,
-                        total_count: None,
-                        has_more: None,
-                        offset: None,
-                    },
-                    Err(e) => ApiResponse::error(format!("log query failed: {}", e)),
-                }
+            request @ (ApiRequest::GetLogs { .. } | ApiRequest::SubscribeLogs { .. }) => {
+                answer_log_request(&self.log_store, request)
             }
             ApiRequest::RestartGroup { name, .. } => match self.restart_group(&name).await {
                 Ok(()) => {
@@ -2749,19 +2882,10 @@ impl Engine {
                 Ok(()) => ApiResponse::ok_with_message("restart initiated for all groups"),
                 Err(e) => ApiResponse::error(format!("failed to restart: {}", e)),
             },
-            ApiRequest::ReloadConfig => match self.reload_config().await {
-                ReloadResult::Success {
-                    added,
-                    removed,
-                    modified,
-                } => ApiResponse::ok_with_message(format!(
-                    "config reloaded: {} added, {} removed, {} modified",
-                    added.len(),
-                    removed.len(),
-                    modified.len()
-                )),
-                ReloadResult::Failed(e) => ApiResponse::error(format!("reload failed: {}", e)),
-            },
+            ApiRequest::ReloadConfig => ApiResponse::error(
+                "the engine does not reload itself [reload_not_supported]: reloads go through the \
+                 daemon host, which loads sources off the event loop",
+            ),
             ApiRequest::Identify => {
                 let config_path = self
                     .config_path
@@ -3268,31 +3392,34 @@ fn build_group_state(group: &Group) -> GroupState {
     }
 }
 
-fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) -> ManagedGroup {
-    // Create executor with shell, working directory, and group env
-    // Default to config directory if no explicit working_dir is set
-    let mut executor = Executor::new(shell);
-    let working_dir = group
-        .working_dir
-        .clone()
-        .unwrap_or_else(|| config_dir.to_string_lossy().to_string());
-    executor = executor.with_working_dir(working_dir);
-    if !group.env.is_empty() {
-        executor = executor.with_env(group.env.clone());
-    }
+/// The evaluated layers of a group, which every group build requires.
+fn group_env(evaluated: &EvaluatedEnv, name: &str) -> Result<GroupEnv, DaemonError> {
+    evaluated
+        .group(name)
+        .cloned()
+        .ok_or_else(|| DaemonError::GroupNotFound(name.to_string()))
+}
 
-    // Create services with per-service working_dir and env overrides
+fn build_managed_group(
+    group: &Group,
+    shell: Option<String>,
+    config_dir: &Path,
+    group_env: GroupEnv,
+) -> ManagedGroup {
+    let executor = env::group_executor(shell, config_dir, group.working_dir.as_deref(), &group_env);
+
     let services: Vec<Service> = group
         .services
         .iter()
-        .map(|d| {
-            let mut service_executor = executor.clone();
-            if let Some(ref dir) = d.working_dir {
-                service_executor = service_executor.with_working_dir(dir.clone());
-            }
-            if !d.env.is_empty() {
-                service_executor = service_executor.extend_env(d.env.clone());
-            }
+        .enumerate()
+        .map(|(idx, d)| {
+            let service_executor = env::process_executor(
+                &executor,
+                config_dir,
+                d.working_dir.as_deref(),
+                &group_env,
+                ProcessRef::Service(idx),
+            );
             Service::new(d.clone(), service_executor)
         })
         .collect();
@@ -3300,6 +3427,8 @@ fn build_managed_group(group: &Group, shell: Option<String>, config_dir: &Path) 
     let service_count = services.len();
     ManagedGroup {
         config: group.clone(),
+        config_dir: config_dir.to_path_buf(),
+        env: group_env,
         executor,
         services,
         state: build_group_state(group),
@@ -3355,7 +3484,16 @@ fn calculate_group_status_from_tasks(
 }
 
 /// Compute changes between the current and new configurations.
-fn compute_config_diff(old_config: &Config, new_config: &Config) -> ConfigDiff {
+///
+/// A group is modified when its config changed, when any setting changed, or when the values
+/// evaluated from its sources changed. The unchanged groups keep their executors, so an edited
+/// `env_file` must mark its groups modified or they would keep stale values.
+fn compute_config_diff(
+    old_config: &Config,
+    old_evaluated: &EvaluatedEnv,
+    new_config: &Config,
+    new_evaluated: &EvaluatedEnv,
+) -> ConfigDiff {
     use std::collections::HashSet;
 
     let old_groups = &old_config.groups;
@@ -3378,7 +3516,10 @@ fn compute_config_diff(old_config: &Config, new_config: &Config) -> ConfigDiff {
 
     for new_group in new_groups {
         if let Some(old_group) = old_groups.iter().find(|g| g.name == new_group.name) {
-            if all_groups_modified || old_group != new_group {
+            let env_changed =
+                old_evaluated.group(&new_group.name) != new_evaluated.group(&new_group.name);
+
+            if all_groups_modified || old_group != new_group || env_changed {
                 modified.push(new_group.name.clone());
             } else {
                 unchanged.push(new_group.name.clone());
@@ -4299,7 +4440,12 @@ mod tests {
             },
         ];
 
-        let diff = compute_config_diff(&test_config(groups.clone()), &test_config(groups));
+        let diff = compute_config_diff(
+            &test_config(groups.clone()),
+            &EvaluatedEnv::default(),
+            &test_config(groups),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         assert!(diff.modified.is_empty());
@@ -4323,7 +4469,12 @@ mod tests {
             },
         ];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert_eq!(diff.added, vec!["b"]);
         assert!(diff.removed.is_empty());
         assert!(diff.modified.is_empty());
@@ -4347,7 +4498,12 @@ mod tests {
             ..Default::default()
         }];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert_eq!(diff.removed, vec!["b"]);
         assert!(diff.modified.is_empty());
@@ -4367,7 +4523,12 @@ mod tests {
             ..Default::default()
         }];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         assert_eq!(diff.modified, vec!["a"]);
@@ -4387,7 +4548,12 @@ mod tests {
             ..Default::default()
         }];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         assert_eq!(diff.modified, vec!["a"]);
@@ -4427,7 +4593,12 @@ mod tests {
             },
         ];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert_eq!(diff.added, vec!["add"]);
         assert_eq!(diff.removed, vec!["remove"]);
         assert_eq!(diff.modified, vec!["modify"]);
@@ -4448,7 +4619,12 @@ mod tests {
             },
         ];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert_eq!(diff.added.len(), 2);
         assert!(diff.added.contains(&"a".to_string()));
         assert!(diff.added.contains(&"b".to_string()));
@@ -4471,7 +4647,12 @@ mod tests {
         ];
         let new: Vec<Group> = vec![];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert_eq!(diff.removed.len(), 2);
         assert!(diff.removed.contains(&"a".to_string()));
@@ -4491,7 +4672,12 @@ mod tests {
         old_config.settings.shell = Some("bash".to_string());
         new_config.settings.shell = Some("zsh".to_string());
 
-        let diff = compute_config_diff(&old_config, &new_config);
+        let diff = compute_config_diff(
+            &old_config,
+            &EvaluatedEnv::default(),
+            &new_config,
+            &EvaluatedEnv::default(),
+        );
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
         assert_eq!(diff.modified, vec!["a"]);
@@ -4511,7 +4697,12 @@ mod tests {
             ..Default::default()
         }];
 
-        let diff = compute_config_diff(&test_config(old), &test_config(new));
+        let diff = compute_config_diff(
+            &test_config(old),
+            &EvaluatedEnv::default(),
+            &test_config(new),
+            &EvaluatedEnv::default(),
+        );
         assert_eq!(diff.modified, vec!["a"]);
         assert!(diff.unchanged.is_empty());
     }
@@ -5431,10 +5622,16 @@ mod tests {
         let mut updated_modified = modified.clone();
         updated_modified.patterns = vec!["*.rs".to_string()];
         let new_config = test_config(vec![unchanged, updated_modified]);
-        let diff = compute_config_diff(&engine.config, &new_config);
+        let diff = compute_config_diff(
+            &engine.config,
+            &engine.evaluated,
+            &new_config,
+            &engine.evaluated,
+        );
 
+        let staged = engine.stage_groups(&new_config, &engine.evaluated).unwrap();
         engine.config = new_config;
-        engine.rebuild_groups(diff).unwrap();
+        engine.commit_groups(staged, &diff);
 
         let keep = engine.groups.get("keep").unwrap();
         assert!(keep.services_started);
@@ -5447,6 +5644,71 @@ mod tests {
         assert!(!change.services_started);
         assert_eq!(change.state.status, GroupStatus::Pending);
         assert!(change.pending_restarts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_an_engine_with_no_groups_polls_and_checks_services() {
+        let mut engine = create_test_engine(Vec::new());
+
+        engine.startup().await.unwrap();
+        assert!(!engine.poll().await.unwrap());
+        engine.check_services().await.unwrap();
+        engine.shutdown().await.unwrap();
+
+        assert!(engine.state().groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reload_with_a_dependency_cycle_stops_nothing() {
+        let mut engine = create_test_engine(vec![test_service_group("keep", "sleep 30")]);
+        engine.startup().await.unwrap();
+        assert!(engine.groups["keep"].services[0].is_running());
+
+        let cyclic = test_config(vec![
+            test_group_with_deps("a", &["t"], &["b"]),
+            test_group_with_deps("b", &["t"], &["a"]),
+        ]);
+        let result = engine
+            .apply_prepared(Prepared {
+                config: cyclic,
+                evaluated: EvaluatedEnv::default(),
+            })
+            .await;
+
+        match result {
+            ReloadResult::Failed(message) => assert!(message.contains("dependency error")),
+            other => panic!("expected the reload to fail, got {other:?}"),
+        }
+        assert!(engine.groups["keep"].services[0].is_running());
+        assert!(engine.groups.contains_key("keep"));
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reload_with_a_bad_pattern_stops_nothing() {
+        let mut engine = create_test_engine(vec![test_service_group("keep", "sleep 30")]);
+        engine.startup().await.unwrap();
+        assert!(engine.groups["keep"].services[0].is_running());
+
+        let mut broken = test_service_group("other", "sleep 30");
+        broken.patterns = vec!["[".to_string()];
+
+        let result = engine
+            .apply_prepared(Prepared {
+                config: test_config(vec![broken]),
+                evaluated: EvaluatedEnv::default(),
+            })
+            .await;
+
+        match result {
+            ReloadResult::Failed(message) => assert!(message.contains("rebuild error")),
+            other => panic!("expected the reload to fail, got {other:?}"),
+        }
+        assert!(engine.groups["keep"].services[0].is_running());
+        assert!(!engine.groups.contains_key("other"));
+
+        engine.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -7032,5 +7294,220 @@ command = "touch '{marker}'"
             "only the first transition is gated; a group already Ready keeps it while a \
              respawned service checks again, the same as it does through a backoff"
         );
+    }
+
+    // =========================================================================
+    // env_file tests
+    // =========================================================================
+
+    fn write_env_file_config(dir: &Path, task_out: &Path, hook_out: &Path) -> PathBuf {
+        let config_path = dir.join("zaz.toml");
+        let config = format!(
+            r#"
+[settings]
+env_file = "settings.env"
+
+[[group]]
+name = "api"
+patterns = ["never.txt"]
+env_file = "group.env"
+env = {{ C = "group-inline" }}
+
+[[group.task]]
+name = "show"
+command = "printf '%s' \"$A $B $C $D $E\" > '{task_out}'"
+env_file = "task.env"
+env = {{ E = "task-inline" }}
+
+[[group.service]]
+name = "svc"
+command = "sleep 30"
+cleanup_command = "printf '%s' \"$A $B $C $F\" > '{hook_out}'"
+env_file = "service.env"
+
+[[group]]
+name = "other"
+patterns = ["never.txt"]
+
+[[group.task]]
+name = "quiet"
+command = "true"
+"#,
+            task_out = task_out.display(),
+            hook_out = hook_out.display(),
+        );
+        std::fs::write(&config_path, config).unwrap();
+        std::fs::write(
+            dir.join("settings.env"),
+            "A=settings\nB=settings\nC=settings\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("group.env"),
+            "B=group-file\nC=group-file\nD=group-file\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("task.env"), "D=task-file\nE=task-file\n").unwrap();
+        std::fs::write(dir.join("service.env"), "F=service-file\n").unwrap();
+
+        config_path
+    }
+
+    #[tokio::test]
+    async fn test_env_file_values_reach_tasks_services_and_hooks_in_precedence_order() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_out = temp_dir.path().join("task.out");
+        let hook_out = temp_dir.path().join("hook.out");
+        let config_path = write_env_file_config(temp_dir.path(), &task_out, &hook_out);
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        assert_eq!(
+            std::fs::read_to_string(&task_out).unwrap(),
+            "settings group-file group-inline task-file task-inline"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hook_out).unwrap(),
+            "settings group-file group-inline service-file"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reload_after_env_file_edit_rebuilds_only_the_affected_group() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_out = temp_dir.path().join("task.out");
+        let hook_out = temp_dir.path().join("hook.out");
+        let config_path = write_env_file_config(temp_dir.path(), &task_out, &hook_out);
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        match engine.reload_config().await {
+            ReloadResult::Success { modified, .. } => assert!(modified.is_empty(), "{modified:?}"),
+            other => panic!("expected reload success, got {:?}", other),
+        }
+
+        std::fs::write(temp_dir.path().join("task.env"), "D=edited\nE=task-file\n").unwrap();
+
+        match engine.reload_config().await {
+            ReloadResult::Success { modified, .. } => assert_eq!(modified, vec!["api"]),
+            other => panic!("expected reload success, got {:?}", other),
+        }
+        assert!(engine.wait_for_tasks().await);
+
+        assert_eq!(
+            std::fs::read_to_string(&task_out).unwrap(),
+            "settings group-file group-inline edited task-inline"
+        );
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reload_after_settings_env_file_edit_rebuilds_every_group() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_out = temp_dir.path().join("task.out");
+        let hook_out = temp_dir.path().join("hook.out");
+        let config_path = write_env_file_config(temp_dir.path(), &task_out, &hook_out);
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+
+        std::fs::write(
+            temp_dir.path().join("settings.env"),
+            "A=edited\nB=settings\nC=settings\n",
+        )
+        .unwrap();
+
+        match engine.reload_config().await {
+            ReloadResult::Success { mut modified, .. } => {
+                modified.sort();
+                assert_eq!(modified, vec!["api", "other"]);
+            }
+            other => panic!("expected reload success, got {:?}", other),
+        }
+        assert!(engine.wait_for_tasks().await);
+
+        assert!(std::fs::read_to_string(&task_out)
+            .unwrap()
+            .starts_with("edited "));
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reload_with_a_missing_env_file_fails_and_keeps_the_running_config() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let task_out = temp_dir.path().join("task.out");
+        let hook_out = temp_dir.path().join("hook.out");
+        let config_path = write_env_file_config(temp_dir.path(), &task_out, &hook_out);
+
+        let mut engine = Engine::new(&config_path).unwrap();
+        engine.startup().await.unwrap();
+        assert!(engine.wait_for_tasks().await);
+        let before = engine.evaluated.clone();
+
+        let removed = temp_dir.path().join("group.env");
+        std::fs::remove_file(&removed).unwrap();
+
+        match engine.reload_config().await {
+            ReloadResult::Failed(message) => {
+                assert!(message.contains("env_file_missing"), "{message}");
+                assert!(
+                    message.contains(&removed.display().to_string()),
+                    "{message}"
+                );
+                assert!(message.contains("group 'api' env_file"), "{message}");
+                assert!(
+                    message.contains(&config_path.display().to_string()),
+                    "{message}"
+                );
+            }
+            other => panic!("expected reload failure, got {:?}", other),
+        }
+
+        assert_eq!(engine.evaluated, before);
+
+        engine.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn test_engine_start_with_a_malformed_env_file_is_a_coded_error() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("zaz.toml");
+        std::fs::write(
+            &config_path,
+            "[[group]]\nname = \"a\"\nenv_file = \"bad.env\"\n\n[[group.task]]\ncommand = \"true\"\n",
+        )
+        .unwrap();
+        std::fs::write(temp_dir.path().join("bad.env"), "TOKEN=a b\n").unwrap();
+
+        let Err(err) = Engine::new(&config_path) else {
+            panic!("expected the engine to refuse a malformed env_file");
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("env_file_unquoted_whitespace"),
+            "{message}"
+        );
+        assert!(message.contains("line 1"), "{message}");
+        assert!(!message.contains("TOKEN"), "{message}");
     }
 }

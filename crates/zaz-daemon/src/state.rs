@@ -17,6 +17,65 @@ pub struct DaemonState {
 
     /// Last file change timestamp (Unix millis).
     pub last_change: Option<u64>,
+
+    /// Why the first load failed, when it did. Set only while nothing is built. A later reload
+    /// failure never sets it, and a successful load clears it.
+    ///
+    /// This is a field rather than a status variant so a client that predates it still
+    /// deserializes the state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<LoadError>,
+
+    /// Errors per workspace member, reported only by a workspace supervisor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_errors: Vec<MemberError>,
+}
+
+/// A coded failure to load a config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadError {
+    /// Stable machine-readable code of the first error.
+    pub code: String,
+
+    /// Every error, one per line, each ending in its code.
+    pub message: String,
+
+    /// What to do next, when the first error carries a hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+impl LoadError {
+    /// Build an error from its parts.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    /// Attach a hint.
+    pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+/// The error of one workspace member, named by its project token or by its config path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberError {
+    /// The member's project token, or its config path when it has none.
+    pub member: String,
+
+    /// What went wrong.
+    pub error: LoadError,
 }
 
 /// Daemon status.
@@ -125,6 +184,38 @@ pub enum ProcessStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_without_load_fields_deserializes_from_an_older_daemon() {
+        let older = r#"{"status":"running","groups":{},"watched_files":0,"last_change":null}"#;
+
+        let state: DaemonState = serde_json::from_str(older).unwrap();
+
+        assert_eq!(state.status, DaemonStatus::Running);
+        assert!(state.load_error.is_none());
+        assert!(state.member_errors.is_empty());
+    }
+
+    #[test]
+    fn a_state_without_errors_serializes_without_the_new_fields() {
+        let json = serde_json::to_string(&DaemonState::default()).unwrap();
+
+        assert!(!json.contains("load_error"), "{json}");
+        assert!(!json.contains("member_errors"), "{json}");
+    }
+
+    #[test]
+    fn load_error_round_trips_with_its_hint() {
+        let state = DaemonState {
+            load_error: Some(LoadError::new("env_file_missing", "no file").with_hint("create it")),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&state).unwrap();
+        let back: DaemonState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.load_error, state.load_error);
+    }
 
     #[test]
     fn group_state_serializes_services_key() {

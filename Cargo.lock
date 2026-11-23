@@ -1907,6 +1907,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.148"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2974,10 +2984,13 @@ dependencies = [
  "globset",
  "humantime",
  "serde",
+ "serde_ignored",
  "serde_json",
  "strsim",
+ "tempfile",
  "thiserror 2.0.17",
  "toml",
+ "toml_edit 0.22.27",
  "tracing",
  "zaz-vars",
 ]

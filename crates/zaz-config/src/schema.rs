@@ -111,8 +111,12 @@ impl<'de> Deserialize<'de> for HumanDuration {
 }
 
 /// Root configuration structure.
+///
+/// The derived `Deserialize` impls accept unknown keys. Only the crate's entry points, which are
+/// `load`, `load_unvalidated`, `parse_toml`, and `parse_json`, report them. A direct
+/// `toml::from_str::<Config>` silently drops a misspelled key.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// Global settings.
     pub settings: Settings,
@@ -127,7 +131,7 @@ pub struct Config {
 
 /// Global settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Settings {
     /// Shell to use for command execution (defaults to $SHELL).
     pub shell: Option<String>,
@@ -144,6 +148,12 @@ pub struct Settings {
     /// supervisor derives the token from the config directory basename.
     #[serde(default)]
     pub name: Option<String>,
+
+    /// File of `KEY=VALUE` lines loaded into the environment of every process.
+    ///
+    /// A relative path resolves against the config directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
 }
 
 impl Default for Settings {
@@ -153,6 +163,7 @@ impl Default for Settings {
             debounce: HumanDuration::from_millis(100),
             log_format: LogFormat::Pretty,
             name: None,
+            env_file: None,
         }
     }
 }
@@ -194,7 +205,7 @@ pub enum Silence {
 
 /// A watch group that pairs file patterns with commands.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Group {
     /// Unique name for this group.
     pub name: String,
@@ -211,6 +222,12 @@ pub struct Group {
     /// Working directory for commands (defaults to config file directory).
     pub working_dir: Option<String>,
 
+    /// File of `KEY=VALUE` lines loaded into the environment of all commands in this group.
+    ///
+    /// A relative path resolves against the config directory. Inline `env` wins over the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
+
     /// Environment variables for all commands in this group.
     /// These are merged with task/daemon-specific env vars.
     pub env: HashMap<String, String>,
@@ -226,7 +243,6 @@ pub struct Group {
 
 /// A task command that runs to completion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TaskCommand {
     /// Display name for this command (derived from command if not set).
     #[serde(default)]
@@ -247,6 +263,12 @@ pub struct TaskCommand {
     #[serde(default)]
     pub working_dir: Option<String>,
 
+    /// File of `KEY=VALUE` lines loaded into this task's environment.
+    ///
+    /// A relative path resolves against the config directory. Inline `env` wins over the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
+
     /// Environment variables for this task (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -261,6 +283,7 @@ impl TaskCommand {
             on_change_only: false,
             silence: Silence::None,
             working_dir: None,
+            env_file: None,
             env: HashMap::new(),
         }
     }
@@ -273,6 +296,7 @@ impl TaskCommand {
             on_change_only: false,
             silence: Silence::None,
             working_dir: None,
+            env_file: None,
             env: HashMap::new(),
         }
     }
@@ -311,7 +335,6 @@ fn derive_name(command: &str) -> &str {
 
 /// A service command that runs continuously.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ServiceCommand {
     /// Display name for this service (derived from command if not set).
     #[serde(default)]
@@ -401,6 +424,12 @@ pub struct ServiceCommand {
     #[serde(default)]
     pub ready_timeout: Option<HumanDuration>,
 
+    /// File of `KEY=VALUE` lines loaded into this service's environment.
+    ///
+    /// A relative path resolves against the config directory. Inline `env` wins over the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
+
     /// Environment variables for this service (merged with group env).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -424,6 +453,7 @@ impl ServiceCommand {
             stop_timeout: None,
             ready_poll_interval: None,
             ready_timeout: None,
+            env_file: None,
             env: HashMap::new(),
         }
     }
@@ -445,6 +475,7 @@ impl ServiceCommand {
             stop_timeout: None,
             ready_poll_interval: None,
             ready_timeout: None,
+            env_file: None,
             env: HashMap::new(),
         }
     }

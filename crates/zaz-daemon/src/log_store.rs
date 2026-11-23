@@ -14,6 +14,7 @@ use crate::error::LogStorageError;
 use crate::log_storage::{LogQuery, LogQueryResult, LogStorage, LogStorageStats};
 use crate::log_storage_sqlite::SqliteLogStorage;
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
@@ -357,6 +358,67 @@ impl LogStore {
 impl Default for LogStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A log store that the engine and the daemon host both hold.
+///
+/// The engine is borrowed for the whole of a reload or startup apply. The host answers log
+/// requests during that time through its own handle, so logs never go dark while an apply runs.
+/// Every method takes the lock for one synchronous call and never holds it across an await.
+#[derive(Clone)]
+pub struct SharedLogStore(Arc<Mutex<LogStore>>);
+
+impl SharedLogStore {
+    /// Share `store`.
+    pub fn new(store: LogStore) -> Self {
+        Self(Arc::new(Mutex::new(store)))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, LogStore> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Get a sender for spawned tasks to submit logs.
+    pub fn sender(&self) -> mpsc::Sender<LogLine> {
+        self.lock().sender()
+    }
+
+    /// Subscribe to real-time log broadcasts.
+    pub fn subscribe(&self) -> broadcast::Receiver<LogLine> {
+        self.lock().subscribe()
+    }
+
+    /// Drain logs from the channel into the buffer.
+    pub fn drain(&self) -> Result<(), LogStorageError> {
+        self.lock().drain()
+    }
+
+    /// Drain the channel and run the shutdown-time flush hook.
+    pub fn drain_and_flush_now(&self) -> Result<(), LogStorageError> {
+        self.lock().drain_and_flush_now()
+    }
+
+    /// Run the persistent retention sweep if `cadence` has elapsed.
+    pub fn maybe_enforce_retention_tick(&self, cadence: Duration) -> Result<(), LogStorageError> {
+        self.lock().maybe_enforce_retention_tick(cadence)
+    }
+
+    /// Add a log line to storage and broadcast.
+    pub fn push(&self, log: LogLine) -> Result<(), LogStorageError> {
+        self.lock().push(log)
+    }
+
+    /// Get stored logs for a process, or for all of them with `*`.
+    pub fn get(&self, name: &str, limit: Option<usize>) -> Result<Vec<LogLine>, LogStorageError> {
+        self.lock().get(name, limit)
+    }
+
+    /// Query logs with pagination and filtering.
+    pub fn query(&self, query: LogQuery) -> Result<LogQueryResult, LogStorageError> {
+        self.lock().query(query)
     }
 }
 

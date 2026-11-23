@@ -3,6 +3,7 @@
 use crate::pty::ManagedChild;
 use crate::ProcessError;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -31,7 +32,7 @@ pub struct CommandOutput {
 pub struct Executor {
     shell: String,
     working_dir: Option<String>,
-    env: HashMap<String, String>,
+    env: HashMap<OsString, OsString>,
 }
 
 const SHELL_ENV_VAR: &str = "SHELL";
@@ -47,8 +48,18 @@ impl Executor {
         Self {
             shell,
             working_dir: None,
-            env: HashMap::new(),
+            env: std::env::vars_os().collect(),
         }
+    }
+
+    /// The working directory commands run in, when one is set.
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
+    }
+
+    /// The complete environment commands run with.
+    pub fn env(&self) -> &HashMap<OsString, OsString> {
+        &self.env
     }
 
     /// Set the working directory for commands.
@@ -57,17 +68,15 @@ impl Executor {
         self
     }
 
-    /// Set environment variables for commands.
-    /// These are added to the inherited process environment.
-    pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
+    /// Set the complete environment commands run with.
+    ///
+    /// The map replaces the executor's environment whole. Spawning clears the inherited
+    /// environment first, so a variable absent from the map is absent from the command.
+    ///
+    /// A new executor starts from the daemon's own environment. Names and values are `OsString`
+    /// because the daemon's environment need not be UTF-8.
+    pub fn with_env(mut self, env: HashMap<OsString, OsString>) -> Self {
         self.env = env;
-        self
-    }
-
-    /// Extend the environment variables for commands.
-    /// New vars override existing ones with the same key.
-    pub fn extend_env(mut self, env: HashMap<String, String>) -> Self {
-        self.env.extend(env);
         self
     }
 
@@ -102,10 +111,8 @@ impl Executor {
             cmd.current_dir(dir);
         }
 
-        // Add environment variables (extend inherited env)
-        for (key, value) in &self.env {
-            cmd.env(key, value);
-        }
+        cmd.env_clear();
+        cmd.envs(&self.env);
 
         // Create new process group
         unsafe {
@@ -335,5 +342,166 @@ pub enum OutputLine {
 impl Default for Executor {
     fn default() -> Self {
         Self::new(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROBE: &str = "printf '%s' \"${ZAZ_TEST_ABSENT-unset}\"";
+
+    /// Removes a process variable when dropped, so a failed assertion cannot leak it into other
+    /// tests.
+    struct EnvVarGuard(&'static str);
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            std::env::set_var(key, value);
+            Self(key)
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    fn pty_available() -> bool {
+        portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .is_ok()
+    }
+
+    fn complete_env_without_probe() -> HashMap<OsString, OsString> {
+        std::env::set_var("ZAZ_TEST_ABSENT", "inherited");
+
+        let mut env: HashMap<OsString, OsString> = std::env::vars_os().collect();
+        env.remove(std::ffi::OsStr::new("ZAZ_TEST_ABSENT"));
+        env
+    }
+
+    #[test]
+    fn new_executor_starts_from_the_inherited_environment() {
+        std::env::set_var("ZAZ_TEST_SEEDED", "seeded");
+
+        let executor = Executor::new(Some("/bin/sh".to_string()));
+
+        assert_eq!(
+            executor
+                .env()
+                .get(std::ffi::OsStr::new("ZAZ_TEST_SEEDED"))
+                .unwrap(),
+            "seeded"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_inherited_value_does_not_panic_and_survives_into_the_map() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let value = OsString::from_vec(vec![b'o', b'k', 0xff, 0xfe]);
+        let _guard = EnvVarGuard::set("ZAZ_TEST_NON_UTF8", &value);
+
+        let executor = Executor::new(Some("/bin/sh".to_string()));
+
+        let held = executor
+            .env()
+            .get(std::ffi::OsStr::new("ZAZ_TEST_NON_UTF8"))
+            .unwrap();
+        assert_eq!(held.as_bytes(), value.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_value_reaches_the_command_unchanged() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut env = complete_env_without_probe();
+        env.insert(
+            OsString::from("ZAZ_TEST_BYTES"),
+            OsString::from_vec(vec![0xff, b'a', 0xfe]),
+        );
+        let executor = Executor::new(Some("/bin/sh".to_string())).with_env(env);
+
+        let output = executor
+            .run("printf '%s' \"$ZAZ_TEST_BYTES\" | od -An -tx1 | tr -d ' \\n'")
+            .await
+            .unwrap();
+
+        assert_eq!(output.stdout, vec!["ff61fe".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn variable_absent_from_the_map_is_absent_from_the_command() {
+        let executor =
+            Executor::new(Some("/bin/sh".to_string())).with_env(complete_env_without_probe());
+
+        let output = executor.run(PROBE).await.unwrap();
+
+        assert_eq!(output.stdout, vec!["unset".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn variable_present_in_the_map_reaches_the_command() {
+        let mut env = complete_env_without_probe();
+        env.insert(OsString::from("ZAZ_TEST_ABSENT"), OsString::from("mapped"));
+        let executor = Executor::new(Some("/bin/sh".to_string())).with_env(env);
+
+        let output = executor.run(PROBE).await.unwrap();
+
+        assert_eq!(output.stdout, vec!["mapped".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn variable_absent_from_the_map_is_absent_in_a_pty() {
+        if !pty_available() {
+            eprintln!("PTY not available in this environment, skipping test");
+            return;
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let out = temp.path().join("probe.txt");
+        let executor =
+            Executor::new(Some("/bin/sh".to_string())).with_env(complete_env_without_probe());
+
+        let command = format!("{PROBE} > '{}'", out.display());
+        let mut child = executor.spawn(&command, true).unwrap();
+        child.wait().await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "unset");
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_value_reaches_the_command_unchanged_in_a_pty() {
+        use std::os::unix::ffi::OsStringExt;
+
+        if !pty_available() {
+            eprintln!("PTY not available in this environment, skipping test");
+            return;
+        }
+
+        let mut env = complete_env_without_probe();
+        env.insert(
+            OsString::from("ZAZ_TEST_BYTES"),
+            OsString::from_vec(vec![0xff, b'a', 0xfe]),
+        );
+        let executor = Executor::new(Some("/bin/sh".to_string())).with_env(env);
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let out = temp.path().join("bytes.txt");
+        let command = format!(
+            "printf '%s' \"$ZAZ_TEST_BYTES\" | od -An -tx1 | tr -d ' \\n' > '{}'",
+            out.display()
+        );
+        let mut child = executor.spawn(&command, true).unwrap();
+        child.wait().await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "ff61fe");
     }
 }

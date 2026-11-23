@@ -520,7 +520,7 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("could not resolve daemon socket from"));
         assert_eq!(
-            err.hint(),
+            err.hint().as_deref(),
             Some("run this command from a zaz project directory or pass --socket <PATH>")
         );
     }
@@ -584,7 +584,7 @@ mod tests {
             .to_string()
             .contains("could not resolve workspace socket from"));
         assert_eq!(
-            err.hint(),
+            err.hint().as_deref(),
             Some("create a .zaz/ workspace root above your configs or pass --socket <PATH>")
         );
     }
