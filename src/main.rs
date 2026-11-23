@@ -1515,19 +1515,30 @@ pub(crate) fn resolve_autostart_executable() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
 
-    let current_exe = std::env::current_exe()?;
-    if let Some(deps_dir) = current_exe.parent() {
-        if deps_dir.file_name().and_then(|name| name.to_str()) == Some("deps") {
-            if let Some(target_dir) = deps_dir.parent() {
-                let candidate = target_dir.join(env!("CARGO_PKG_NAME"));
-                if candidate.exists() {
-                    return Ok(candidate);
-                }
-            }
-        }
+    Ok(autostart_executable_for(std::env::current_exe()?))
+}
+
+/// A binary named `zaz` launches itself. Any other name is a Cargo unit-test binary, such as
+/// `zaz-<hash>`, which must launch the `zaz` binary Cargo built in the same profile directory.
+///
+/// Cargo's layout for test binaries is not stable: it was `<profile>/deps/`, and since 1.100 it is
+/// `<profile>/build/<pkg>/<hash>/out/`. The nearest ancestor holding a `zaz` file is the profile
+/// directory in both, so the lookup does not encode either layout.
+fn autostart_executable_for(current_exe: PathBuf) -> PathBuf {
+    let name = env!("CARGO_PKG_NAME");
+    if current_exe.file_stem().and_then(|stem| stem.to_str()) == Some(name) {
+        return current_exe;
     }
 
-    Ok(current_exe)
+    current_exe
+        .ancestors()
+        .skip(1)
+        .map(|dir| {
+            dir.join(name)
+                .with_extension(std::env::consts::EXE_EXTENSION)
+        })
+        .find(|candidate| candidate.is_file())
+        .unwrap_or(current_exe)
 }
 
 pub(crate) fn build_daemon_args(
@@ -2082,6 +2093,55 @@ mod tests {
             derive_daemon_output_log_path(Path::new("/tmp/zaz")),
             PathBuf::from("/tmp/zaz.daemon-output.log")
         );
+    }
+
+    /// A unit-test binary must autostart the `zaz` binary built beside it, never itself. Cargo
+    /// placed test binaries in `<profile>/deps/` and, since 1.100, in
+    /// `<profile>/build/<pkg>/<hash>/out/`. Both must find `<profile>/zaz`. This cannot prove
+    /// layouts that a future Cargo invents.
+    #[test]
+    fn autostart_executable_finds_the_built_binary_from_a_test_binary() -> Result<()> {
+        let temp = TempDir::new()?;
+        let profile = temp.path().join("debug");
+        let built = profile.join("zaz");
+        std::fs::create_dir_all(&profile)?;
+        std::fs::write(&built, "")?;
+
+        let layouts = [
+            profile.join("deps"),
+            profile
+                .join("build")
+                .join("zaz")
+                .join("0123abcd")
+                .join("out"),
+        ];
+        for dir in layouts {
+            std::fs::create_dir_all(&dir)?;
+            let test_exe = dir.join("zaz-0123abcd");
+            std::fs::write(&test_exe, "")?;
+
+            assert_eq!(
+                autostart_executable_for(test_exe),
+                built,
+                "from {}",
+                dir.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// An installed `zaz` launches itself, even when another `zaz` sits higher up its path.
+    #[test]
+    fn autostart_executable_keeps_an_installed_binary() -> Result<()> {
+        let temp = TempDir::new()?;
+        std::fs::write(temp.path().join("zaz"), "")?;
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let installed = bin.join("zaz");
+        std::fs::write(&installed, "")?;
+
+        assert_eq!(autostart_executable_for(installed.clone()), installed);
+        Ok(())
     }
 
     #[test]
