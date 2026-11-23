@@ -5,9 +5,11 @@
 mod batch;
 mod error;
 mod glob;
+mod paths;
 mod watcher;
 
 pub use batch::EventBatch;
 pub use error::WatchError;
 pub use glob::PatternSet;
+pub use paths::normalize;
 pub use watcher::{default_ignores, FileEvent, FileEventKind, Watcher, WatcherConfig};

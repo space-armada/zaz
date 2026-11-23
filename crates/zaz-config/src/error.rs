@@ -295,6 +295,40 @@ pub enum ValidationErrorKind {
         /// Name of the service.
         service: String,
     },
+    /// `env_command_timeout` is set and no level of the config sets an `env_command`.
+    EnvCommandTimeoutWithoutCommand,
+    /// A level lists `env_watch` paths and sets no `env_command` of its own to re-run.
+    EnvWatchWithoutCommand {
+        /// The level, such as `group 'api'`.
+        level: String,
+    },
+    /// An `env_command` references a file-context built-in variable, which is never populated
+    /// because the command runs at load.
+    EnvCommandFileBuiltin {
+        /// The declaring field, such as `group 'api' env_command`.
+        field: String,
+        /// The offending built-in name, e.g. `zaz:files`.
+        builtin: String,
+    },
+    /// An `env_command` references a variable that `[variables]` does not define.
+    EnvCommandUndefinedVariable {
+        /// The declaring field, such as `group 'api' env_command`.
+        field: String,
+        /// The undefined variable name.
+        name: String,
+    },
+    /// An `env_command` holds a `${` with no closing brace.
+    EnvCommandMalformedVariable {
+        /// The declaring field, such as `group 'api' env_command`.
+        field: String,
+    },
+    /// An `env_passthrough` entry is not a variable name or a `PREFIX_*` pattern.
+    InvalidEnvPassthrough {
+        /// The entry as written.
+        entry: String,
+        /// What is wrong with it.
+        problem: String,
+    },
     /// A key that no config table defines.
     UnknownKey {
         /// The unrecognized key.
@@ -325,6 +359,12 @@ impl ValidationErrorKind {
             Self::ConflictingStopMechanism { .. } => "conflicting_stop_mechanism",
             Self::ReadyTuningWithoutCheck { .. } => "ready_tuning_without_check",
             Self::ZeroReadyPollInterval { .. } => "zero_ready_poll_interval",
+            Self::EnvCommandTimeoutWithoutCommand => "env_command_timeout_without_command",
+            Self::EnvWatchWithoutCommand { .. } => "env_watch_without_command",
+            Self::EnvCommandFileBuiltin { .. } => "env_command_file_builtin",
+            Self::EnvCommandUndefinedVariable { .. } => "env_command_undefined_variable",
+            Self::EnvCommandMalformedVariable { .. } => "env_command_malformed_variable",
+            Self::InvalidEnvPassthrough { .. } => "invalid_env_passthrough",
             Self::UnknownKey { .. } => "unknown_key",
         }
     }
@@ -442,6 +482,37 @@ impl fmt::Display for ValidationErrorKind {
                     "group '{}': service '{}' has a zero ready_poll_interval",
                     group, service
                 )
+            }
+            Self::EnvCommandTimeoutWithoutCommand => {
+                write!(
+                    f,
+                    "settings: env_command_timeout is set but no env_command exists to time"
+                )
+            }
+            Self::EnvWatchWithoutCommand { level } => {
+                write!(
+                    f,
+                    "{level}: env_watch is set but the same level has no env_command to re-run"
+                )
+            }
+            Self::EnvCommandFileBuiltin { field, builtin } => {
+                write!(
+                    f,
+                    "{field} references ${{{builtin}}}, which is only populated for file-change \
+                     triggers and is unavailable to a command that runs at load"
+                )
+            }
+            Self::EnvCommandUndefinedVariable { field, name } => {
+                write!(
+                    f,
+                    "{field} references ${{{name}}}, which [variables] does not define"
+                )
+            }
+            Self::EnvCommandMalformedVariable { field } => {
+                write!(f, "{field} has a '${{' with no closing '}}'")
+            }
+            Self::InvalidEnvPassthrough { entry, problem } => {
+                write!(f, "settings: env_passthrough entry '{entry}': {problem}")
             }
             Self::UnknownKey { key, table } if table.is_empty() => {
                 write!(f, "unknown key '{}' at the top level", key)

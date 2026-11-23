@@ -213,6 +213,7 @@ Mapping to subcommands:
 | Subcommand | `0` | `1` | `3` |
 |------------|-----|-----|-----|
 | `status` | running | operational error | not running |
+| `env` | report printed | operational error | not running |
 | `restart` | restart succeeded | no daemon, or API error | — |
 | `reload` | reload succeeded | no daemon, or API error | — |
 | `start` | running (already or just started) | start failed | — |
@@ -407,6 +408,54 @@ prints the full no-daemon block on stdout, hint included; see
 This subcommand takes no arguments or flags.
 
 <!-- END: zaz status -->
+
+### zaz env
+
+Query: shows the environment variable names the running config loaded, and which source each came
+from. The view is labeled as the running config. It shows key names and never a value. When a
+source failed, the error it shows carries the failed command's stderr, capped and stripped of
+escape sequences, so check that text before pasting it.
+
+Each group lists the sources that apply to it, in the order they are applied: an `env_file`, an
+`env_command`, then the inline `env` table, from the `[settings]` level down. Each task and service
+lists the sources it adds. A source shows the names it set and the names it unset. A source that
+set and unset nothing says `produced no keys`. That is the signal for an `env_command` such as
+`direnv export json` that printed nothing, for example because the directory has no `.envrc` or the group's
+`working_dir` is wrong. A blocked `.envrc` is not this case. direnv exits non-zero then, and the load fails with its
+message.
+
+The view also lists the inherited variable names the base environment dropped, when a level sets an `env_command`.
+
+The keys come from the running config, not from the files on disk. An edit that the daemon has not
+loaded is not shown. When the last refresh of a watched source failed, the view shows the failure
+above the environment the daemon is still running on. Name a group to show only that group.
+
+Against a workspace supervisor, pass `--project` to select one member. A query is always scoped to
+one member.
+
+A daemon started by an older zaz does not know this query. The command exits `1` and says the
+daemon is too old. Restart it with `zaz stop` and `zaz start`.
+
+| Exit | Meaning |
+|------|---------|
+| `0` | report printed |
+| `1` | operational error (e.g. unknown group, workspace without `--project`, daemon too old) |
+| `3` | daemon not running |
+
+<!-- BEGIN: zaz env -->
+**Positional arguments**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `GROUP` | no | Group to show (omit for all) |
+
+**Flags**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--project` `<PROJECT>` | — | Workspace project to show (required against a workspace supervisor) |
+
+<!-- END: zaz env -->
 
 ### zaz restart
 

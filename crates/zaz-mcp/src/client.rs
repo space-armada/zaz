@@ -10,7 +10,10 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use zaz_config::Config;
-use zaz_daemon::{discover_config_upward, ApiRequest, ApiResponse, Client, DaemonState, LogLine};
+use zaz_daemon::{
+    discover_config_upward, is_unknown_request_error, ApiRequest, ApiResponse, Client, DaemonState,
+    EnvReport, LogLine,
+};
 
 use crate::error::McpError;
 use crate::types::LogsRequest;
@@ -69,6 +72,36 @@ pub async fn fetch_logs(socket_path: &Path, req: &LogsRequest) -> Result<LogsPag
         ApiResponse::Error { message } => Err(McpError::UnexpectedResponse(message)),
         other => Err(McpError::UnexpectedResponse(format!(
             "expected Logs, got {:?}",
+            other
+        ))),
+    }
+}
+
+/// Fetch the key names the running config loaded.
+///
+/// An older daemon answers an unknown-request error, which becomes [`McpError::DaemonTooOld`].
+pub async fn fetch_env(socket_path: &Path, project: Option<&str>) -> Result<EnvReport, McpError> {
+    let mut client = open_client(socket_path).await?;
+    let response = client
+        .request(&ApiRequest::GetEnv {
+            project: project.map(str::to_string),
+        })
+        .await?;
+
+    env_from_response(response)
+}
+
+fn env_from_response(response: ApiResponse) -> Result<EnvReport, McpError> {
+    match response {
+        ApiResponse::Env { report } => Ok(report),
+        ApiResponse::Error { message } if is_unknown_request_error(&message, "get_env") => {
+            Err(McpError::DaemonTooOld {
+                feature: "the loaded environment report",
+            })
+        }
+        ApiResponse::Error { message } => Err(McpError::UnexpectedResponse(message)),
+        other => Err(McpError::UnexpectedResponse(format!(
+            "expected Env, got {:?}",
             other
         ))),
     }
@@ -186,6 +219,33 @@ mod tests {
             }
             other => panic!("expected DaemonNotRunning, got: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_env_returns_daemon_not_running_when_socket_absent() {
+        let tmp = TempDir::new().unwrap();
+        let err = fetch_env(&missing_socket(tmp.path()), None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, McpError::DaemonNotRunning { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn an_unknown_request_answer_means_the_daemon_is_too_old() {
+        let older = ApiResponse::error(
+            "invalid request: unknown variant `get_env`, expected one of `status`, `subscribe`",
+        );
+        assert!(matches!(
+            env_from_response(older),
+            Err(McpError::DaemonTooOld { .. })
+        ));
+
+        let refused = ApiResponse::error("unknown project 'x'");
+        assert!(matches!(
+            env_from_response(refused),
+            Err(McpError::UnexpectedResponse(message)) if message == "unknown project 'x'"
+        ));
     }
 
     #[tokio::test]

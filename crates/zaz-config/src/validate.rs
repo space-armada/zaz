@@ -1,5 +1,6 @@
 //! Configuration validation.
 
+use crate::env_command::declared_env_commands;
 use crate::error::{ValidationError, ValidationErrorKind, ValidationErrors};
 use crate::toml_spanned::SpanInfo;
 use crate::{Config, ServiceCommand};
@@ -70,6 +71,7 @@ pub(crate) fn collect_errors(
     validate_dependencies(config, source, span_info, errors);
     validate_patterns(config, errors);
     validate_commands(config, errors);
+    validate_env_commands(config, errors);
 }
 
 /// Validate group definitions.
@@ -344,6 +346,148 @@ fn validate_commands(config: &Config, errors: &mut ValidationErrors) {
             service_names.insert(name);
         }
     }
+}
+
+/// Validate the `env_command` fields and the settings that tune them.
+///
+/// The command runs only at load, so a file-context built-in could never mean anything in it. An
+/// undefined variable is found against `[variables]` here, so `zaz check` catches it without
+/// running anything. In a service's `command` the same mistake only logs at spawn.
+fn validate_env_commands(config: &Config, errors: &mut ValidationErrors) {
+    let declared = declared_env_commands(config);
+
+    if config.settings.env_command_timeout.is_some() && declared.is_empty() {
+        errors.push(
+            ValidationError::new(ValidationErrorKind::EnvCommandTimeoutWithoutCommand)
+                .with_hint("this only applies to an env_command; add one or remove the field"),
+        );
+    }
+
+    for level in levels_with_env_watch_and_no_command(config) {
+        errors.push(
+            ValidationError::new(ValidationErrorKind::EnvWatchWithoutCommand { level }).with_hint(
+                "env_watch re-runs the same level's env_command; add one or remove the field",
+            ),
+        );
+    }
+
+    for entry in &config.settings.env_passthrough {
+        if let Some(problem) = passthrough_problem(entry) {
+            errors.push(
+                ValidationError::new(ValidationErrorKind::InvalidEnvPassthrough {
+                    entry: entry.clone(),
+                    problem: problem.to_string(),
+                })
+                .with_hint(
+                    "list a variable name such as 'AWS_PROFILE', or a prefix such as 'OP_*'",
+                ),
+            );
+        }
+    }
+
+    for source in declared {
+        for name in zaz_vars::references(source.command) {
+            if zaz_vars::FILE_CONTEXT_BUILTINS.contains(&name) {
+                errors.push(
+                    ValidationError::new(ValidationErrorKind::EnvCommandFileBuiltin {
+                        field: source.field.clone(),
+                        builtin: name.to_string(),
+                    })
+                    .with_hint("only ${zaz:root} and [variables] are available to env_command"),
+                );
+            } else if name != "zaz:root" && !config.variables.contains_key(name) {
+                errors.push(
+                    ValidationError::new(ValidationErrorKind::EnvCommandUndefinedVariable {
+                        field: source.field.clone(),
+                        name: name.to_string(),
+                    })
+                    .with_hint(
+                        "define it under [variables], or escape the dollar sign as \\${...}",
+                    ),
+                );
+            }
+        }
+
+        if has_unterminated_reference(source.command) {
+            errors.push(
+                ValidationError::new(ValidationErrorKind::EnvCommandMalformedVariable {
+                    field: source.field.clone(),
+                })
+                .with_hint("close the reference, or escape the dollar sign as \\${"),
+            );
+        }
+    }
+}
+
+/// The levels that list `env_watch` paths and set no `env_command` of their own.
+fn levels_with_env_watch_and_no_command(config: &Config) -> Vec<String> {
+    let mut levels = Vec::new();
+
+    if !config.settings.env_watch.is_empty() && config.settings.env_command.is_none() {
+        levels.push("settings".to_string());
+    }
+
+    for group in &config.groups {
+        if !group.env_watch.is_empty() && group.env_command.is_none() {
+            levels.push(format!("group '{}'", group.name));
+        }
+
+        for task in &group.tasks {
+            if !task.env_watch.is_empty() && task.env_command.is_none() {
+                levels.push(format!("group '{}' task '{}'", group.name, task.name()));
+            }
+        }
+
+        for service in &group.services {
+            if !service.env_watch.is_empty() && service.env_command.is_none() {
+                levels.push(format!(
+                    "group '{}' service '{}'",
+                    group.name,
+                    service.name()
+                ));
+            }
+        }
+    }
+
+    levels
+}
+
+/// Whether `command` holds a `${` that the expander would reject for lacking a closing brace.
+fn has_unterminated_reference(command: &str) -> bool {
+    let context = zaz_vars::Context::new().with_root(std::path::PathBuf::from("/"));
+
+    matches!(
+        zaz_vars::Expander::new(&context).expand(command),
+        Err(zaz_vars::VarError::Malformed(_))
+    )
+}
+
+/// What is wrong with an `env_passthrough` entry, when anything is.
+///
+/// An entry is a variable name, or a prefix followed by one trailing `*`.
+fn passthrough_problem(entry: &str) -> Option<&'static str> {
+    let prefix = entry.strip_suffix('*').unwrap_or(entry);
+
+    if entry.is_empty() {
+        return Some("the entry is empty");
+    }
+
+    if entry.ends_with('*') && prefix.is_empty() {
+        return Some("a pattern needs a prefix before the '*'");
+    }
+
+    if prefix.contains('*') {
+        return Some("'*' is only allowed as the last character");
+    }
+
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Some("names hold only letters, digits, and underscores");
+    }
+
+    None
 }
 
 /// Validate one command-carrying field of a service.
@@ -1135,6 +1279,94 @@ mod tests {
             "expected empty command error, got: {}",
             msg
         );
+    }
+
+    fn codes(config: &Config) -> Vec<&'static str> {
+        match validate(config) {
+            Ok(()) => Vec::new(),
+            Err(errors) => errors.iter().map(|e| e.kind.code()).collect(),
+        }
+    }
+
+    fn env_command_config(toml: &str) -> Config {
+        crate::parse_toml(toml).unwrap()
+    }
+
+    #[test]
+    fn test_env_command_timeout_without_a_command_rejected() {
+        let config = env_command_config(
+            "[settings]\nenv_command_timeout = \"5s\"\n\n[[group]]\nname = \"a\"\npatterns = [\"*\"]\n",
+        );
+
+        assert_eq!(codes(&config), vec!["env_command_timeout_without_command"]);
+    }
+
+    #[test]
+    fn test_env_command_timeout_with_a_command_at_any_level_validates() {
+        let config = env_command_config(
+            "[settings]\nenv_command_timeout = \"5s\"\n\n\
+             [[group]]\nname = \"a\"\npatterns = [\"*\"]\n\n\
+             [[group.service]]\ncommand = \"x\"\nenv_command = \"true\"\n",
+        );
+
+        assert!(codes(&config).is_empty());
+    }
+
+    #[test]
+    fn test_env_watch_without_a_command_at_its_own_level_rejected() {
+        let config = env_command_config(
+            "[settings]\nenv_command = \"true\"\nenv_watch = [\".envrc\"]\n\n\
+             [[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_watch = [\"x\"]\n\n\
+             [[group.task]]\ncommand = \"t\"\nenv_watch = [\"y\"]\n\n\
+             [[group.service]]\ncommand = \"s\"\nenv_command = \"true\"\nenv_watch = [\"z\"]\n",
+        );
+
+        assert_eq!(
+            codes(&config),
+            vec!["env_watch_without_command", "env_watch_without_command"]
+        );
+    }
+
+    #[test]
+    fn test_env_command_rejects_file_builtins_and_undefined_names() {
+        let config = env_command_config(
+            "[variables]\nknown = \"1\"\n\n\
+             [settings]\nenv_command = \"echo ${known} ${zaz:root} \\\\${escaped}\"\n\n\
+             [[group]]\nname = \"a\"\npatterns = [\"*\"]\nenv_command = \"x ${zaz:files} ${nope}\"\n",
+        );
+
+        assert_eq!(
+            codes(&config),
+            vec!["env_command_file_builtin", "env_command_undefined_variable"]
+        );
+    }
+
+    #[test]
+    fn test_env_command_rejects_an_unterminated_reference() {
+        let config = env_command_config(
+            "[settings]\nenv_command = \"echo ${oops\"\n\n[[group]]\nname = \"a\"\npatterns = [\"*\"]\n",
+        );
+
+        assert_eq!(codes(&config), vec!["env_command_malformed_variable"]);
+    }
+
+    #[test]
+    fn test_env_passthrough_entries_are_names_or_prefixes() {
+        for good in ["HOME", "OP_*", "A1_b"] {
+            assert_eq!(passthrough_problem(good), None, "{good}");
+        }
+
+        for bad in ["", "*", "A*B", "A**", "A-B", "A B", "A=B"] {
+            assert!(passthrough_problem(bad).is_some(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_env_passthrough_is_a_coded_error() {
+        let mut config = Config::default();
+        config.settings.env_passthrough = vec!["OK".to_string(), "bad name".to_string()];
+
+        assert_eq!(codes(&config), vec!["invalid_env_passthrough"]);
     }
 
     #[test]

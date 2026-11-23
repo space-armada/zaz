@@ -12,8 +12,9 @@ use zaz_config::{
     Config, Group, LogFormat, ServiceCommand, Settings, Signal, Silence, TaskCommand,
 };
 use zaz_daemon::{
-    DaemonState, DaemonStatus, GroupState, GroupStatus, LoadError, LogLine, LogSource, OutputKind,
-    ProcessState, ProcessStatus,
+    DaemonState, DaemonStatus, EnvLevel, EnvReport, EnvSourceKind, EnvSourceReport, EnvStart,
+    GroupEnvReport, GroupState, GroupStatus, LoadError, LogLine, LogSource, OutputKind,
+    ProcessEnvReport, ProcessState, ProcessStatus,
 };
 
 /// Top-level daemon status response for the `zaz_status` tool.
@@ -31,6 +32,14 @@ pub struct StatusReport {
     /// built until the config is fixed and reloaded. A later reload failure never sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_error: Option<LoadErrorReport>,
+    /// Why the last refresh of a watched source failed, when it did. The daemon keeps running on
+    /// the environment it already applied until a refresh succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_refresh_error: Option<LoadErrorReport>,
+    /// Failed environment refreshes per workspace member, reported by a workspace supervisor.
+    /// Each member is still running. `env_refresh_error` carries the first of these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_refresh_errors: Vec<MemberErrorReport>,
     /// Errors per workspace member, reported by a workspace supervisor.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_errors: Vec<MemberErrorReport>,
@@ -154,6 +163,121 @@ pub struct LogsRequest {
     pub search: Option<String>,
 }
 
+/// Input parameters for the `zaz_env` tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct EnvRequest {
+    /// Project token selecting one workspace member. Required against a workspace supervisor;
+    /// omit for a single-config daemon.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Group to report. Omit for every group.
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// The loaded environment of the running config, for the `zaz_env` tool.
+///
+/// It holds key names and where each came from, never values. The error text of a failed source
+/// can carry that command's stderr.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvToolReport {
+    /// What this report describes. It reflects the running config, so an edit to `zaz.toml` or to
+    /// a source that has not been reloaded or picked up by the watcher is not in it.
+    pub scope: String,
+    /// The workspace project this report describes, when the daemon is a workspace supervisor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Overall lifecycle state of the daemon. `starting` with no groups means nothing is loaded.
+    pub daemon_status: DaemonStatusReport,
+    /// Why the first load failed, when it did. No keys are reported then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<LoadErrorReport>,
+    /// Why the last refresh of a watched source failed, when it did. The groups show the
+    /// environment the daemon is still running on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_error: Option<LoadErrorReport>,
+    /// Inherited variable names the base environment dropped, for chains that start from it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped_inherited: Vec<String>,
+    /// The groups, in declaration order.
+    pub groups: Vec<EnvGroupReport>,
+}
+
+/// The environment sources of one group and its processes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvGroupReport {
+    pub name: String,
+    /// What the group's own environment starts from.
+    pub starts_from: EnvStartReport,
+    /// Sources that apply to the group, in the order they are applied.
+    pub sources: Vec<EnvSourceInfo>,
+    pub tasks: Vec<EnvProcessReport>,
+    pub services: Vec<EnvProcessReport>,
+}
+
+/// The environment sources of one task or service.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvProcessReport {
+    pub name: String,
+    /// What the process's environment starts from.
+    pub starts_from: EnvStartReport,
+    /// Sources that apply to the process, in the order they are applied. They run from the
+    /// settings level through the group's and then the process's own.
+    pub sources: Vec<EnvSourceInfo>,
+}
+
+/// What a chain of sources is applied to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvStartReport {
+    /// The daemon's own environment.
+    Daemon,
+    /// The fixed base environment plus any `env_passthrough` names.
+    Base,
+}
+
+/// The config level a source was declared at.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvLevelReport {
+    Settings,
+    Group,
+    Task,
+    Service,
+}
+
+/// The kind of environment source.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvSourceKindReport {
+    /// An `env_file`.
+    File,
+    /// An `env_command`.
+    Command,
+    /// An inline `env` table.
+    Inline,
+}
+
+/// The key names one source set and unset.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EnvSourceInfo {
+    pub level: EnvLevelReport,
+    /// The config field, such as `group 'api' env_file`.
+    pub field: String,
+    pub kind: EnvSourceKindReport,
+    /// The `env_file` path or `env_command` as written in the config. Unset for an inline table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Names the source set.
+    pub set: Vec<String>,
+    /// Names the source removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unset: Vec<String>,
+    /// True when the source set and unset nothing. An `env_command` that prints nothing, such as
+    /// `direnv export json` with an unallowed or missing `.envrc`, looks like this.
+    pub produced_no_keys: bool,
+}
+
 /// Input parameters for the `zaz_restart_group` tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RestartGroupRequest {
@@ -256,6 +380,15 @@ pub struct ConfigSettings {
     pub log_format: LogFormatReport,
     /// The `env_file` path as written. Loaded values are never shown.
     pub env_file: Option<String>,
+    /// The `env_command` as written. Its output is never shown.
+    pub env_command: Option<String>,
+    /// Literal paths whose changes re-run the `env_command`, as written.
+    #[serde(default)]
+    pub env_watch: Vec<String>,
+    /// Extra variable names, or `PREFIX_*` patterns, kept from the daemon's environment.
+    pub env_passthrough: Vec<String>,
+    /// The `env_command_timeout` in milliseconds, when set.
+    pub env_command_timeout_ms: Option<u64>,
 }
 
 /// Log output format.
@@ -276,6 +409,10 @@ pub struct ConfigGroup {
     pub depends_on: Vec<String>,
     pub working_dir: Option<String>,
     pub env_file: Option<String>,
+    pub env_command: Option<String>,
+    /// Literal paths whose changes re-run the `env_command`, as written.
+    #[serde(default)]
+    pub env_watch: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tasks: Vec<ConfigTask>,
     pub services: Vec<ConfigService>,
@@ -290,6 +427,10 @@ pub struct ConfigTask {
     pub silence: SilenceReport,
     pub working_dir: Option<String>,
     pub env_file: Option<String>,
+    pub env_command: Option<String>,
+    /// Literal paths whose changes re-run the `env_command`, as written.
+    #[serde(default)]
+    pub env_watch: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -311,6 +452,10 @@ pub struct ConfigService {
     pub ready_poll_interval_ms: Option<u64>,
     pub ready_timeout_ms: Option<u64>,
     pub env_file: Option<String>,
+    pub env_command: Option<String>,
+    /// Literal paths whose changes re-run the `env_command`, as written.
+    #[serde(default)]
+    pub env_watch: Vec<String>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -345,6 +490,15 @@ impl From<&DaemonState> for StatusReport {
             last_change_ms: state.last_change,
             groups: state.groups.values().map(GroupReport::from).collect(),
             load_error: state.load_error.as_ref().map(LoadErrorReport::from),
+            env_refresh_error: state.env_refresh_error.as_ref().map(LoadErrorReport::from),
+            member_refresh_errors: state
+                .member_refresh_errors
+                .iter()
+                .map(|m| MemberErrorReport {
+                    member: m.member.clone(),
+                    error: LoadErrorReport::from(&m.error),
+                })
+                .collect(),
             member_errors: state
                 .member_errors
                 .iter()
@@ -353,6 +507,91 @@ impl From<&DaemonState> for StatusReport {
                     error: LoadErrorReport::from(&m.error),
                 })
                 .collect(),
+        }
+    }
+}
+
+impl EnvToolReport {
+    /// Build the tool report from the daemon's, narrowed to `group` when one is named.
+    ///
+    /// Returns `None` when `group` names no group of a loaded config.
+    pub fn from_daemon(report: &EnvReport, group: Option<&str>) -> Option<Self> {
+        let groups: Vec<EnvGroupReport> = report
+            .groups
+            .iter()
+            .filter(|candidate| group.map_or(true, |name| candidate.name == name))
+            .map(EnvGroupReport::from)
+            .collect();
+
+        if group.is_some() && groups.is_empty() && !report.groups.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            scope: "Key names loaded by the running config. Values are never reported. Edits to \
+                    zaz.toml or to a source that the daemon has not reloaded or picked up are not \
+                    reflected."
+                .to_string(),
+            project: report.project.clone(),
+            daemon_status: report.status.into(),
+            load_error: report.load_error.as_ref().map(LoadErrorReport::from),
+            refresh_error: report.refresh_error.as_ref().map(LoadErrorReport::from),
+            dropped_inherited: report.dropped_inherited.clone(),
+            groups,
+        })
+    }
+}
+
+impl From<&GroupEnvReport> for EnvGroupReport {
+    fn from(group: &GroupEnvReport) -> Self {
+        Self {
+            name: group.name.clone(),
+            starts_from: group.starts_from.into(),
+            sources: group.sources.iter().map(EnvSourceInfo::from).collect(),
+            tasks: group.tasks.iter().map(EnvProcessReport::from).collect(),
+            services: group.services.iter().map(EnvProcessReport::from).collect(),
+        }
+    }
+}
+
+impl From<&ProcessEnvReport> for EnvProcessReport {
+    fn from(process: &ProcessEnvReport) -> Self {
+        Self {
+            name: process.name.clone(),
+            starts_from: process.starts_from.into(),
+            sources: process.sources.iter().map(EnvSourceInfo::from).collect(),
+        }
+    }
+}
+
+impl From<&EnvSourceReport> for EnvSourceInfo {
+    fn from(source: &EnvSourceReport) -> Self {
+        Self {
+            level: match source.level {
+                EnvLevel::Settings => EnvLevelReport::Settings,
+                EnvLevel::Group => EnvLevelReport::Group,
+                EnvLevel::Task => EnvLevelReport::Task,
+                EnvLevel::Service => EnvLevelReport::Service,
+            },
+            field: source.field.clone(),
+            kind: match source.kind {
+                EnvSourceKind::File => EnvSourceKindReport::File,
+                EnvSourceKind::Command => EnvSourceKindReport::Command,
+                EnvSourceKind::Inline => EnvSourceKindReport::Inline,
+            },
+            origin: source.origin.clone(),
+            set: source.set.clone(),
+            unset: source.unset.clone(),
+            produced_no_keys: source.produced_no_keys,
+        }
+    }
+}
+
+impl From<EnvStart> for EnvStartReport {
+    fn from(start: EnvStart) -> Self {
+        match start {
+            EnvStart::Daemon => Self::Daemon,
+            EnvStart::Base => Self::Base,
         }
     }
 }
@@ -513,6 +752,10 @@ impl From<&Settings> for ConfigSettings {
             debounce_ms: s.debounce_ms(),
             log_format: s.log_format.into(),
             env_file: s.env_file.clone(),
+            env_command: s.env_command.clone(),
+            env_watch: s.env_watch.clone(),
+            env_passthrough: s.env_passthrough.clone(),
+            env_command_timeout_ms: s.env_command_timeout.map(|t| t.as_millis()),
         }
     }
 }
@@ -536,6 +779,8 @@ impl From<&Group> for ConfigGroup {
             depends_on: g.depends_on.clone(),
             working_dir: g.working_dir.clone(),
             env_file: g.env_file.clone(),
+            env_command: g.env_command.clone(),
+            env_watch: g.env_watch.clone(),
             env: g.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             tasks: g.tasks.iter().map(ConfigTask::from).collect(),
             services: g.services.iter().map(ConfigService::from).collect(),
@@ -552,6 +797,8 @@ impl From<&TaskCommand> for ConfigTask {
             silence: t.silence.into(),
             working_dir: t.working_dir.clone(),
             env_file: t.env_file.clone(),
+            env_command: t.env_command.clone(),
+            env_watch: t.env_watch.clone(),
             env: t.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         }
     }
@@ -571,6 +818,8 @@ impl From<&ServiceCommand> for ConfigService {
             silence: d.silence.into(),
             working_dir: d.working_dir.clone(),
             env_file: d.env_file.clone(),
+            env_command: d.env_command.clone(),
+            env_watch: d.env_watch.clone(),
             delay_ms: d.delay_ms(),
             stop_timeout_ms: d.stop_timeout_ms(),
             ready_poll_interval_ms: d.ready_poll_interval_ms(),
@@ -662,6 +911,30 @@ mod tests {
         assert_eq!(error.code, "env_file_missing");
         assert_eq!(error.hint.as_deref(), Some("create it"));
         assert!(report.member_errors.is_empty());
+    }
+
+    #[test]
+    fn status_report_carries_every_member_refresh_failure() {
+        let state = DaemonState {
+            env_refresh_error: Some(LoadError::new("a", "member 'api': x")),
+            member_refresh_errors: vec![
+                MemberError {
+                    member: "api".to_string(),
+                    error: LoadError::new("a", "x"),
+                },
+                MemberError {
+                    member: "web".to_string(),
+                    error: LoadError::new("b", "y"),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let report = StatusReport::from(&state);
+
+        assert!(report.env_refresh_error.is_some());
+        assert_eq!(report.member_refresh_errors.len(), 2);
+        assert_eq!(report.member_refresh_errors[1].member, "web");
     }
 
     #[test]
@@ -758,14 +1031,22 @@ mod tests {
 
         let mut task = TaskCommand::new("build", "make");
         task.env_file = Some("task.env".to_string());
+        task.env_command = Some("mise env --json".to_string());
+        task.env_watch = vec!["mise.toml".to_string()];
         let mut service = ServiceCommand::new("web", "run");
         service.env_file = Some("svc.env".to_string());
+        service.env_command = Some("dotenvx get --format json".to_string());
 
         let mut config = Config::default();
         config.settings.env_file = Some("secrets.env".to_string());
+        config.settings.env_command = Some("direnv export json".to_string());
+        config.settings.env_passthrough = vec!["OP_*".to_string()];
+        config.settings.env_watch = vec![".envrc".to_string(), "../flake.nix".to_string()];
+        config.settings.env_command_timeout = Some(zaz_config::HumanDuration::from_millis(30_000));
         config.groups.push(Group {
             name: "api".to_string(),
             env_file: Some("group.env".to_string()),
+            env_command: Some("sops -d x.json".to_string()),
             tasks: vec![task],
             services: vec![service],
             ..Default::default()
@@ -774,6 +1055,26 @@ mod tests {
         let report = ConfigReport::from_config(&dir.path().join("zaz.toml"), &config);
 
         assert_eq!(report.settings.env_file.as_deref(), Some("secrets.env"));
+        assert_eq!(
+            report.settings.env_command.as_deref(),
+            Some("direnv export json")
+        );
+        assert_eq!(report.settings.env_passthrough, vec!["OP_*".to_string()]);
+        assert_eq!(report.settings.env_watch, [".envrc", "../flake.nix"]);
+        assert_eq!(report.groups[0].tasks[0].env_watch, ["mise.toml"]);
+        assert_eq!(report.settings.env_command_timeout_ms, Some(30_000));
+        assert_eq!(
+            report.groups[0].env_command.as_deref(),
+            Some("sops -d x.json")
+        );
+        assert_eq!(
+            report.groups[0].tasks[0].env_command.as_deref(),
+            Some("mise env --json")
+        );
+        assert_eq!(
+            report.groups[0].services[0].env_command.as_deref(),
+            Some("dotenvx get --format json")
+        );
         assert_eq!(report.groups[0].env_file.as_deref(), Some("group.env"));
         assert_eq!(
             report.groups[0].tasks[0].env_file.as_deref(),

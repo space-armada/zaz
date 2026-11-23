@@ -26,6 +26,20 @@ pub struct DaemonState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_error: Option<LoadError>,
 
+    /// Why the last refresh of a watched source failed, when it did.
+    ///
+    /// The daemon keeps running on the environment it applied last. A refresh that succeeds
+    /// clears this. It is never `load_error`, which is only for a first load that left nothing
+    /// built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_refresh_error: Option<LoadError>,
+
+    /// Failed environment refreshes per workspace member, reported only by a workspace
+    /// supervisor. A member with a refresh failure is still running, so this is not
+    /// `member_errors`. `env_refresh_error` carries the first of these, tagged with its member.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_refresh_errors: Vec<MemberError>,
+
     /// Errors per workspace member, reported only by a workspace supervisor.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub member_errors: Vec<MemberError>,

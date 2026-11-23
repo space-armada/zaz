@@ -6,8 +6,10 @@ license.workspace = true
 description = "Process management for zaz"
 
 [dependencies]
+libc.workspace = true
 nix.workspace = true
 portable-pty.workspace = true
+regex.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

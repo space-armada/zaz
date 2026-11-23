@@ -12,8 +12,9 @@ pub use error::McpError;
 pub use server::{run, McpRunOptions, ZazMcpServer};
 pub use types::{
     ConfigGroup, ConfigReport, ConfigService, ConfigSettings, ConfigTask, DaemonStatusReport,
-    GroupReport, GroupStatusReport, GroupSummary, GroupsReport, LogEntry, LogFormatReport,
-    LogSourceReport, LogsReport, LogsRequest, MutationReport, OutputKindReport, ProcessKind,
-    ProcessReport, ProcessStatusReport, RestartGroupRequest, RestartProcessRequest, SignalReport,
-    SilenceReport, StatusReport,
+    EnvGroupReport, EnvLevelReport, EnvProcessReport, EnvRequest, EnvSourceInfo,
+    EnvSourceKindReport, EnvStartReport, EnvToolReport, GroupReport, GroupStatusReport,
+    GroupSummary, GroupsReport, LogEntry, LogFormatReport, LogSourceReport, LogsReport,
+    LogsRequest, MutationReport, OutputKindReport, ProcessKind, ProcessReport, ProcessStatusReport,
+    RestartGroupRequest, RestartProcessRequest, SignalReport, SilenceReport, StatusReport,
 };

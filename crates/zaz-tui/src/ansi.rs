@@ -163,13 +163,6 @@ fn apply_ansi_codes(style: Style, codes: &str) -> Style {
     result
 }
 
-/// Strip all ANSI escape codes from a string.
-///
-/// Useful for getting plain text content for matching/filtering.
-pub fn strip_ansi(input: &str) -> String {
-    ANSI_SGR_REGEX.replace_all(input, "").to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,13 +236,6 @@ mod tests {
         assert_eq!(line.spans.len(), 2);
         assert_eq!(line.spans[0].style.fg, Some(Color::Red));
         assert_eq!(line.spans[1].style.fg, None);
-    }
-
-    #[test]
-    fn test_strip_ansi() {
-        let input = "\x1b[31mError\x1b[0m: \x1b[1msomething\x1b[0m failed";
-        let stripped = strip_ansi(input);
-        assert_eq!(stripped, "Error: something failed");
     }
 
     #[test]

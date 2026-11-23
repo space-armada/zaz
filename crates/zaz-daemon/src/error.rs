@@ -19,6 +19,10 @@ pub enum DaemonError {
     #[error("{}", format_env_file_errors(.0))]
     EnvFile(Vec<zaz_config::EnvFileError>),
 
+    /// An `env_command` failed.
+    #[error("{}", .0.with_code())]
+    EnvCommand(Box<crate::env_command::EnvCommandError>),
+
     /// The thread that loads and evaluates a config panicked.
     #[error("loading the config panicked")]
     EvaluationPanicked,
@@ -123,6 +127,7 @@ impl DaemonError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::EnvFile(errors) => errors.first().map_or("env_file_error", |e| e.code()),
+            Self::EnvCommand(error) => error.code(),
             Self::Config(error) => error.code(),
             Self::EvaluationPanicked => "evaluation_panicked",
             Self::EvaluationThread(_) => "evaluation_unavailable",
@@ -148,6 +153,7 @@ impl DaemonError {
     pub fn hint(&self) -> Option<String> {
         match self {
             Self::EnvFile(errors) => errors.first().and_then(|e| e.hint()).map(str::to_string),
+            Self::EnvCommand(errors) => errors.hint().map(str::to_string),
             Self::Config(zaz_config::ConfigError::Validation(errors)) => {
                 errors.iter().next().and_then(|e| e.hint.clone())
             }

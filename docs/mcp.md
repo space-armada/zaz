@@ -31,11 +31,24 @@ written to stderr or to `--log-file`. Never redirect stdout when invoking
 | `zaz_status` | (none) | Daemon state, all groups and processes (pid, exit code, duration). |
 | `zaz_list_groups` | (none) | Slim group listing: name, status, task and service counts. |
 | `zaz_logs` | `name?`, `offset?`, `limit?`, `search?` | Paginated log lines for one process, or `*` for all. |
+| `zaz_env` | `project?`, `group?` | Environment variable names the running config loaded, and the source of each. Never values. |
 | `zaz_config` | (none) | Parsed config: settings, variables, groups, tasks, services. |
 | `zaz_restart_group` | `name` | Restart every process in one group. |
 | `zaz_restart_process` | `group`, `process` | Restart a single task or service. |
 | `zaz_restart_all` | (none) | Restart every group, respecting `depends_on`. |
 | `zaz_reload_config` | (none) | Re-read `zaz.toml`/`zaz.json` from disk and apply diffs. |
+
+`zaz_env` reports key names, never values, because MCP clients are language models and a value
+would reach model context. The error of a failed source is reported as it is, so it can carry the
+failed command's stderr, capped and stripped of escape sequences.
+
+For each group, task, and service it lists the sources in the order they are applied:
+an `env_file`, an `env_command`, then the inline `env` table. Each source shows the names it set and
+unset, and a source that set and unset nothing is flagged with `produced_no_keys`. The report also
+carries the inherited names the base environment dropped and the last source-refresh failure. It
+describes the running config, so it differs from `zaz_config`, which reads the config from disk and
+shows each source as written. A daemon started by an older zaz answers with an error that says the
+daemon is too old. Restart it to get the report.
 
 `zaz_shutdown` is intentionally not exposed: shutting down the process
 manager is qualitatively different from the reversible operations above and
@@ -157,7 +170,8 @@ registration reaches the whole set:
 ```
 
 `zaz_status` against the supervisor merges every member's groups under
-`project/group` keys. `zaz_logs`, `zaz_restart_group`, and `zaz_restart_process`
+`project/group` keys. `zaz_logs`, `zaz_env`, `zaz_restart_group`, and `zaz_restart_process`
 take a structured `project` parameter to target one member; a log query without
 a `project` is rejected rather than fanned out, since each member keeps its own
-log database.
+log database. A `zaz_env` query without a `project` is rejected for the same reason: each member
+loads its own environment, and merging them would put one project's key names beside another's.

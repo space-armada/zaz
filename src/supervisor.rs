@@ -699,6 +699,7 @@ impl Supervisor {
                     .await,
                 false,
             ),
+            ApiRequest::GetEnv { project } => (self.route_env(project).await, false),
             ApiRequest::SubscribeLogs { .. } | ApiRequest::Identify => (
                 ApiResponse::error("not supported in workspace mode yet"),
                 false,
@@ -793,6 +794,10 @@ impl Supervisor {
                             error,
                         });
                         continue;
+                    }
+
+                    if let Some(error) = state.env_refresh_error {
+                        record_refresh_error(&mut merged, &member.token, error);
                     }
 
                     starting |= state.status == DaemonStatus::Starting;
@@ -943,6 +948,38 @@ impl Supervisor {
                 has_more,
                 offset,
             },
+            Ok(ApiResponse::Error { message }) => {
+                ApiResponse::error(format!("project '{}': {}", project, message))
+            }
+            Ok(other) => other,
+            Err(e) => ApiResponse::error(format!("project '{}': {}", project, e)),
+        }
+    }
+
+    /// Route a loaded-environment query to one member daemon.
+    ///
+    /// Like a log query, it is scoped to one member and needs a project. Merging every member
+    /// would put one project's key names next to another's.
+    async fn route_env(&self, project: Option<String>) -> ApiResponse {
+        let project = match project {
+            Some(project) if !project.is_empty() => project,
+            _ => {
+                return ApiResponse::error(
+                    "workspace environment query requires a project (set `project`, or pass --project to `zaz env`)",
+                )
+            }
+        };
+        let member = match self.member_by_token(&project) {
+            Some(member) => member,
+            None => return ApiResponse::error(format!("unknown project '{}'", project)),
+        };
+
+        let forwarded = ApiRequest::GetEnv { project: None };
+        match forward(&member.socket_path, &forwarded).await {
+            Ok(ApiResponse::Env { mut report }) => {
+                report.project = Some(project);
+                ApiResponse::Env { report }
+            }
             Ok(ApiResponse::Error { message }) => {
                 ApiResponse::error(format!("project '{}': {}", project, message))
             }
@@ -1297,6 +1334,24 @@ pub(crate) async fn run_supervisor(
     Ok(())
 }
 
+/// Record a member's failed environment refresh in the aggregate.
+///
+/// Every member's failure is kept in `member_refresh_errors`. The top-level field carries the
+/// first one, tagged with its member, for clients that read only it. The member keeps running, so
+/// its groups are not marked failed.
+fn record_refresh_error(merged: &mut DaemonState, member: &str, error: LoadError) {
+    if merged.env_refresh_error.is_none() {
+        let mut tagged = error.clone();
+        tagged.message = format!("member '{member}': {}", error.message);
+        merged.env_refresh_error = Some(tagged);
+    }
+
+    merged.member_refresh_errors.push(MemberError {
+        member: member.to_string(),
+        error,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1608,6 +1663,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn env_request_needs_a_known_project() {
+        let mut sup = test_supervisor();
+        sup.members.push(member("api", "/repo/api/zaz.toml"));
+
+        for project in [None, Some(String::new())] {
+            let (response, is_shutdown) = sup.handle_request(ApiRequest::GetEnv { project }).await;
+            assert!(!is_shutdown);
+            match response {
+                ApiResponse::Error { message } => assert!(message.contains("requires a project")),
+                other => panic!("expected Error, got {:?}", other),
+            }
+        }
+
+        let (unknown, _) = sup
+            .handle_request(ApiRequest::GetEnv {
+                project: Some("nope".to_string()),
+            })
+            .await;
+        match unknown {
+            ApiResponse::Error { message } => assert!(message.contains("unknown project 'nope'")),
+            other => panic!("expected Error, got {:?}", other),
+        }
+
+        let (unreachable, _) = sup
+            .handle_request(ApiRequest::GetEnv {
+                project: Some("api".to_string()),
+            })
+            .await;
+        match unreachable {
+            ApiResponse::Error { message } => assert!(message.starts_with("project 'api': ")),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn restart_group_rejects_malformed_and_unknown() {
         let mut sup = test_supervisor();
         sup.members.push(member("api", "/repo/api/zaz.toml"));
@@ -1756,5 +1846,38 @@ mod tests {
             "workspace_token_collision"
         );
         assert_eq!(state.member_errors[1].error.code, "workspace_attach_failed");
+    }
+
+    #[test]
+    fn every_members_refresh_failure_reaches_the_aggregate() {
+        let mut merged = DaemonState::default();
+
+        record_refresh_error(
+            &mut merged,
+            "api",
+            LoadError::new("env_command_failed", "api broke"),
+        );
+        record_refresh_error(
+            &mut merged,
+            "web",
+            LoadError::new("env_file_missing", "web broke"),
+        );
+
+        let top = merged
+            .env_refresh_error
+            .expect("the first failure is kept at the top");
+        assert_eq!(top.code, "env_command_failed");
+        assert_eq!(top.message, "member 'api': api broke");
+
+        let members: Vec<_> = merged
+            .member_refresh_errors
+            .iter()
+            .map(|m| (m.member.as_str(), m.error.code.as_str()))
+            .collect();
+        assert_eq!(
+            members,
+            [("api", "env_command_failed"), ("web", "env_file_missing")]
+        );
+        assert!(merged.groups.is_empty());
     }
 }

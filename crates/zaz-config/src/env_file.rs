@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-/// Where in the config an `env_file` was declared.
+/// Where in the config an `env_file` or `env_command` was declared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EnvFileLevel {
     Settings,

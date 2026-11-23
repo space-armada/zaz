@@ -9,30 +9,30 @@
 //! in flight joins the pending run. Each waiter gets the result of the run it joined, and runs
 //! apply in the order they started. Nothing is cancelled except by shutdown.
 //!
+//! A change to a watched source asks for a partial run, which reads the sources and never
+//! `zaz.toml`. Partial requests that join one pending run union their changed paths. A reload that
+//! joins it widens it to a full run. The host keeps the evaluation nodes between runs, so a
+//! partial run reuses whatever the change leaves clean.
+//!
 //! A run that outlasts its deadline is abandoned. The thread stuck in a read cannot be killed, so
 //! it is left behind and its result is dropped. The run fails with its own error, and the pending
 //! run, if there is one, starts.
 
 use crate::api::{ApiRequest, ApiResponse, EngineCommand};
-use crate::engine::{answer_log_request, Engine};
-use crate::evaluate::{self, Prepared};
+use crate::engine::{answer_log_request, BusySnapshot, Engine};
+use crate::env_report::EnvReport;
+use crate::evaluate::{self, EvalCache, Prepared, Scope};
 use crate::log_store::SharedLogStore;
 use crate::state::{DaemonState, DaemonStatus, LoadError};
 use crate::DaemonError;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use zaz_process::{CancelHandle, TERMINATE_GRACE};
 
 type Waiter = oneshot::Sender<ApiResponse>;
-
-/// How much of the config a run reads.
-///
-/// Only runs that read the whole config exist so far. A run that reads sources alone joins them
-/// later, and a request that joins a pending narrower run will widen it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunScope {
-    Full,
-}
 
 enum Slot {
     /// No engine is built. `error` is why the first load failed, once one has.
@@ -45,17 +45,29 @@ enum Slot {
 
 struct InFlight {
     id: u64,
+    scope: Scope,
+
+    /// Whether a watched source change started this run or joined it. A failed full run that
+    /// absorbed one still records the failure as a refresh error, since nothing else would.
+    from_watcher: bool,
+
+    /// The nodes of a full run. They replace the kept ones when the run succeeds.
+    fresh: Option<Arc<Mutex<EvalCache>>>,
     waiters: Vec<Waiter>,
+    cancel: CancelHandle,
 }
 
 struct Pending {
-    scope: RunScope,
+    scope: Scope,
+    from_watcher: bool,
     waiters: Vec<Waiter>,
 }
 
 /// The result of one load and evaluation, on its way back to the event loop.
 pub struct RunOutcome {
     id: u64,
+
+    /// An error here means the evaluation thread panicked or never started.
     result: Result<Prepared, DaemonError>,
 }
 
@@ -70,6 +82,12 @@ pub struct DaemonHost {
     outcomes_tx: mpsc::UnboundedSender<RunOutcome>,
     read_deadline: Duration,
     shutting_down: bool,
+    abandoned: Vec<CancelHandle>,
+
+    /// What the last evaluation of the running config left behind, for the next partial run.
+    cache: Arc<Mutex<EvalCache>>,
+    refresh_tx: mpsc::UnboundedSender<BTreeSet<PathBuf>>,
+    refresh_rx: mpsc::UnboundedReceiver<BTreeSet<PathBuf>>,
 }
 
 impl DaemonHost {
@@ -85,6 +103,7 @@ impl DaemonHost {
         let config_path =
             zaz_config::absolute_config_path(config_path).map_err(DaemonError::Config)?;
         let (outcomes_tx, outcomes_rx) = mpsc::unbounded_channel();
+        let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
 
         let host = Self {
             config_path,
@@ -96,6 +115,10 @@ impl DaemonHost {
             outcomes_tx,
             read_deadline: evaluate::ENV_FILE_READ_DEADLINE,
             shutting_down: false,
+            abandoned: Vec::new(),
+            cache: Arc::default(),
+            refresh_tx,
+            refresh_rx,
         };
 
         Ok((host, outcomes_rx))
@@ -112,7 +135,7 @@ impl DaemonHost {
     /// finishes joins the pending run.
     pub fn begin_first_load(&mut self) {
         tracing::info!(config = %self.config_path.display(), "loading configuration");
-        self.request_run(RunScope::Full, None);
+        self.request_run(Scope::Full, None);
     }
 
     /// Whether the config loaded and the engine is built.
@@ -174,12 +197,31 @@ impl DaemonHost {
 
         // The run stays in flight while it is applied, so a reload that arrives meanwhile joins
         // the pending run instead of starting an evaluation of its own.
-        let waiters = match self.in_flight.as_mut() {
-            Some(in_flight) if in_flight.id == outcome.id => std::mem::take(&mut in_flight.waiters),
+        let (waiters, scope, from_watcher, fresh) = match self.in_flight.as_mut() {
+            Some(in_flight) if in_flight.id == outcome.id => (
+                std::mem::take(&mut in_flight.waiters),
+                in_flight.scope.clone(),
+                in_flight.from_watcher,
+                in_flight.fresh.take(),
+            ),
             _ => return,
         };
 
-        let response = self.apply(outcome.result, commands).await;
+        let evaluated = outcome.result.is_ok();
+        let response = self
+            .apply(outcome.result, &scope, from_watcher, commands)
+            .await;
+
+        // A full run's nodes replace the kept ones only once the config they belong to is
+        // running. A failed run, or an apply that fails, drops them. A partial run edits the kept
+        // nodes in place.
+        if let Some(fresh) = fresh {
+            if evaluated && !matches!(response, ApiResponse::Error { .. }) {
+                self.cache = fresh;
+            }
+        }
+
+        self.release_held_when_idle(commands).await;
         self.in_flight = None;
 
         let response = if self.shutting_down {
@@ -196,8 +238,30 @@ impl DaemonHost {
         }
 
         if let Some(pending) = self.pending.take() {
-            self.start_run(pending.scope, pending.waiters);
+            self.start_run(pending.scope, pending.from_watcher, pending.waiters);
         }
+    }
+
+    /// Run the file changes that waited for a refresh, once no run is queued behind this one.
+    ///
+    /// This looks at the queue after the apply, since a reload that arrived during it joined the
+    /// pending run, and that run is about to replace the environment.
+    async fn release_held_when_idle(&mut self, commands: &mut mpsc::Receiver<EngineCommand>) {
+        if self.pending.is_some() || self.shutting_down || !self.is_loaded() {
+            return;
+        }
+
+        let Slot::Loaded(mut engine) =
+            std::mem::replace(&mut self.slot, Slot::Unloaded { error: None })
+        else {
+            return;
+        };
+
+        let snapshot = engine.busy_snapshot();
+        let logs = engine.log_handle();
+        self.while_answering(engine.release_held(), &snapshot, &logs, commands)
+            .await;
+        self.slot = Slot::Loaded(engine);
     }
 
     /// Do one pass of background work: drain process output, poll for file changes, and check
@@ -219,15 +283,52 @@ impl DaemonHost {
         if let Err(e) = engine.check_services().await {
             tracing::error!(error = %e, "service check error");
         }
+
+        while let Ok(changed) = self.refresh_rx.try_recv() {
+            if !self.shutting_down {
+                self.request_run(Scope::Partial(changed), None);
+            }
+        }
     }
 
     /// Stop every process the engine started. A load still in flight is abandoned.
+    ///
+    /// A command the load is running is signalled, and this waits for its group to be terminated
+    /// before it returns. The evaluation thread dies with the daemon, so a command that ignores
+    /// SIGTERM would otherwise outlive it.
     pub async fn shutdown(&mut self) -> Result<(), DaemonError> {
         self.shutting_down = true;
 
-        match &mut self.slot {
+        if let Some(in_flight) = &self.in_flight {
+            self.abandon(in_flight.cancel.clone());
+        }
+
+        let result = match &mut self.slot {
             Slot::Loaded(engine) => engine.shutdown().await,
             Slot::Unloaded { .. } => Ok(()),
+        };
+
+        self.wait_for_abandoned().await;
+
+        result
+    }
+
+    fn abandon(&mut self, cancel: CancelHandle) {
+        cancel.cancel();
+        self.abandoned.push(cancel);
+    }
+
+    async fn wait_for_abandoned(&self) {
+        let limit = TERMINATE_GRACE + Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + limit;
+
+        while self.abandoned.iter().any(|cancel| !cancel.is_idle()) {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!("an env_command was still running when the shutdown wait ended");
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -237,34 +338,73 @@ impl DaemonHost {
             return;
         }
 
-        self.request_run(RunScope::Full, Some(waiter));
+        self.request_run(Scope::Full, Some(waiter));
     }
 
     /// Run now when nothing is in flight, otherwise join the pending run.
-    fn request_run(&mut self, scope: RunScope, waiter: Option<Waiter>) {
+    fn request_run(&mut self, scope: Scope, waiter: Option<Waiter>) {
         if self.in_flight.is_none() {
-            self.start_run(scope, waiter.into_iter().collect());
+            let from_watcher = matches!(scope, Scope::Partial(_));
+            self.start_run(scope, from_watcher, waiter.into_iter().collect());
             return;
         }
 
-        let pending = self.pending.get_or_insert_with(|| Pending {
-            scope,
-            waiters: Vec::new(),
-        });
-        pending.waiters.extend(waiter);
+        match self.pending.as_mut() {
+            Some(pending) => {
+                pending.from_watcher |= matches!(scope, Scope::Partial(_));
+                let joined = std::mem::replace(&mut pending.scope, Scope::Full);
+                pending.scope = joined.merge(scope);
+                pending.waiters.extend(waiter);
+            }
+            None => {
+                self.pending = Some(Pending {
+                    from_watcher: matches!(scope, Scope::Partial(_)),
+                    scope,
+                    waiters: waiter.into_iter().collect(),
+                });
+            }
+        }
     }
 
-    fn start_run(&mut self, scope: RunScope, waiters: Vec<Waiter>) {
+    /// Start a run. Whether it is full or partial is decided here, from everything that joined.
+    ///
+    /// A partial run needs a running config to evaluate, so one asked for while nothing is built
+    /// runs as a full one.
+    fn start_run(&mut self, scope: Scope, from_watcher: bool, waiters: Vec<Waiter>) {
         let id = self.next_run;
         self.next_run += 1;
 
+        let (scope, config) = match (&scope, &self.slot) {
+            (Scope::Partial(_), Slot::Loaded(engine)) => (scope, Some(engine.config_snapshot())),
+            _ => (Scope::Full, None),
+        };
+        let (cache, fresh) = match scope {
+            Scope::Full => {
+                let fresh = Arc::new(Mutex::new(EvalCache::default()));
+                (Arc::clone(&fresh), Some(fresh))
+            }
+            Scope::Partial(_) => (Arc::clone(&self.cache), None),
+        };
+
         tracing::debug!(run = id, scope = ?scope, "starting a load");
-        self.in_flight = Some(InFlight { id, waiters });
+        let cancel = CancelHandle::new();
+        self.in_flight = Some(InFlight {
+            id,
+            scope: scope.clone(),
+            from_watcher,
+            fresh,
+            waiters,
+            cancel: cancel.clone(),
+        });
 
         let outcomes_tx = self.outcomes_tx.clone();
-        evaluate::prepare_detached(
+        evaluate::prepare_scoped_detached(
             self.config_path.clone(),
             self.read_deadline,
+            cancel,
+            scope,
+            config,
+            cache,
             move |result| {
                 let _ = outcomes_tx.send(RunOutcome { id, result });
             },
@@ -272,8 +412,15 @@ impl DaemonHost {
     }
 
     /// Answer every waiter with a shutting-down result, and drop the load in flight.
+    ///
+    /// A command the load is running is signalled before the daemon exits, since the daemon runs
+    /// under `setsid` and nothing else would reach the command's process group.
     fn begin_shutdown(&mut self) -> ApiResponse {
         self.shutting_down = true;
+
+        if let Some(cancel) = self.in_flight.as_ref().map(|f| f.cancel.clone()) {
+            self.abandon(cancel);
+        }
 
         let in_flight = self.in_flight.take().into_iter().flat_map(|f| f.waiters);
         let pending = self.pending.take().into_iter().flat_map(|p| p.waiters);
@@ -285,9 +432,15 @@ impl DaemonHost {
     }
 
     /// Apply a finished run to whatever the host holds, and say how it went.
+    ///
+    /// A failed refresh keeps the running environment and is recorded apart from `load_error`.
+    /// A failed full run that absorbed a watcher change is recorded the same way, since the
+    /// change would otherwise be lost with no trace.
     async fn apply(
         &mut self,
         result: Result<Prepared, DaemonError>,
+        scope: &Scope,
+        from_watcher: bool,
         commands: &mut mpsc::Receiver<EngineCommand>,
     ) -> ApiResponse {
         match (
@@ -295,11 +448,28 @@ impl DaemonHost {
             result,
         ) {
             (Slot::Loaded(mut engine), Ok(prepared)) => {
-                let snapshot = engine.status_snapshot();
+                let snapshot = engine.busy_snapshot();
                 let logs = engine.log_handle();
-                let applied = self
-                    .while_answering(engine.apply_prepared(prepared), &snapshot, &logs, commands)
-                    .await;
+                let applied = match scope {
+                    Scope::Full => {
+                        self.while_answering(
+                            engine.apply_prepared(prepared),
+                            &snapshot,
+                            &logs,
+                            commands,
+                        )
+                        .await
+                    }
+                    Scope::Partial(_) => {
+                        self.while_answering(
+                            engine.apply_refresh(prepared.evaluated),
+                            &snapshot,
+                            &logs,
+                            commands,
+                        )
+                        .await
+                    }
+                };
                 self.slot = Slot::Loaded(engine);
 
                 match applied {
@@ -307,9 +477,12 @@ impl DaemonHost {
                     None => shutting_down_response(),
                 }
             }
-            (Slot::Loaded(engine), Err(e)) => {
-                // A failed reload leaves the running config in place and is never a load error.
+            (Slot::Loaded(mut engine), Err(e)) => {
+                if matches!(scope, Scope::Partial(_)) || from_watcher {
+                    engine.refresh_failed(&e);
+                }
                 self.slot = Slot::Loaded(engine);
+
                 Engine::reload_response(Engine::prepare_failure(&e))
             }
             (Slot::Unloaded { .. }, Ok(prepared)) => self.load_first(prepared, commands).await,
@@ -333,7 +506,7 @@ impl DaemonHost {
     async fn while_answering<T>(
         &mut self,
         work: impl std::future::Future<Output = T>,
-        snapshot: &DaemonState,
+        snapshot: &BusySnapshot,
         logs: &SharedLogStore,
         commands: &mut mpsc::Receiver<EngineCommand>,
     ) -> Option<T> {
@@ -359,12 +532,13 @@ impl DaemonHost {
     /// contract promises. Service starts that wait out a `delay` finish later, and show in the
     /// group states as they do.
     ///
-    /// Log requests read the shared log store, so they answer in full during an apply. Restarts
-    /// are refused, since the engine that would run them is busy.
+    /// Log requests read the shared log store, so they answer in full during an apply. The loaded
+    /// environment answers from the snapshot taken before the apply began, like the state does.
+    /// Restarts are refused, since the engine that would run them is busy.
     fn answer_busy(
         &mut self,
         command: EngineCommand,
-        snapshot: &DaemonState,
+        snapshot: &BusySnapshot,
         logs: &SharedLogStore,
     ) {
         let EngineCommand {
@@ -377,7 +551,7 @@ impl DaemonHost {
             ApiRequest::Shutdown => self.begin_shutdown(),
             ApiRequest::Status | ApiRequest::ListGroups | ApiRequest::Subscribe => {
                 ApiResponse::Status {
-                    state: snapshot.clone(),
+                    state: snapshot.state.clone(),
                 }
             }
             ApiRequest::RestartGroup { .. }
@@ -385,6 +559,9 @@ impl DaemonHost {
             | ApiRequest::RestartAll => ApiResponse::error(
                 "daemon busy [daemon_busy]: it is still starting or reloading its services",
             ),
+            ApiRequest::GetEnv { .. } => ApiResponse::Env {
+                report: snapshot.env.clone(),
+            },
             request @ (ApiRequest::GetLogs { .. } | ApiRequest::SubscribeLogs { .. }) => {
                 if let Err(e) = logs.drain() {
                     tracing::error!(error = %e, "log drain error");
@@ -425,9 +602,11 @@ impl DaemonHost {
 
         // The groups are built, so the daemon is `Running` from here, however long the service
         // starts take.
-        let mut snapshot = engine.status_snapshot();
-        snapshot.status = DaemonStatus::Running;
-        let groups = snapshot.groups.len();
+        engine.set_refresh_sender(self.refresh_tx.clone());
+        let mut snapshot = engine.busy_snapshot();
+        snapshot.state.status = DaemonStatus::Running;
+        snapshot.env.status = DaemonStatus::Running;
+        let groups = snapshot.state.groups.len();
 
         // A failed startup keeps the daemon up, as it always has.
         let logs = engine.log_handle();
@@ -494,6 +673,13 @@ fn answer_unloaded(
                 offset: None,
             }
         }
+        ApiRequest::GetEnv { .. } => ApiResponse::Env {
+            report: EnvReport {
+                status: DaemonStatus::Starting,
+                load_error: error.cloned(),
+                ..Default::default()
+            },
+        },
         ApiRequest::Identify => {
             let config_path = config_path
                 .canonicalize()
@@ -675,6 +861,15 @@ mod tests {
         let subscribe = fixture.request(ApiRequest::Subscribe).await;
         assert!(matches!(subscribe, ApiResponse::Status { .. }));
 
+        let ApiResponse::Env { report } =
+            fixture.request(ApiRequest::GetEnv { project: None }).await
+        else {
+            panic!("expected an env report");
+        };
+        assert_eq!(report.status, DaemonStatus::Starting);
+        assert!(report.groups.is_empty());
+        assert!(report.load_error.is_none());
+
         for request in [
             ApiRequest::RestartAll,
             ApiRequest::RestartGroup {
@@ -716,6 +911,15 @@ mod tests {
             message(&restart).contains("first_load_failed"),
             "{restart:?}"
         );
+
+        let ApiResponse::Env { report } =
+            fixture.request(ApiRequest::GetEnv { project: None }).await
+        else {
+            panic!("expected an env report");
+        };
+        assert_eq!(report.status, DaemonStatus::Starting);
+        assert_eq!(report.load_error.unwrap().code, "env_file_missing");
+        assert!(report.groups.is_empty());
 
         std::fs::write(fixture.dir.path().join("slow.env"), "A=1\n").unwrap();
         let response = fixture.reload().await;
@@ -828,6 +1032,54 @@ mod tests {
         fixture.host.shutdown().await.unwrap();
     }
 
+    fn paths(names: &[&str]) -> BTreeSet<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[tokio::test]
+    async fn partial_requests_union_and_a_reload_widens_the_pending_run() {
+        let mut fixture = Fixture::with_fifo();
+        fixture.host.begin_first_load();
+        assert_eq!(fixture.host.in_flight.as_ref().unwrap().scope, Scope::Full);
+
+        fixture
+            .host
+            .request_run(Scope::Partial(paths(&["/a"])), None);
+        fixture
+            .host
+            .request_run(Scope::Partial(paths(&["/b"])), None);
+        assert_eq!(
+            fixture.host.pending.as_ref().unwrap().scope,
+            Scope::Partial(paths(&["/a", "/b"]))
+        );
+
+        let waiter = fixture.reload().await;
+        assert_eq!(fixture.host.pending.as_ref().unwrap().scope, Scope::Full);
+
+        fixture
+            .host
+            .request_run(Scope::Partial(paths(&["/c"])), None);
+        assert_eq!(fixture.host.pending.as_ref().unwrap().scope, Scope::Full);
+        drop(waiter);
+
+        fixture.feed("A=1\n");
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_partial_request_with_nothing_built_runs_as_a_full_run() {
+        let mut fixture = Fixture::with_fifo();
+
+        fixture
+            .host
+            .request_run(Scope::Partial(paths(&["/a"])), None);
+
+        assert_eq!(fixture.host.in_flight.as_ref().unwrap().scope, Scope::Full);
+
+        fixture.feed("A=1\n");
+        fixture.host.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_reload_after_a_run_started_gets_the_next_runs_result() {
         let mut fixture = Fixture::with_fifo();
@@ -883,6 +1135,10 @@ mod tests {
 
     const DELAYED_CONFIG: &str = "[[group]]\nname = \"svc\"\n\n\
                                   [[group.service]]\nname = \"s\"\ncommand = \"sleep 30\"\ndelay = \"3s\"\n";
+
+    /// A delay far longer than any bound a test asserts, for tests that must end the wait early.
+    const LONG_DELAYED_CONFIG: &str = "[[group]]\nname = \"svc\"\n\n\
+                                       [[group.service]]\nname = \"s\"\ncommand = \"sleep 60\"\ndelay = \"30s\"\n";
 
     /// Send `request` on `commands_tx` after `wait`, and report when and how it was answered.
     async fn probe(
@@ -964,7 +1220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_during_a_delayed_start_ends_the_wait_and_stops_the_engine() {
+    async fn the_env_report_answers_from_the_snapshot_during_a_delayed_start() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("zaz.toml"), DELAYED_CONFIG).unwrap();
         let mut fixture = Fixture::at(dir);
@@ -972,20 +1228,52 @@ mod tests {
         let outcome = fixture.outcomes.recv().await.unwrap();
 
         let (commands_tx, mut commands) = mpsc::channel(8);
-        let begun = std::time::Instant::now();
         let ((), (_, reply)) = tokio::join!(
             fixture.host.finish_run(outcome, &mut commands),
             probe(
                 &commands_tx,
                 Duration::from_millis(300),
-                ApiRequest::Shutdown
+                ApiRequest::GetEnv { project: None }
             ),
         );
 
+        let ApiResponse::Env { report } = reply else {
+            panic!("expected an env report, got {reply:?}");
+        };
+        assert_eq!(report.status, DaemonStatus::Running);
+        assert_eq!(report.groups[0].name, "svc");
+        assert_eq!(report.groups[0].services[0].name, "s");
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_a_delayed_start_ends_the_wait_and_stops_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zaz.toml"), LONG_DELAYED_CONFIG).unwrap();
+        let mut fixture = Fixture::at(dir);
+        fixture.host.begin_first_load();
+        let outcome = fixture.outcomes.recv().await.unwrap();
+
+        let (commands_tx, mut commands) = mpsc::channel(8);
+        // Building the engine runs synchronously on the first poll and can take seconds on a busy
+        // machine. The bound starts when the shutdown is sent, so it measures only the wait.
+        let (sent, reply) = {
+            let probe = async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let sent = std::time::Instant::now();
+                let (_, reply) = probe(&commands_tx, Duration::ZERO, ApiRequest::Shutdown).await;
+                (sent, reply)
+            };
+            let ((), probed) = tokio::join!(fixture.host.finish_run(outcome, &mut commands), probe);
+            probed
+        };
+        let waited = sent.elapsed();
+
         assert_eq!(message(&reply), "shutting down");
         assert!(
-            begun.elapsed() < Duration::from_millis(2500),
-            "the wait should end early"
+            waited < Duration::from_millis(2500),
+            "the wait should end early, took {waited:?}"
         );
         assert!(fixture.host.is_loaded());
 
@@ -1023,6 +1311,220 @@ mod tests {
         );
         assert!(matches!(reply, ApiResponse::Status { .. }));
         assert!(message(&waiter.await.unwrap()).contains("1 added"));
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_reload_that_absorbed_a_watcher_change_records_a_refresh_error() {
+        let mut fixture = Fixture::with_fifo();
+        fixture.host.begin_first_load();
+        fixture.feed("A=1\n");
+        fixture.next_outcome().await;
+
+        let _running = fixture.reload().await;
+        fixture
+            .host
+            .request_run(Scope::Partial(paths(&["/a"])), None);
+        let joined = fixture.reload().await;
+        assert_eq!(fixture.host.pending.as_ref().unwrap().scope, Scope::Full);
+
+        fixture.feed("A=2\n");
+        fixture.next_outcome().await;
+        assert!(fixture.host.state().env_refresh_error.is_none());
+
+        fixture.feed("not valid\n");
+        fixture.next_outcome().await;
+
+        let response = joined.await.unwrap();
+        assert!(
+            matches!(response, ApiResponse::Error { .. }),
+            "{response:?}"
+        );
+        let state = fixture.host.state();
+        assert!(state.env_refresh_error.is_some());
+        assert!(state.load_error.is_none());
+
+        let ApiResponse::Env { report } =
+            fixture.request(ApiRequest::GetEnv { project: None }).await
+        else {
+            panic!("expected an env report");
+        };
+        assert_eq!(report.status, DaemonStatus::Running);
+        assert_eq!(report.refresh_error, state.env_refresh_error);
+        assert_eq!(report.groups[0].name, "app");
+        assert_eq!(report.groups[0].sources[0].set, ["A"]);
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_reload_with_no_watcher_change_records_no_refresh_error() {
+        let mut fixture = Fixture::with_fifo();
+        fixture.host.begin_first_load();
+        fixture.feed("A=1\n");
+        fixture.next_outcome().await;
+
+        let failed = fixture.reload().await;
+        fixture.feed("not valid\n");
+        fixture.next_outcome().await;
+
+        assert!(matches!(failed.await.unwrap(), ApiResponse::Error { .. }));
+        assert!(fixture.host.state().env_refresh_error.is_none());
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    fn held_batches(host: &DaemonHost) -> usize {
+        match &host.slot {
+            Slot::Loaded(engine) => engine.held_count(),
+            Slot::Unloaded { .. } => panic!("expected a loaded engine"),
+        }
+    }
+
+    #[tokio::test]
+    async fn held_batches_wait_while_a_reload_is_queued_and_run_when_the_chain_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zaz.toml"), CONFIG).unwrap();
+        std::fs::write(dir.path().join("slow.env"), "A=1\n").unwrap();
+        let mut fixture = Fixture::at(dir);
+        fixture.host.begin_first_load();
+        fixture.next_outcome().await;
+        match &mut fixture.host.slot {
+            Slot::Loaded(engine) => engine.hold_batch_for_test("app"),
+            Slot::Unloaded { .. } => panic!("expected a loaded engine"),
+        }
+
+        // A new delayed service makes the reload's apply wait out its delay. A reload that
+        // arrives meanwhile joins the pending run.
+        std::fs::write(
+            fixture.dir.path().join("zaz.toml"),
+            format!("{CONFIG}{}", DELAYED_CONFIG),
+        )
+        .unwrap();
+        let _first = fixture.reload().await;
+        let outcome = fixture.outcomes.recv().await.unwrap();
+
+        let (commands_tx, mut commands) = mpsc::channel(8);
+        let (response_tx, _queued) = oneshot::channel();
+        let queue_a_reload = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            commands_tx
+                .send(EngineCommand {
+                    request: ApiRequest::ReloadConfig,
+                    response_tx,
+                })
+                .await
+                .unwrap();
+        };
+        let ((), ()) = tokio::join!(
+            fixture.host.finish_run(outcome, &mut commands),
+            queue_a_reload
+        );
+
+        assert!(
+            fixture.host.in_flight.is_some(),
+            "the queued reload started"
+        );
+        assert_eq!(
+            held_batches(&fixture.host),
+            1,
+            "released into a changing environment"
+        );
+
+        fixture.next_outcome().await;
+        assert_eq!(held_batches(&fixture.host), 0);
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    /// A loaded fixture with a plain `env_file`, so a reload evaluates without blocking.
+    async fn loaded_fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("zaz.toml"), CONFIG).unwrap();
+        std::fs::write(dir.path().join("slow.env"), "A=1\n").unwrap();
+        let mut fixture = Fixture::at(dir);
+        fixture.host.begin_first_load();
+        fixture.next_outcome().await;
+        assert!(fixture.host.is_loaded());
+
+        fixture
+    }
+
+    #[tokio::test]
+    async fn a_successful_full_run_replaces_the_node_cache() {
+        let mut fixture = loaded_fixture().await;
+        let before = Arc::clone(&fixture.host.cache);
+
+        let _reply = fixture.reload().await;
+        fixture.next_outcome().await;
+
+        assert!(!Arc::ptr_eq(&before, &fixture.host.cache));
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_run_whose_apply_fails_keeps_the_previous_node_cache() {
+        let mut fixture = loaded_fixture().await;
+        let before = Arc::clone(&fixture.host.cache);
+
+        let reply = fixture.reload().await;
+        let mut outcome = fixture.outcomes.recv().await.unwrap();
+        assert!(outcome.result.is_ok());
+
+        // Validation rejects a cycle at load, so the evaluated config is swapped for one that
+        // only the apply can refuse.
+        std::fs::write(
+            fixture.dir.path().join("cycle.toml"),
+            "[[group]]\nname = \"a\"\ndepends_on = [\"b\"]\n\n\
+             [[group]]\nname = \"b\"\ndepends_on = [\"a\"]\n",
+        )
+        .unwrap();
+        outcome.result = Ok(Prepared {
+            config: zaz_config::load_unvalidated(fixture.dir.path().join("cycle.toml")).unwrap(),
+            evaluated: Default::default(),
+        });
+
+        fixture
+            .host
+            .finish_run(outcome, &mut fixture.commands)
+            .await;
+
+        let response = reply.await.unwrap();
+        assert!(
+            message(&response).contains("dependency error"),
+            "{response:?}"
+        );
+        assert!(Arc::ptr_eq(&before, &fixture.host.cache));
+
+        fixture.host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_during_the_apply_keeps_the_previous_node_cache() {
+        let mut fixture = loaded_fixture().await;
+        let before = Arc::clone(&fixture.host.cache);
+
+        std::fs::write(
+            fixture.dir.path().join("zaz.toml"),
+            format!("{CONFIG}{LONG_DELAYED_CONFIG}"),
+        )
+        .unwrap();
+        let _reply = fixture.reload().await;
+        let outcome = fixture.outcomes.recv().await.unwrap();
+
+        let (commands_tx, mut commands) = mpsc::channel(8);
+        let ((), _) = tokio::join!(
+            fixture.host.finish_run(outcome, &mut commands),
+            probe(
+                &commands_tx,
+                Duration::from_millis(300),
+                ApiRequest::Shutdown
+            ),
+        );
+
+        assert!(Arc::ptr_eq(&before, &fixture.host.cache));
 
         fixture.host.shutdown().await.unwrap();
     }
@@ -1165,7 +1667,7 @@ mod tests {
         let id = fixture.host.in_flight.as_ref().unwrap().id;
 
         let (tx, rx) = oneshot::channel();
-        evaluate::run_detached(
+        evaluate::run_detached::<Prepared, _, _>(
             || panic!("evaluation exploded"),
             move |result| {
                 let _ = tx.send(result);
@@ -1176,7 +1678,13 @@ mod tests {
 
         fixture
             .host
-            .finish_run(RunOutcome { id, result }, &mut fixture.commands)
+            .finish_run(
+                RunOutcome {
+                    id,
+                    result: result.map(|_| unreachable!()),
+                },
+                &mut fixture.commands,
+            )
             .await;
 
         let state = fixture.host.state();

@@ -54,9 +54,10 @@ pub struct DaemonBanner {
     pub is_error: bool,
 }
 
-/// The banner for a daemon that is still starting, or whose first load failed.
+/// The banner for a daemon that is still starting, whose first load failed, or whose last
+/// environment refresh failed.
 ///
-/// A daemon that is running, or one that is shutting down, needs none.
+/// A daemon that is running cleanly, or one that is shutting down, needs none.
 pub fn daemon_banner(state: &DaemonState) -> Option<DaemonBanner> {
     if let Some(error) = &state.load_error {
         let first_line = error.message.lines().next().unwrap_or_default();
@@ -77,7 +78,27 @@ pub fn daemon_banner(state: &DaemonState) -> Option<DaemonBanner> {
         });
     }
 
-    None
+    state.env_refresh_error.as_ref().map(|error| {
+        let first_line = error.message.lines().next().unwrap_or_default();
+        let others: Vec<String> = state
+            .member_refresh_errors
+            .iter()
+            .map(|m| format!("{} [{}]", m.member, m.error.code))
+            .collect();
+        let detail = if others.len() > 1 {
+            format!(" Failing members: {}.", others.join(", "))
+        } else {
+            String::new()
+        };
+
+        DaemonBanner {
+            text: format!(
+                "Environment refresh failed [{}]: {}{} Still running on the previous environment.",
+                error.code, first_line, detail
+            ),
+            is_error: true,
+        }
+    })
 }
 
 /// Draw the daemon banner on the bottom row.
@@ -210,6 +231,49 @@ mod tests {
         assert!(banner.text.contains("env_file_missing"));
         assert!(banner.text.contains("zaz reload"));
         assert!(!banner.text.contains("second line"));
+    }
+
+    #[test]
+    fn a_running_daemon_with_a_failed_refresh_gets_an_error_banner() {
+        let state = DaemonState {
+            status: DaemonStatus::Running,
+            env_refresh_error: Some(LoadError::new(
+                "env_command_failed",
+                "group 'a' env_command failed [env_command_failed]\nsecond line",
+            )),
+            ..Default::default()
+        };
+
+        let banner = daemon_banner(&state).expect("a failed refresh shows a banner");
+
+        assert!(banner.is_error);
+        assert!(banner.text.contains("env_command_failed"));
+        assert!(banner.text.contains("previous environment"));
+        assert!(!banner.text.contains("second line"));
+    }
+
+    #[test]
+    fn the_banner_lists_every_failing_member() {
+        let state = DaemonState {
+            status: DaemonStatus::Running,
+            env_refresh_error: Some(LoadError::new("env_command_failed", "member 'api': broke")),
+            member_refresh_errors: vec![
+                zaz_daemon::MemberError {
+                    member: "api".to_string(),
+                    error: LoadError::new("env_command_failed", "broke"),
+                },
+                zaz_daemon::MemberError {
+                    member: "web".to_string(),
+                    error: LoadError::new("env_file_missing", "gone"),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let banner = daemon_banner(&state).expect("a failed refresh shows a banner");
+
+        assert!(banner.text.contains("api [env_command_failed]"));
+        assert!(banner.text.contains("web [env_file_missing]"));
     }
 
     #[test]

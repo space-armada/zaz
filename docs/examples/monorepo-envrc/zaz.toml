@@ -1,0 +1,34 @@
+# One .envrc per service directory.
+#
+# Each group's env_command runs in the group's working_dir. direnv finds the
+# nearest .envrc from there, so no path is repeated in the command.
+# env_watch resolves against the same directory, which is why the root
+# .envrc is reached with "../../.envrc".
+
+[[group]]
+name = "api"
+working_dir = "services/api"
+patterns = ["services/api/**/*.go", "go.mod", "go.sum"]
+env_command = "direnv export json"
+env_watch = [".envrc", "../../.envrc"]
+
+  [[group.task]]
+  name = "build"
+  command = "go build -o bin/api ./cmd/api"
+
+  [[group.service]]
+  name = "api"
+  command = "./bin/api"
+
+[[group]]
+name = "web"
+working_dir = "services/web"
+depends_on = ["api"]
+patterns = ["services/web/src/**"]
+ignore = ["**/node_modules/**"]
+env_command = "direnv export json"
+env_watch = [".envrc", "../../.envrc"]
+
+  [[group.service]]
+  name = "vite"
+  command = "npx vite"

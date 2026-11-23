@@ -3,8 +3,8 @@
 zaz is not a Procfile runner. The overlap with foreman, overmind, and the
 broader Procfile ecosystem is narrow: "run a named set of long-running
 processes from one config." Everything else — formation control, `$PORT`
-allocation, `.env` file loading, `Procfile.export` to systemd/upstart — is
-out of scope. This page documents the part that does map.
+allocation, `Procfile.export` to systemd/upstart — is out of scope. `.env`
+loading maps to `env_file`. This page documents the part that does map.
 
 If your motivation for using foreman or overmind was file-watching with a
 restart, see [modd.md](modd.md) instead. zaz's services restart on file
@@ -64,9 +64,10 @@ with no `depends_on` between them.
 
 ## Environment variables
 
-foreman loads a `.env` file by default and supports `$PORT` allocation
-across processes. zaz does neither. Use the explicit `[variables]` and
-`env` tables described in [../configuration.md](../configuration.md):
+foreman loads a `.env` file by default. zaz loads one when you name it with
+`env_file`. zaz does not allocate `$PORT` across processes. Use the explicit
+`[variables]` and `env` tables described in
+[../configuration.md](../configuration.md):
 
 ```toml
 [variables]
@@ -75,6 +76,7 @@ port = "3000"
 [[group]]
 name = "procfile"
 patterns = []
+env_file = ".env"
 
   [group.env]
   RACK_ENV = "development"
@@ -84,16 +86,34 @@ patterns = []
   command = "bundle exec puma -p ${port}"
 ```
 
-If you need values from a `.env` file, source them in your shell before
-launching zaz, or template them into the `[variables]` table at config
-generation time.
+`env_file` takes one path. A relative path resolves against the directory that
+holds `zaz.toml`. Put it in `[settings]` to load it into every process, on a
+group to load it into that group, or on a single task or service.
+
+A missing `.env` fails config load, so a fresh clone without one fails until
+the file exists. `zaz check` lists a missing file and still passes. See
+[Environment loading](../configuration.md#environment-loading).
+
+zaz parses a portable subset of the dotenv format. Values in a foreman `.env`
+usually fit. These do not:
+
+- A `$` or `${VAR}` outside single quotes. zaz does no expansion, and a `$` in
+  an unquoted or double-quoted value is a parse error. Single-quote a literal
+  `$`.
+- A comment after a value on the same line. Move it to its own line.
+- Whitespace around `=`, or whitespace in an unquoted value.
+
+Every error names the line and says how to fix it. Edits to the file reload
+the groups that use it, without `zaz reload`.
+
+For a `.env` that a tool must evaluate, use `env_command` instead. The
+[direnv example](../examples/direnv/README.md) shows how.
 
 ## What zaz does not provide
 
 - **Process replica counts.** `foreman start -m web=2,worker=3` has no
   zaz equivalent. Each `[[group.service]]` is exactly one process.
 - **`$PORT` macro.** zaz does not allocate ports across services.
-- **`.env` file auto-loading.** Use `[variables]` and `env` explicitly.
 - **`Procfile.export` to systemd / upstart.** zaz expects to be the
   long-running process; for service-manager integration, run
   `zaz start` from a systemd unit (the `pty-less-environment` example
@@ -110,4 +130,4 @@ generation time.
   — the closest existing example to a service-manager-friendly service
   set.
 - [../configuration.md](../configuration.md) — `[variables]`, `env`,
-  `signal`, and `delay` reference.
+  `env_file`, `signal`, and `delay` reference.

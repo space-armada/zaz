@@ -1,0 +1,31 @@
+# Load the project's direnv environment into every process.
+#
+# `env_command = "direnv export json"` replaces `direnv exec . <command>` in
+# every command and hook. zaz evaluates the `.envrc` once at load, and again
+# when a file in `env_watch` changes.
+
+[settings]
+env_command = "direnv export json"
+env_watch = [".envrc"]
+
+[[group]]
+name = "api"
+patterns = ["cmd/**/*.go", "internal/**/*.go", "go.mod", "go.sum"]
+ignore = ["**/*_test.go"]
+
+  [[group.task]]
+  name = "build"
+  command = "go build -o bin/api ./cmd/api"
+
+  [[group.service]]
+  name = "api"
+  command = "./bin/api"
+  ready_check = "curl -sf http://localhost:$PORT/healthz"
+
+[[group]]
+name = "tests"
+patterns = ["**/*.go"]
+
+  [[group.task]]
+  name = "test"
+  command = "go test ./..."
